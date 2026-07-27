@@ -18,6 +18,13 @@
 #include <windows.h>
 #undef min
 #undef max
+#else
+#include <csignal>
+#include <map>
+#include <sys/mman.h>
+#include <sys/wait.h>
+#include <ucontext.h>
+#include <unistd.h>
 #endif
 
 namespace {
@@ -38,6 +45,127 @@ void Check(bool value, const char *text) {
     std::abort();
   }
 }
+
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+// Windows-shaped shims so the test bodies stay platform-neutral. Protection() reads the real
+// kernel state from /proc/self/maps rather than any PageManager bookkeeping -- reading the
+// shadow would make these assertions circular.
+using DWORD = uint32_t;
+constexpr uint32_t PAGE_NOACCESS = 1;
+constexpr uint32_t PAGE_READONLY = 2;
+constexpr uint32_t PAGE_READWRITE = 3;
+constexpr uint32_t MEM_RESERVE = 0;
+constexpr uint32_t MEM_COMMIT = 0;
+constexpr uint32_t MEM_RELEASE = 0;
+
+int ToHostProt(uint32_t protection) {
+  switch (protection) {
+  case PAGE_NOACCESS:
+    return PROT_NONE;
+  case PAGE_READONLY:
+    return PROT_READ;
+  default:
+    return PROT_READ | PROT_WRITE;
+  }
+}
+
+uint32_t Protection(const void *address) {
+  const auto addr = reinterpret_cast<uintptr_t>(address);
+  std::FILE *maps = std::fopen("/proc/self/maps", "r");
+  Check(maps != nullptr, "open /proc/self/maps failed");
+  char line[512];
+  uint32_t result = 0; // 0 => not mapped at all
+  while (std::fgets(line, sizeof(line), maps) != nullptr) {
+    unsigned long start = 0;
+    unsigned long end = 0;
+    char perms[8]{};
+    if (std::sscanf(line, "%lx-%lx %7s", &start, &end, perms) != 3) {
+      continue;
+    }
+    if (addr >= start && addr < end) {
+      result = perms[1] == 'w'   ? PAGE_READWRITE
+               : perms[0] == 'r' ? PAGE_READONLY
+                                 : PAGE_NOACCESS;
+      break;
+    }
+  }
+  std::fclose(maps);
+  return result;
+}
+
+bool IsWritable(const void *address) { return Protection(address) == PAGE_READWRITE; }
+
+// munmap needs a length where VirtualFree's callers pass 0, so sizes are remembered here.
+std::map<void *, size_t> &AllocationSizes() {
+  static std::map<void *, size_t> sizes;
+  return sizes;
+}
+
+void *VirtualAlloc(void *address, size_t size, DWORD /*type*/, uint32_t protection) {
+  const int extra = address != nullptr ? MAP_FIXED_NOREPLACE : 0;
+  void *raw = ::mmap(address, size, ToHostProt(protection),
+                     MAP_PRIVATE | MAP_ANONYMOUS | extra, -1, 0);
+  if (raw == MAP_FAILED) {
+    return nullptr;
+  }
+  AllocationSizes()[raw] = size;
+  return raw;
+}
+
+int VirtualFree(void *address, size_t /*size*/, DWORD /*type*/) {
+  auto &sizes = AllocationSizes();
+  auto it = sizes.find(address);
+  if (it == sizes.end()) {
+    return 0;
+  }
+  const int ok = ::munmap(address, it->second) == 0 ? 1 : 0;
+  sizes.erase(it);
+  return ok;
+}
+
+[[maybe_unused]] int VirtualProtect(void *address, size_t size, uint32_t protection,
+                                    DWORD *old_protection) {
+  if (old_protection != nullptr) {
+    *old_protection = Protection(address);
+  }
+  return ::mprotect(address, size, ToHostProt(protection)) == 0 ? 1 : 0;
+}
+
+// Two views of one anonymous shared object: `guest` pinned at the requested address and
+// `backing` wherever the kernel likes. memfd_create is the Linux stand-in for a pagefile-backed
+// CreateFileMapping.
+class SharedPage final {
+ public:
+  SharedPage(uintptr_t address, uint64_t size) : size_(static_cast<size_t>(size)) {
+    fd_ = static_cast<int>(::syscall(SYS_memfd_create, "kyty-shared-page", 0u));
+    Check(fd_ >= 0, "memfd_create failed");
+    Check(::ftruncate(fd_, static_cast<off_t>(size)) == 0, "ftruncate failed");
+    guest = static_cast<uint8_t *>(::mmap(reinterpret_cast<void *>(address), size_,
+                                          PROT_READ | PROT_WRITE,
+                                          MAP_SHARED | MAP_FIXED_NOREPLACE, fd_, 0));
+    Check(guest == reinterpret_cast<void *>(address), "fixed shared view failed");
+    backing = static_cast<uint8_t *>(
+        ::mmap(nullptr, size_, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0));
+    Check(backing != MAP_FAILED && backing != nullptr, "shared backing view failed");
+  }
+
+  ~SharedPage() {
+    Check(::munmap(backing, size_) == 0, "shared backing unmap failed");
+    Check(::munmap(guest, size_) == 0, "shared guest unmap failed");
+    Check(::close(fd_) == 0, "shared mapping close failed");
+  }
+
+  SharedPage(const SharedPage &) = delete;
+  SharedPage &operator=(const SharedPage &) = delete;
+
+  uint8_t *guest = nullptr;
+  uint8_t *backing = nullptr;
+
+ private:
+  size_t size_ = 0;
+  int fd_ = -1;
+};
+#endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool IsWritable(const void *address) {
@@ -84,6 +212,8 @@ class SharedPage final {
  private:
   HANDLE mapping_ = nullptr;
 };
+#endif
+#if 1
 
 bool DummyFault(void *, PageFaultAccess, uint64_t, uint64_t, PageFaultPhase) noexcept {
   return true;
@@ -246,6 +376,7 @@ void UnmapContended() noexcept {
   g_unmap_contended.store(true, std::memory_order_release);
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 LONG CALLBACK NativeTrackerFaultHandler(EXCEPTION_POINTERS *exception) {
   if (exception == nullptr || exception->ExceptionRecord == nullptr ||
       exception->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) {
@@ -266,6 +397,46 @@ LONG CALLBACK NativeTrackerFaultHandler(EXCEPTION_POINTERS *exception) {
              ? EXCEPTION_CONTINUE_EXECUTION
              : EXCEPTION_CONTINUE_SEARCH;
 }
+#else
+// SIGSEGV stands in for the vectored exception handler; returning re-executes the faulting
+// instruction, matching EXCEPTION_CONTINUE_EXECUTION.
+void NativeTrackerFaultHandler(int signal_number, siginfo_t *info, void *native_context) {
+  auto *context = static_cast<ucontext_t *>(native_context);
+  const auto error_code = static_cast<uint64_t>(context->uc_mcontext.gregs[REG_ERR]);
+  const auto access = (error_code & 0x10u) != 0    ? PageFaultAccess::Execute
+                      : (error_code & 0x02u) != 0 ? PageFaultAccess::Write
+                                                  : PageFaultAccess::Read;
+  auto *page_manager = g_native_page_manager.load(std::memory_order_acquire);
+  if (page_manager != nullptr) {
+    g_native_fault_entered.store(true, std::memory_order_release);
+    if (page_manager->HandleFault(access, reinterpret_cast<uint64_t>(info->si_addr))) {
+      return;
+    }
+  }
+  struct sigaction restore {};
+  restore.sa_handler = SIG_DFL;
+  sigemptyset(&restore.sa_mask);
+  ::sigaction(signal_number, &restore, nullptr);
+}
+
+struct sigaction g_saved_segv_action {};
+
+void *AddVectoredExceptionHandler(unsigned long /*first*/,
+                                  void (*handler)(int, siginfo_t *, void *)) {
+  struct sigaction action {};
+  action.sa_sigaction = handler;
+  sigemptyset(&action.sa_mask);
+  action.sa_flags = SA_SIGINFO;
+  if (::sigaction(SIGSEGV, &action, &g_saved_segv_action) != 0) {
+    return nullptr;
+  }
+  return reinterpret_cast<void *>(handler);
+}
+
+int RemoveVectoredExceptionHandler(void * /*token*/) {
+  return ::sigaction(SIGSEGV, &g_saved_segv_action, nullptr) == 0 ? 1 : 0;
+}
+#endif
 
 void TestPendingFaultBlocksUploadConsumption() {
   constexpr uintptr_t base = 0x0000000200010000ull;
@@ -978,14 +1149,17 @@ void TestCrossRegionUpload() {
 }
 
 void TestFatalPaths() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
   char path[MAX_PATH]{};
   Check(GetModuleFileNameA(nullptr, path, MAX_PATH) != 0,
         "GetModuleFileName failed");
+#endif
   for (const char *name : {"gpu-dirty-fault", "gpu-dirty-read", "virtual-gpu-read",
                            "gpu-dirty-explicit-cpu",
                            "unmapped", "reentrant-upload",
                            "writable-upload-race", "gpu-dirty-unmap-race",
                            "missing-download-bytes"}) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
     std::string command = std::string("\"") + path + "\" --death " + name;
     std::vector<char> mutable_command(command.begin(), command.end());
     mutable_command.push_back('\0');
@@ -1004,6 +1178,25 @@ void TestFatalPaths() {
           "MemoryTracker death path used the wrong exit");
     CloseHandle(process.hThread);
     CloseHandle(process.hProcess);
+#else
+    const pid_t pid = ::fork();
+    Check(pid >= 0, "fork failed");
+    if (pid == 0) {
+      // /proc/self/exe re-executes this same test binary in its --death mode.
+      ::execl("/proc/self/exe", "MemoryTrackerTests", "--death", name, nullptr);
+      std::_Exit(0x7e);
+    }
+    int status = 0;
+    Check(::waitpid(pid, &status, 0) == pid, "waitpid failed");
+    // EXIT() terminates with 321 and PageManager's FailFast with 322; the Windows check accepts
+    // both (FailFast there dies with EXCEPTION_NONCONTINUABLE_EXCEPTION). A process exit status
+    // only carries the low 8 bits, so the parent observes those codes masked. A fatal signal is
+    // equally good evidence that the invariant tripped.
+    const bool fatal_exit = WIFEXITED(status) && (WEXITSTATUS(status) == (321 & 0xff) ||
+                                                  WEXITSTATUS(status) == (322 & 0xff));
+    Check(fatal_exit || WIFSIGNALED(status),
+          "MemoryTracker death path used the wrong exit");
+#endif
   }
 }
 #endif
@@ -1011,7 +1204,7 @@ void TestFatalPaths() {
 } // namespace
 
 int main(int argc, char **argv) {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#if 1
   if (argc == 3 && std::strcmp(argv[1], "--death") == 0) {
     RunDeathCase(argv[2]);
   }

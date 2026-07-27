@@ -3,9 +3,14 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <initializer_list>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
+#else
+#include <csignal>
+#include <ucontext.h> // IWYU pragma: keep
+#include <unistd.h>
 #endif
 
 // IWYU pragma: no_include <errhandlingapi.h>
@@ -15,8 +20,6 @@
 // IWYU pragma: no_include <wtypes.h>
 
 namespace Common::HostException {
-
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 
 static std::atomic<Handler> g_handler {nullptr};
 static std::atomic_uint32_t g_install_state {0};
@@ -30,7 +33,9 @@ static_assert(decltype(g_install_state)::is_always_lock_free);
 	std::fputs(reason != nullptr ? reason : "unspecified", stderr);
 	std::fputc('\n', stderr);
 	std::fflush(stderr);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	TerminateProcess(GetCurrentProcess(), static_cast<UINT>(EXCEPTION_NONCONTINUABLE_EXCEPTION));
+#endif
 	std::_Exit(321);
 }
 
@@ -47,6 +52,20 @@ public:
 
 	KYTY_CLASS_NO_COPY(FilterScope);
 };
+
+static Handler LoadInstalledHandler() noexcept {
+	if (g_install_state.load(std::memory_order_acquire) == 0) {
+		FailFast("host exception handler is not installed");
+	}
+
+	const auto handler = g_handler.load(std::memory_order_acquire);
+	if (handler == nullptr) {
+		FailFast("host exception callback is null");
+	}
+	return handler;
+}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 
 static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) {
 	FilterScope filter_scope;
@@ -106,22 +125,89 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) {
 	info.r14 = exception->ContextRecord->R14;
 	info.r15 = exception->ContextRecord->R15;
 
-	if (g_install_state.load(std::memory_order_acquire) == 0) {
-		FailFast("host exception handler is not installed");
-	}
-
-	const auto handler = g_handler.load(std::memory_order_acquire);
-	if (handler == nullptr) {
-		FailFast("host exception callback is null");
-	}
+	const auto handler = LoadInstalledHandler();
 
 	return handler(info) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+}
+
+#else
+
+// x86-64 page-fault error code bits, as delivered in ucontext_t::uc_mcontext.gregs[REG_ERR].
+constexpr uint64_t PAGE_FAULT_ERROR_WRITE        = 0x02;
+constexpr uint64_t PAGE_FAULT_ERROR_INSTRUCTION  = 0x10;
+
+// Restores the default disposition so that returning from the handler re-executes the faulting
+// instruction, takes the same fault again, and lets the kernel apply the default action. This is
+// the Linux equivalent of EXCEPTION_CONTINUE_SEARCH reaching the end of the handler chain --
+// simply returning without this would spin on the faulting instruction forever.
+static void ChainToDefault(int signal_number) noexcept {
+	struct sigaction restore {};
+	restore.sa_handler = SIG_DFL;
+	sigemptyset(&restore.sa_mask);
+	restore.sa_flags = 0;
+	::sigaction(signal_number, &restore, nullptr);
+}
+
+static void SignalHandler(int signal_number, siginfo_t* signal_info, void* native_context) {
+	FilterScope filter_scope;
+
+	auto* context = static_cast<ucontext_t*>(native_context);
+	auto* gregs   = context->uc_mcontext.gregs;
+
+	ExceptionInfo info {};
+	info.exception_address = static_cast<uint64_t>(gregs[REG_RIP]);
+	info.native_code       = static_cast<uint32_t>(signal_number);
+	info.native_context    = context;
+
+	if (signal_number == SIGSEGV || signal_number == SIGBUS) {
+		info.type              = ExceptionType::AccessViolation;
+		const auto error_code  = static_cast<uint64_t>(gregs[REG_ERR]);
+		if ((error_code & PAGE_FAULT_ERROR_INSTRUCTION) != 0) {
+			info.access_violation_type = AccessViolationType::Execute;
+		} else if ((error_code & PAGE_FAULT_ERROR_WRITE) != 0) {
+			info.access_violation_type = AccessViolationType::Write;
+		} else {
+			info.access_violation_type = AccessViolationType::Read;
+		}
+		info.access_violation_vaddr = reinterpret_cast<uint64_t>(signal_info->si_addr);
+	} else if (signal_number == SIGILL) {
+		info.type = ExceptionType::IllegalInstruction;
+	} else {
+		ChainToDefault(signal_number);
+		return;
+	}
+
+	info.rax = static_cast<uint64_t>(gregs[REG_RAX]);
+	info.rbx = static_cast<uint64_t>(gregs[REG_RBX]);
+	info.rcx = static_cast<uint64_t>(gregs[REG_RCX]);
+	info.rdx = static_cast<uint64_t>(gregs[REG_RDX]);
+	info.rsi = static_cast<uint64_t>(gregs[REG_RSI]);
+	info.rdi = static_cast<uint64_t>(gregs[REG_RDI]);
+	info.rbp = static_cast<uint64_t>(gregs[REG_RBP]);
+	info.rsp = static_cast<uint64_t>(gregs[REG_RSP]);
+	info.r8  = static_cast<uint64_t>(gregs[REG_R8]);
+	info.r9  = static_cast<uint64_t>(gregs[REG_R9]);
+	info.r10 = static_cast<uint64_t>(gregs[REG_R10]);
+	info.r11 = static_cast<uint64_t>(gregs[REG_R11]);
+	info.r12 = static_cast<uint64_t>(gregs[REG_R12]);
+	info.r13 = static_cast<uint64_t>(gregs[REG_R13]);
+	info.r14 = static_cast<uint64_t>(gregs[REG_R14]);
+	info.r15 = static_cast<uint64_t>(gregs[REG_R15]);
+
+	const auto handler = LoadInstalledHandler();
+
+	if (handler(info)) {
+		// The handler resolved the fault (typically by restoring page protection), so returning
+		// re-executes the faulting instruction, which now succeeds.
+		return;
+	}
+
+	ChainToDefault(signal_number);
 }
 
 #endif
 
 bool InstallHandler(Handler handler) {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	if (handler == nullptr) {
 		return false;
 	}
@@ -133,19 +219,35 @@ bool InstallHandler(Handler handler) {
 
 	g_handler.store(handler, std::memory_order_release);
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	if (AddVectoredExceptionHandler(1, ExceptionFilter) == nullptr) {
 		g_handler.store(nullptr, std::memory_order_release);
 		g_install_state.store(0, std::memory_order_release);
 		printf("AddVectoredExceptionHandler() failed\n");
 		return false;
 	}
+#else
+	struct sigaction action {};
+	action.sa_sigaction = SignalHandler;
+	sigemptyset(&action.sa_mask);
+	// No SA_ONSTACK: fault resolution runs the full GPU invalidation path, which needs more stack
+	// than a typical sigaltstack, and it executes on threads whose normal stacks are ample.
+	action.sa_flags = SA_SIGINFO | SA_RESTART;
+
+	// SIGSEGV carries watched-page write faults, SIGBUS covers the same class of access faults on
+	// some mappings, and SIGILL feeds the x86-64 instruction emulator.
+	for (const int signal_number: {SIGSEGV, SIGBUS, SIGILL}) {
+		if (::sigaction(signal_number, &action, nullptr) != 0) {
+			g_handler.store(nullptr, std::memory_order_release);
+			g_install_state.store(0, std::memory_order_release);
+			printf("sigaction(%d) failed\n", signal_number);
+			return false;
+		}
+	}
+#endif
 
 	g_install_state.store(2, std::memory_order_release);
 	return true;
-#else
-	(void)handler;
-	return false;
-#endif
 }
 
 } // namespace Common::HostException

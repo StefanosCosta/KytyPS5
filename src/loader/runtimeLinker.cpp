@@ -345,6 +345,7 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 		guest_root_frame[0]    = 0;
 		guest_root_frame[1]    = 0;
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		asm volatile("pushq %%r12\n\t"
 		             "pushq %%r13\n\t"
 		             "movq %%rsp, %%r12\n\t"
@@ -362,11 +363,33 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 		             : "cc", "memory", "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0",
 		               "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9",
 		               "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15");
+#else
+		// Linux only, so the Windows codegen above stays exactly as it was. r12/r13 are declared
+		// as clobbers here instead of being saved with push/pop by hand: that makes the compiler
+		// preserve them across the block and -- critically -- stops it allocating
+		// func/guest_rsp/guest_rbp into them. With plain "r" constraints and no such clobber,
+		// clang 18 places func in r13, which "movq %rbp, %r13" then overwrites before the call,
+		// so the entry point call jumps to the saved rbp instead of the guest entry.
+		asm volatile("movq %%rsp, %%r12\n\t"
+		             "movq %%rbp, %%r13\n\t"
+		             "movq %[guest_rsp], %%rsp\n\t"
+		             "movq %[guest_rbp], %%rbp\n\t"
+		             "callq *%[func]\n\t"
+		             "movq %%r13, %%rbp\n\t"
+		             "movq %%r12, %%rsp\n\t"
+		             :
+		             : [func] "r"(func), "D"(params),
+		               "S"(atexit_func), [guest_rsp] "r"(guest_rsp), [guest_rbp] "r"(guest_rbp)
+		             : "cc", "memory", "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "r12",
+		               "r13", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
+		               "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15");
+#endif
 		return;
 	}
 
 	uintptr_t guest_root_frame[2] = {};
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	asm volatile("pushq %%r12\n\t"
 	             "pushq %%r13\n\t"
 	             "movq %%rbp, %%r12\n\t"
@@ -381,6 +404,20 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 	             : "cc", "memory", "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1",
 	               "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11",
 	               "xmm12", "xmm13", "xmm14", "xmm15");
+#else
+	// Linux only, for the same register-allocation hazard as the stack-switching path above:
+	// r12 must be a clobber so that func and guest_rbp cannot be assigned to it.
+	asm volatile("movq %%rbp, %%r12\n\t"
+	             "movq %[guest_rbp], %%rbp\n\t"
+	             "callq *%[func]\n\t"
+	             "movq %%r12, %%rbp\n\t"
+	             :
+	             : [func] "r"(func), "D"(params),
+	               "S"(atexit_func), [guest_rbp] "r"(guest_root_frame)
+	             : "cc", "memory", "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "r12", "xmm0",
+	               "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10",
+	               "xmm11", "xmm12", "xmm13", "xmm14", "xmm15");
+#endif
 #else
 	(void)stack_top;
 	reinterpret_cast<entry_func_t>(addr)(params, atexit_func);

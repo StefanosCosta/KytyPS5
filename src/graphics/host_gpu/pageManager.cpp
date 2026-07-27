@@ -19,6 +19,16 @@
 #include <windows.h>
 #undef min
 #undef max
+#else
+#include <cerrno>
+#include <cstring>
+#include <execinfo.h>
+#include <fcntl.h>
+#include <string>
+#include <string_view>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #endif
 
 namespace Libs::Graphics {
@@ -35,9 +45,12 @@ constexpr uint32_t NO_ACCESS_PROTECTION = PAGE_NOACCESS;
 constexpr uint32_t READ_ONLY_PROTECTION = PAGE_READONLY;
 constexpr uint32_t READ_WRITE_PROTECTION = PAGE_READWRITE;
 #else
-constexpr uint32_t NO_ACCESS_PROTECTION = 0;
-constexpr uint32_t READ_ONLY_PROTECTION = 1;
-constexpr uint32_t READ_WRITE_PROTECTION = 2;
+// Zero is reserved as the "unset" sentinel for PageState::original_protection and as the
+// "unknown" sentinel for PageState::current_protection, so no real protection may use it.
+constexpr uint32_t UNKNOWN_PROTECTION    = 0;
+constexpr uint32_t NO_ACCESS_PROTECTION  = 1;
+constexpr uint32_t READ_ONLY_PROTECTION  = 2;
+constexpr uint32_t READ_WRITE_PROTECTION = 3;
 #endif
 
 thread_local bool g_in_fault_resolution = false;
@@ -56,6 +69,12 @@ thread_local bool g_in_fault_resolution = false;
 		std::fprintf(stderr, "  frame[%u]=0x%016" PRIxPTR " image_rva=0x%016" PRIxPTR "\n", i,
 		             address, address >= image_base ? address - image_base : 0);
 	}
+#else
+	void*     frames[16] {};
+	const int frame_count = ::backtrace(frames, static_cast<int>(std::size(frames)));
+	// backtrace_symbols_fd avoids the malloc that backtrace_symbols would perform; this runs
+	// from a signal handler on the fault path.
+	::backtrace_symbols_fd(frames, frame_count, STDERR_FILENO);
 #endif
 	std::fflush(stderr);
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -79,9 +98,86 @@ uint32_t CurrentThread() noexcept {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	return GetCurrentThreadId();
 #else
-	FailFast();
+	// Zero marks "no owner" in PageState::backing_writer, and Linux never assigns tid 0 to a
+	// thread, so the raw kernel tid can be used directly as an owner token.
+	static thread_local const uint32_t tid = [] {
+		const auto raw = static_cast<uint32_t>(::syscall(SYS_gettid));
+		if (raw == 0) {
+			FailFast("gettid returned the reserved zero owner token");
+		}
+		return raw;
+	}();
+	return tid;
 #endif
 }
+
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+int ToHostProtection(uint32_t protection) {
+	switch (protection) {
+		case NO_ACCESS_PROTECTION: return PROT_NONE;
+		case READ_ONLY_PROTECTION: return PROT_READ;
+		case READ_WRITE_PROTECTION: return PROT_READ | PROT_WRITE;
+		default: Fatal("unmappable protection 0x%08" PRIx32, protection);
+	}
+}
+
+// Reads the kernel's real protection for a page. Linux has no VirtualQuery equivalent, so this
+// walks /proc/self/maps, which is sorted by address and can therefore stop at the first region
+// that ends past the target. It is only consulted to confirm a shadow that already says the
+// access is permitted -- see AllowsAccess -- so a page PageManager itself protected never
+// reaches here, and the cost stays off the watched-page fault path.
+uint32_t QueryHostProtection(uint64_t vaddr) noexcept {
+	int fd = ::open("/proc/self/maps", O_RDONLY | O_CLOEXEC); // NOLINT
+	if (fd < 0) {
+		return UNKNOWN_PROTECTION;
+	}
+
+	uint32_t    result = UNKNOWN_PROTECTION;
+	char        buffer[8192];
+	std::string carry;
+
+	for (bool done = false; !done;) {
+		const auto got = ::read(fd, buffer, sizeof(buffer));
+		if (got <= 0) {
+			break;
+		}
+		carry.append(buffer, static_cast<size_t>(got));
+
+		size_t line_start = 0;
+		while (true) {
+			const auto newline = carry.find('\n', line_start);
+			if (newline == std::string::npos) {
+				break;
+			}
+			const std::string line = carry.substr(line_start, newline - line_start);
+			line_start             = newline + 1;
+
+			unsigned long start = 0;
+			unsigned long end   = 0;
+			char          perms[8] {};
+			if (std::sscanf(line.c_str(), "%lx-%lx %7s", &start, &end, perms) != 3) {
+				continue;
+			}
+			if (vaddr < start) {
+				// Regions are address-ordered, so the target is in no mapping at all.
+				done = true;
+				break;
+			}
+			if (vaddr < end) {
+				result = perms[1] == 'w'   ? READ_WRITE_PROTECTION
+				         : perms[0] == 'r' ? READ_ONLY_PROTECTION
+				                           : NO_ACCESS_PROTECTION;
+				done   = true;
+				break;
+			}
+		}
+		carry.erase(0, line_start);
+	}
+
+	::close(fd);
+	return result;
+}
+#endif
 
 class SpinGuard final {
 public:
@@ -124,6 +220,12 @@ struct PageManager::Impl {
 		uint32_t         access_watchers      = 0;
 		uint32_t         original_protection  = 0;
 		uint32_t         backing_writer       = 0;
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+		// Linux has no cheap per-page protection query (VirtualQuery has no equivalent short of
+		// re-parsing /proc/self/maps), so PageManager shadows the protection it has applied.
+		// Every mutation goes through Impl::Protect while the page lock is held.
+		uint32_t current_protection = UNKNOWN_PROTECTION;
+#endif
 		bool             resolving            = false;
 		bool             resolving_read_write = false;
 		bool             late_read_pending    = false;
@@ -146,7 +248,10 @@ struct PageManager::Impl {
 			      static_cast<uint32_t>(info.dwPageSize));
 		}
 #else
-		Fatal("page-fault invalidation is not implemented on this platform");
+		const auto host_page_size = ::sysconf(_SC_PAGESIZE);
+		if (host_page_size < 0 || static_cast<uint64_t>(host_page_size) != PAGE_SIZE) {
+			Fatal("unsupported host page size %ld", static_cast<long>(host_page_size));
+		}
 #endif
 		regions = std::make_unique<std::atomic<Region*>[]>(REGION_COUNT);
 		for (uint64_t i = 0; i < REGION_COUNT; i++) {
@@ -214,7 +319,10 @@ struct PageManager::Impl {
 		}
 	}
 
-	static uint32_t QueryProtection(uint64_t vaddr) {
+	// All three helpers are called with the page's spin lock held, which is what makes the
+	// non-Windows protection shadow in PageState safe to read and write without further
+	// synchronisation.
+	static uint32_t QueryProtection([[maybe_unused]] PageState& page, uint64_t vaddr) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		MEMORY_BASIC_INFORMATION info {};
 		if (VirtualQuery(reinterpret_cast<const void*>(static_cast<uintptr_t>(vaddr)), &info,
@@ -226,12 +334,23 @@ struct PageManager::Impl {
 		}
 		return info.Protect;
 #else
-		(void)vaddr;
-		Fatal("page query is unsupported on this platform");
+		// This runs once per page when its first watcher attaches, not on the fault path, so it
+		// can afford the real kernel query and enforce the same invariant as the Windows
+		// VirtualQuery path: the page must be mapped and read/write before it can be watched.
+		// UNKNOWN_PROTECTION here means no mapping covers the address at all.
+		const auto host_protection = QueryHostProtection(vaddr);
+		if (host_protection != READ_WRITE_PROTECTION) {
+			Fatal("basic path requires a read/write mapping at 0x%016" PRIx64
+			      " (protection=0x%08" PRIx32 ")",
+			      vaddr, host_protection);
+		}
+		page.current_protection = host_protection;
+		return host_protection;
 #endif
 	}
 
-	static bool AllowsAccess(uint64_t vaddr, PageFaultAccess access) noexcept {
+	static bool AllowsAccess([[maybe_unused]] const PageState& page, uint64_t vaddr,
+	                         PageFaultAccess access) noexcept {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		MEMORY_BASIC_INFORMATION info {};
 		if (VirtualQuery(reinterpret_cast<const void*>(static_cast<uintptr_t>(vaddr)), &info,
@@ -246,13 +365,30 @@ struct PageManager::Impl {
 			default: return false;
 		}
 #else
-		(void)vaddr;
-		return false;
+		// The shadow is the fast path and is conservative: a page PageManager has never
+		// protected has an UNKNOWN shadow and is reported inaccessible, which routes the fault
+		// to the guest exception path rather than resuming an instruction that would fault
+		// forever. When the shadow says the access IS permitted the answer is confirmed against
+		// the kernel, because something outside PageManager may have re-protected the page and
+		// resuming into a genuinely read-only mapping would loop.
+		const auto permitted = [](uint32_t protection, PageFaultAccess wanted) {
+			switch (wanted) {
+				case PageFaultAccess::Read:
+					return protection == READ_ONLY_PROTECTION || protection == READ_WRITE_PROTECTION;
+				case PageFaultAccess::Write: return protection == READ_WRITE_PROTECTION;
+				default: return false;
+			}
+		};
+
+		if (!permitted(page.current_protection, access)) {
+			return false;
+		}
+		return permitted(QueryHostProtection(vaddr), access);
 #endif
 	}
 
-	static void Protect(uint64_t vaddr, uint32_t protection, uint32_t expected_old,
-	                    bool fault_path) noexcept {
+	static void Protect([[maybe_unused]] PageState& page, uint64_t vaddr, uint32_t protection,
+	                    uint32_t expected_old, bool fault_path) noexcept {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		DWORD old_protection = 0;
 		if (VirtualProtect(reinterpret_cast<void*>(static_cast<uintptr_t>(vaddr)), PAGE_SIZE,
@@ -266,10 +402,26 @@ struct PageManager::Impl {
 			      vaddr, static_cast<uint32_t>(old_protection), expected_old, protection);
 		}
 #else
-		(void)vaddr;
-		(void)protection;
-		(void)fault_path;
-		FailFast("page protection is unsupported on this platform");
+		// The shadow stands in for VirtualProtect's old-protection readback, so the same
+		// unexpected-transition invariant is still enforced.
+		if (page.current_protection != UNKNOWN_PROTECTION &&
+		    page.current_protection != expected_old) {
+			if (fault_path) {
+				FailFast("mprotect fault transition did not match expected protection");
+			}
+			Fatal("invalid protection transition at 0x%016" PRIx64 ", old=0x%08" PRIx32
+			      ", expected=0x%08" PRIx32 ", new=0x%08" PRIx32,
+			      vaddr, page.current_protection, expected_old, protection);
+		}
+		if (::mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(vaddr)), PAGE_SIZE,
+		               ToHostProtection(protection)) != 0) {
+			if (fault_path) {
+				FailFast("mprotect failed on the fault path");
+			}
+			Fatal("mprotect failed at 0x%016" PRIx64 ", new=0x%08" PRIx32 " (%s)", vaddr,
+			      protection, std::strerror(errno));
+		}
+		page.current_protection = protection;
 #endif
 	}
 
@@ -399,13 +551,13 @@ void PageManager::UpdatePageWatchers(bool track, uint64_t vaddr, uint64_t size,
 			}
 			const bool first_watcher = page.write_watchers == 0 && page.access_watchers == 0;
 			if (first_watcher) {
-				page.original_protection = Impl::QueryProtection(page_vaddr);
+				page.original_protection = Impl::QueryProtection(page, page_vaddr);
 			}
 			const auto old_protection = Impl::WatcherProtection(page);
 			watchers++;
 			const auto new_protection = Impl::WatcherProtection(page);
 			if (new_protection != old_protection) {
-				Impl::Protect(page_vaddr, new_protection, old_protection, false);
+				Impl::Protect(page, page_vaddr, new_protection, old_protection, false);
 			}
 			switch (new_protection) {
 				case NO_ACCESS_PROTECTION:
@@ -426,7 +578,7 @@ void PageManager::UpdatePageWatchers(bool track, uint64_t vaddr, uint64_t size,
 			watchers--;
 			const auto new_protection = Impl::WatcherProtection(page);
 			if (page.backing_writer == 0 && new_protection != old_protection) {
-				Impl::Protect(page_vaddr, new_protection, old_protection, false);
+				Impl::Protect(page, page_vaddr, new_protection, old_protection, false);
 			}
 			if (page.backing_writer == 0) {
 				Impl::PublishDelayedFaults(page, old_protection, new_protection);
@@ -459,6 +611,16 @@ void PageManager::OnGpuMap(uint64_t vaddr, uint64_t size, GpuAccess access) {
 		page.mappings++;
 		page.gpu_read_mappings += gpu_read ? 1u : 0u;
 		page.gpu_write_mappings += gpu_write ? 1u : 0u;
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+		// A guest page that has just been mapped is read/write, which is exactly what
+		// VirtualQuery reports on Windows. Seeding the shadow here keeps AllowsAccess answering
+		// correctly for pages PageManager has mapped but not yet protected -- without it, the
+		// first host write to such a page is refused. Pages that were never mapped keep the
+		// UNKNOWN sentinel so a genuinely wild access is still reported as inaccessible.
+		if (page.current_protection == UNKNOWN_PROTECTION) {
+			page.current_protection = READ_WRITE_PROTECTION;
+		}
+#endif
 	}
 }
 
@@ -580,7 +742,7 @@ void PageManager::EndBackingWrite(uint64_t vaddr, uint64_t size) noexcept {
 		const auto old_protection = NO_ACCESS_PROTECTION;
 		const auto new_protection = Impl::WatcherProtection(page);
 		if (new_protection != old_protection) {
-			Impl::Protect(address, new_protection, old_protection, false);
+			Impl::Protect(page, address, new_protection, old_protection, false);
 		}
 		Impl::PublishDelayedFaults(page, old_protection, new_protection);
 		if (page.write_watchers == 0 && page.access_watchers == 0) {
@@ -605,12 +767,12 @@ bool PageManager::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noex
 	while (true) {
 		SpinGuard lock(page.lock);
 		if (access == PageFaultAccess::Read && page.late_read_pending &&
-		    Impl::AllowsAccess(fault_vaddr, access)) {
+		    Impl::AllowsAccess(page, fault_vaddr, access)) {
 			page.late_read_pending = false;
 			return true;
 		}
 		if (access == PageFaultAccess::Write && page.late_write_pending &&
-		    Impl::AllowsAccess(fault_vaddr, access)) {
+		    Impl::AllowsAccess(page, fault_vaddr, access)) {
 			page.late_write_pending = false;
 			return true;
 		}
@@ -632,7 +794,7 @@ bool PageManager::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noex
 			}
 			bool&      pending = (access == PageFaultAccess::Read ? page.late_read_pending
 			                                                      : page.late_write_pending);
-			const bool allowed = Impl::AllowsAccess(fault_vaddr, access);
+			const bool allowed = Impl::AllowsAccess(page, fault_vaddr, access);
 			pending            = false;
 			if (waited && !allowed) {
 				FailFast("page remained inaccessible after waiting for its resolver");
@@ -681,12 +843,12 @@ bool PageManager::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noex
 				page.write_watchers = 0;
 			}
 			const auto restored_protection = Impl::WatcherProtection(page);
-			Impl::Protect(PageStart(fault_vaddr), restored_protection, old_protection, true);
+			Impl::Protect(page, PageStart(fault_vaddr), restored_protection, old_protection, true);
 			if (page.write_watchers == 0) {
 				page.original_protection = 0;
 			}
 			Impl::PublishDelayedFaults(page, old_protection, restored_protection);
-		} else if (!Impl::AllowsAccess(fault_vaddr, access)) {
+		} else if (!Impl::AllowsAccess(page, fault_vaddr, access)) {
 			FailFast("fault completion left the page inaccessible");
 		}
 		page.resolving            = false;

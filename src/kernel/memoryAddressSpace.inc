@@ -1051,7 +1051,16 @@ private:
 
 	static bool UnmapView(void* vaddr, uint64_t size) { return munmap(vaddr, size) == 0; }
 
-	static bool UnmapViewPreservePlaceholder(void* /*vaddr*/, uint64_t /*size*/) { return false; }
+	// Windows drops the view but keeps the range owned via MEM_PRESERVE_PLACEHOLDER, then
+	// re-reserves it. Linux has no placeholder concept anywhere in this class -- AddFree and
+	// Consume are Windows-only, and ReserveFixed just forwards to VirtualMemory -- so the
+	// honest equivalent is a plain unmap. The caller re-reserves the range immediately
+	// afterwards with MAP_FIXED_NOREPLACE, which requires it to actually be free; leaving an
+	// anonymous PROT_NONE mapping behind to imitate a placeholder makes that reservation fail
+	// with EEXIST.
+	static bool UnmapViewPreservePlaceholder(void* vaddr, uint64_t size) {
+		return munmap(vaddr, size) == 0;
+	}
 
 	int m_fd = -1;
 #endif

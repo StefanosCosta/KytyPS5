@@ -11,6 +11,9 @@
 
 #include <cerrno>
 #include <cstdlib>
+#include <dirent.h>
+#include <filesystem>
+#include <system_error>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <utime.h>
@@ -260,8 +263,20 @@ uint64_t SysFileSize(const std::filesystem::path& file_name) {
 	return size;
 }
 
-bool SysFileTruncate(sys_file_t& /*f*/, uint64_t /*size*/) {
-	return false;
+bool SysFileTruncate(sys_file_t& f, uint64_t size) {
+	bool ok = false;
+	if (f.type == SYS_FILE_FILE) {
+		// Mirrors the Windows implementation, which saves the caller's position, resizes, then
+		// restores it. Buffered writes have to reach the descriptor first or ftruncate would
+		// resize around data still sitting in the stdio buffer.
+		const auto position = ftell(f.f);
+		fflush(f.f);
+		ok = (ftruncate(fileno(f.f), static_cast<off_t>(size)) == 0);
+		if (position >= 0) {
+			fseek(f.f, position, SEEK_SET);
+		}
+	}
+	return ok;
 }
 
 bool SysFileUnlink(sys_file_t& /*f*/, const std::filesystem::path& name) {
@@ -531,27 +546,114 @@ bool SysFileSetLastAccessAndWriteTimeUtc(const std::filesystem::path& name,
 	//	}
 }
 
-void SysFileFindFiles(const std::filesystem::path& /*path*/,
-                      std::vector<sys_file_find_t>& /*out*/) {
-	EXIT("not implemented\n");
+// Recurses into subdirectories and collects files only, matching the Windows FindFirstFileW-based
+// implementation. A directory that cannot be opened is skipped rather than fatal, because the
+// Windows version likewise returns early when FindFirstFileW fails.
+void SysFileFindFiles(const std::filesystem::path& path, std::vector<sys_file_find_t>& out) {
+	auto real_path = get_internal_name(path);
+
+	DIR* dir = opendir(real_path.string().c_str());
+	if (dir == nullptr) {
+		return;
+	}
+
+	for (const dirent* entry = readdir(dir); entry != nullptr; entry = readdir(dir)) {
+		const std::string file_name(entry->d_name);
+
+		if (file_name == "." || file_name == "..") {
+			continue;
+		}
+
+		auto        child = real_path / file_name;
+		struct stat s {};
+
+		// lstat, so a symlink is never followed into a cycle during the recursive walk.
+		if (0 != lstat(child.string().c_str(), &s)) {
+			continue;
+		}
+
+		if (S_ISDIR(s.st_mode)) {
+			SysFileFindFiles(child, out);
+		} else if (S_ISREG(s.st_mode)) {
+			sys_file_find_t r {};
+
+			r.path_with_name              = child;
+			r.size                        = static_cast<uint64_t>(s.st_size);
+			r.last_access_time.is_invalid = false;
+			r.last_access_time.time       = s.st_atime;
+			r.last_write_time.is_invalid  = false;
+			r.last_write_time.time        = s.st_mtime;
+
+			out.push_back(r);
+		}
+	}
+
+	closedir(dir);
 }
 
-void SysFileGetDents(const std::filesystem::path& /*path*/, std::vector<sys_dir_entry_t>& /*out*/) {
-	EXIT("not implemented\n");
+// Non-recursive, and deliberately keeps "." and ".." because the Windows implementation reports
+// whatever FindFirstFileW yields, including both dot entries. Guest getdents relies on them.
+void SysFileGetDents(const std::filesystem::path& path, std::vector<sys_dir_entry_t>& out) {
+	auto real_path = get_internal_name(path);
+
+	DIR* dir = opendir(real_path.string().c_str());
+	if (dir == nullptr) {
+		return;
+	}
+
+	for (const dirent* entry = readdir(dir); entry != nullptr; entry = readdir(dir)) {
+		sys_dir_entry_t r {};
+
+		r.name = entry->d_name;
+
+		if (entry->d_type == DT_UNKNOWN) {
+			// Some filesystems do not populate d_type; fall back to stat.
+			struct stat s {};
+			r.is_file = 0 == lstat((real_path / r.name).string().c_str(), &s) && S_ISREG(s.st_mode);
+		} else {
+			r.is_file = entry->d_type != DT_DIR;
+		}
+
+		out.push_back(r);
+	}
+
+	closedir(dir);
 }
 
-bool SysFileCopyFile(const std::filesystem::path& /*src*/, const std::filesystem::path& /*dst*/) {
-	EXIT("not implemented\n");
-	return false;
+bool SysFileCopyFile(const std::filesystem::path& src, const std::filesystem::path& dst) {
+	// CopyFileW with bFailIfExists = FALSE overwrites the destination.
+	std::error_code error;
+	return std::filesystem::copy_file(get_internal_name(src), get_internal_name(dst),
+	                                  std::filesystem::copy_options::overwrite_existing, error) &&
+	       !error;
 }
 
-bool SysFileMoveFile(const std::filesystem::path& /*src*/, const std::filesystem::path& /*dst*/) {
-	EXIT("not implemented\n");
-	return false;
+bool SysFileMoveFile(const std::filesystem::path& src, const std::filesystem::path& dst) {
+	auto real_src = get_internal_name(src);
+	auto real_dst = get_internal_name(dst);
+
+	// MoveFileW fails when the destination already exists, whereas rename() would silently
+	// replace it, so the existence check preserves the Windows contract.
+	std::error_code error;
+	if (std::filesystem::exists(real_dst, error)) {
+		return false;
+	}
+
+	return 0 == rename(real_src.string().c_str(), real_dst.string().c_str());
 }
 
-void SysFileRemoveReadonly(const std::filesystem::path& /*name*/) {
-	EXIT("not implemented\n");
+void SysFileRemoveReadonly(const std::filesystem::path& name) {
+	auto real_name     = get_internal_name(name);
+	auto real_name_str = real_name.string();
+
+	struct stat s {};
+
+	if (0 != stat(real_name_str.c_str(), &s)) {
+		return;
+	}
+
+	// The closest equivalent of clearing FILE_ATTRIBUTE_READONLY is restoring owner write access.
+	chmod(real_name_str.c_str(), s.st_mode | S_IWUSR);
 }
 
 #endif

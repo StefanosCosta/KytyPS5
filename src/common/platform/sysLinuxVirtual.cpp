@@ -8,6 +8,7 @@
 #include "common/platform/sysVirtual.h"
 #include "common/virtualMemory.h"
 
+#include <atomic>
 #include <map>
 #include <pthread.h>
 #include <sys/mman.h>
@@ -76,6 +77,58 @@ static VirtualMemory::Mode get_protection_flag(int mode) {
 	}
 }
 
+// Guest memory has to land below the GPU page tracker's 1<<40 window, or MapGpuRange rejects it
+// (see IsGpuAddressRange in kernel/memory.cpp). Windows VirtualAlloc naturally hands out low
+// addresses, but Linux mmap places anonymous mappings near the top of the address space, which
+// lands well above the limit. When the caller does not pin an address, bump-allocate a hint
+// through a low arena instead of letting the kernel choose.
+//
+// The arena is placed at the TOP of the trackable window and grows downward. Guests reserve
+// their own ranges from low addresses upward -- an Unreal Engine title asks for a single 512 GiB
+// placeholder at 64 GiB, spanning 64..576 GiB -- so an arena anywhere in the low half fragments
+// that range and the reservation fails, falling back to an untrackable high address. Growing
+// down from the limit keeps the two allocators moving away from each other.
+static constexpr uintptr_t LOW_ARENA_LIMIT = 0x0000010000000000ULL; // 1<<40, the tracker limit
+static constexpr uintptr_t LOW_ARENA_FLOOR = 0x000000A000000000ULL; // 640 GiB
+static constexpr uintptr_t LOW_ARENA_GRAIN = 0x0000000000010000ULL; // 64 KiB
+
+static std::atomic<uintptr_t> g_low_arena_next {LOW_ARENA_LIMIT};
+
+static uintptr_t align_up_to(uintptr_t addr, uint64_t alignment) {
+	return (addr + alignment - 1) & ~(alignment - 1);
+}
+
+// Drop-in replacement for the anonymous mmap calls below. A pinned address is passed straight
+// through; only the "kernel picks" case is redirected into the low arena. MAP_FIXED_NOREPLACE
+// makes an occupied hint fail cleanly instead of silently clobbering an existing mapping, so the
+// walk simply advances and retries.
+static void* map_anonymous(uintptr_t addr, size_t size, int protect, int flags) {
+	if (addr != 0) {
+		return mmap(reinterpret_cast<void*>(addr), size, protect, flags, -1, 0); // NOLINT
+	}
+
+#ifdef KYTY_FIXED_NOREPLACE
+	const auto step = align_up_to(size, LOW_ARENA_GRAIN);
+	for (int attempt = 0; attempt < 256; attempt++) {
+		const auto top = g_low_arena_next.fetch_sub(step, std::memory_order_relaxed);
+		if (top < step || top - step < LOW_ARENA_FLOOR) {
+			break;
+		}
+		const auto hint = (top - step) & ~(LOW_ARENA_GRAIN - 1);
+		void*      ptr  = mmap(reinterpret_cast<void*>(hint), size, protect,
+		                       flags | MAP_FIXED_NOREPLACE, -1, 0); // NOLINT
+		if (ptr != MAP_FAILED) {
+			return ptr;
+		}
+	}
+#endif
+
+	// The arena is exhausted or unusable. Fall back to letting the kernel choose: allocations
+	// that are never handed to the GPU still work at a high address, and one that is will fail
+	// loudly in MapGpuRange rather than corrupting anything.
+	return mmap(nullptr, size, protect, flags, -1, 0); // NOLINT
+}
+
 uint64_t SysVirtualAlloc(uint64_t address, uint64_t size, VirtualMemory::Mode mode) {
 	EXIT_IF(g_allocs == nullptr);
 
@@ -83,8 +136,7 @@ uint64_t SysVirtualAlloc(uint64_t address, uint64_t size, VirtualMemory::Mode mo
 
 	int protect = get_protection_flag(mode);
 
-	void* ptr =
-	    mmap(reinterpret_cast<void*>(addr), size, protect, MAP_PRIVATE | MAP_ANON, -1, 0); // NOLINT
+	void* ptr = map_anonymous(addr, size, protect, MAP_PRIVATE | MAP_ANON);
 
 	auto ret_addr = reinterpret_cast<uintptr_t>(ptr);
 
@@ -117,16 +169,15 @@ uint64_t SysVirtualAllocAligned(uint64_t address, uint64_t size, VirtualMemory::
 	auto addr    = static_cast<uintptr_t>(address);
 	int  protect = get_protection_flag(mode);
 
-	void* ptr =
-	    mmap(reinterpret_cast<void*>(addr), size, protect, MAP_PRIVATE | MAP_ANON, -1, 0); // NOLINT
+	void* ptr = map_anonymous(addr, size, protect, MAP_PRIVATE | MAP_ANON);
 
 	auto ret_addr = reinterpret_cast<uintptr_t>(ptr);
 
 	if (ptr != MAP_FAILED && ((ret_addr & (alignment - 1)) != 0)) {
 		munmap(ptr, size);
 
-		ptr      = mmap(reinterpret_cast<void*>(addr), size + alignment, protect,
-		                MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0); // NOLINT
+		ptr      = map_anonymous(addr, size + alignment, protect,
+		                         MAP_PRIVATE | MAP_ANON | MAP_NORESERVE);
 		ret_addr = reinterpret_cast<uintptr_t>(ptr);
 		if (ptr != MAP_FAILED) {
 			munmap(ptr, size + alignment);
@@ -249,16 +300,15 @@ uint64_t SysVirtualReserveAligned(uint64_t address, uint64_t size, uint64_t alig
 
 	auto addr = static_cast<uintptr_t>(address);
 
-	void* ptr = mmap(reinterpret_cast<void*>(addr), size, PROT_NONE,
-	                 MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0); // NOLINT
+	void* ptr = map_anonymous(addr, size, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE);
 
 	auto ret_addr = reinterpret_cast<uintptr_t>(ptr);
 
 	if (ptr != MAP_FAILED && ((ret_addr & (alignment - 1)) != 0)) {
 		munmap(ptr, size);
 
-		ptr      = mmap(reinterpret_cast<void*>(addr), size + alignment, PROT_NONE,
-		                MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0); // NOLINT
+		ptr      = map_anonymous(addr, size + alignment, PROT_NONE,
+		                         MAP_PRIVATE | MAP_ANON | MAP_NORESERVE);
 		ret_addr = reinterpret_cast<uintptr_t>(ptr);
 		if (ptr != MAP_FAILED) {
 			munmap(ptr, size + alignment);

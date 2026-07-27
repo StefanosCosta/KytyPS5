@@ -153,6 +153,18 @@ void FileDescriptors::DeleteDescriptor(int d) {
 	EXIT_IF(m_files[index] == nullptr);
 	EXIT_IF(m_files[index]->opened);
 
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+	// KernelOpen tears a descriptor down on its failure paths before setting `opened`, but the
+	// underlying host file may already have been created or opened by then. Releasing it here
+	// keeps ~File()'s "handle was closed" invariant from tripping on those paths. Close() is a
+	// no-op when nothing is open.
+	//
+	// Guarded to non-Windows so that Windows behaviour is left exactly as it was. The same
+	// latent issue exists there, but it is a pre-existing condition rather than something this
+	// Linux port should change.
+	m_files[index]->f.Close();
+#endif
+
 	delete m_files[index];
 	m_files[index] = nullptr;
 }
