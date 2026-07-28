@@ -653,6 +653,12 @@ LIB_VERSION("Http2", 1, "Http2", 1, 1);
 constexpr int HTTP2_ERROR_INVALID_ID   = -2122641152; /* 0x817B1100 */
 constexpr int HTTP2_ERROR_NULL_POINTER = -2122640859; /* 0x817B1225 */
 
+// libhttp2 numbers its errors like libhttp does, with only the facility differing: the INVALID_ID
+// pair above is 0x817B1100 against SCE_HTTP_ERROR_INVALID_ID's 0x80431100 in errno.h. These two are
+// the same substitution applied to HTTP_ERROR_BEFORE_SEND and HTTP_ERROR_TIMEOUT.
+constexpr int HTTP2_ERROR_BEFORE_SEND = -2122641307; /* 0x817B1065 */
+constexpr int HTTP2_ERROR_TIMEOUT     = -2122641304; /* 0x817B1068 */
+
 struct Http2Options {
 	bool     auth_enabled               = false;
 	bool     auto_redirect              = false;
@@ -691,9 +697,16 @@ struct Http2Request {
 	std::string                                      url;
 	uint64_t                                         content_length = 0;
 	std::vector<std::pair<std::string, std::string>> headers;
-	bool                                             sent        = false;
-	int                                              status_code = 204;
-	std::string  response_headers                                = "HTTP/2 204 No Content\r\n\r\n";
+	// There is no HTTP transport behind any of this, so a request never produces a response. Saying
+	// so is the whole point: this used to report a fabricated "204 No Content" success, and
+	// Subnautica's Unity analytics code dereferenced the null download handler that a 204 with no
+	// body leaves behind, faulting at [0x10] inside Il2CppUserAssemblies. libhttp v1 in
+	// network.cpp already models it this way -- HttpSendRequest fails and every accessor hands the
+	// recorded send_result back -- and libhttp2 was the odd one out.
+	bool         sent        = false;
+	int          send_result = HTTP2_ERROR_BEFORE_SEND;
+	int          status_code = 0;
+	std::string  response_headers;
 	std::string  response_body;
 	size_t       read_offset  = 0;
 	int          async_result = 0;
@@ -1111,9 +1124,10 @@ static int KYTY_SYSV_ABI Http2SendRequest(int req_id, const void* post_data, siz
 		return HTTP2_ERROR_INVALID_ID;
 	}
 
-	request->second.sent = true;
+	request->second.sent        = true;
+	request->second.send_result = HTTP2_ERROR_TIMEOUT;
 
-	return 0;
+	return HTTP2_ERROR_TIMEOUT;
 }
 
 static int KYTY_SYSV_ABI Http2SendRequestAsync(int req_id, const void* post_data, size_t size,
@@ -1133,8 +1147,11 @@ static int KYTY_SYSV_ABI Http2SendRequestAsync(int req_id, const void* post_data
 		return HTTP2_ERROR_INVALID_ID;
 	}
 
+	// Queueing the request is what succeeds here; the failure is delivered through Http2WaitAsync,
+	// which is where the asynchronous form reports a result.
 	request->second.sent         = true;
-	request->second.async_result = 0;
+	request->second.send_result  = HTTP2_ERROR_TIMEOUT;
+	request->second.async_result = HTTP2_ERROR_TIMEOUT;
 	request->second.async_event  = 0;
 
 	return 0;
@@ -1182,7 +1199,7 @@ static int KYTY_SYSV_ABI Http2GetStatusCode(int req_id, int* status_code) {
 
 	*status_code = request->second.status_code;
 
-	return 0;
+	return request->second.send_result;
 }
 
 static int KYTY_SYSV_ABI Http2GetResponseContentLength(int req_id, int* result,
@@ -1205,7 +1222,7 @@ static int KYTY_SYSV_ABI Http2GetResponseContentLength(int req_id, int* result,
 	*result         = 0; // SCE_HTTP2_CONTENTLEN_EXIST
 	*content_length = request->second.response_body.size();
 
-	return 0;
+	return request->second.send_result;
 }
 
 static int KYTY_SYSV_ABI Http2GetAllResponseHeaders(int req_id, char** header,
@@ -1225,10 +1242,14 @@ static int KYTY_SYSV_ABI Http2GetAllResponseHeaders(int req_id, char** header,
 		return HTTP2_ERROR_INVALID_ID;
 	}
 
-	*header      = const_cast<char*>(request->second.response_headers.c_str());
-	*header_size = request->second.response_headers.size();
+	// Null rather than a pointer into an empty std::string: the guest is handed a host heap address
+	// here, and Http2DeleteRequest frees the string out from under it. With no response to report
+	// there is nothing to point at, and null is what libhttp v1 yields in the same situation.
+	const auto& headers = request->second.response_headers;
+	*header             = (headers.empty() ? nullptr : const_cast<char*>(headers.c_str()));
+	*header_size        = headers.size();
 
-	return 0;
+	return request->second.send_result;
 }
 
 static int KYTY_SYSV_ABI Http2ReadData(int req_id, void* data, size_t size) {

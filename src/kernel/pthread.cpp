@@ -808,7 +808,10 @@ static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func,
 
 	if (g_pthread_self != nullptr) {
 		g_pthread_self->guest_host_rbx = host_rbx;
-		g_pthread_self->guest_host_rsp = host_rsp - (2u * sizeof(uint64_t));
+		// Four qwords: the r12/r13/r14/r15 the asm below pushes before switching stacks. PthreadExit
+		// re-enters that asm mid-block by loading this into r12 and returning, so it has to name the
+		// host rsp *after* the pushes or the pops come back off the wrong slots.
+		g_pthread_self->guest_host_rsp = host_rsp - (4u * sizeof(uint64_t));
 		g_pthread_self->guest_host_rbp = host_rbp;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		uintptr_t host_gs8  = 0;
@@ -818,18 +821,45 @@ static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func,
 		             : "=r"(host_gs8), "=r"(host_gs10)
 		             :
 		             : "memory");
-		g_pthread_self->guest_host_rsp -= 2u * sizeof(uint64_t);
 		g_pthread_self->guest_host_gs8  = host_gs8;
 		g_pthread_self->guest_host_gs10 = host_gs10;
 #endif
 	}
 
 	// The guest ABI expects the entry argument in rdi and a 16-byte aligned stack before call.
+	//
+	// All four of r12-r15 are pushed on every platform, but for two different reasons:
+	//
+	//   r12/r13  scratch: they park the host rsp/rbp across the stack switch.
+	//   r14/r15  saved only because the guest cannot be trusted to honour the SysV callee-saved
+	//            contract. Cult of the Lamb returns from its thread entry with r15 = 0x7fff, and
+	//            the compiler keeps &g_pthread_self in r15 for the code just past this block, so
+	//            reading it faulted.
+	//
+	// Per platform, and note that the split below is Windows vs. everything-else, *not* Windows vs.
+	// Linux -- `src/common/config.h` has no KYTY_PLATFORM_MACOS, so macOS takes the same arm:
+	//
+	//   Windows          already pushed r14/r15, because it needs them as scratch for the gs:0x08 /
+	//                    gs:0x10 dance below, and was accidentally immune to the guest clobber.
+	//                    Its instruction stream is unchanged by this fix -- the pushes and pops
+	//                    simply moved out of the #if, in the same positions.
+	//   Linux            pushed only r12/r13 and was exposed. This is the fix.
+	//   macOS (x86-64)   shares the Linux arm and was exposed identically; the push/pop pair is
+	//                    plain SysV and needs nothing Mach-specific. macOS does keep TLS in %gs,
+	//                    but this arm never touches %gs -- only the Windows arm does.
+	//   macOS (arm64)    unreachable: the whole body is under `#if defined(__x86_64__) ||
+	//                    defined(_M_X64)` and falls through to a direct `func(arg)` call.
+	//
+	// The pushes must stay paired with `guest_host_rsp` above (four qwords) -- PthreadExit re-enters
+	// this block mid-stream by loading that into r12 and returning, and the pops below have to line
+	// up with it. That coupling is also why r14/r15 are saved by hand here rather than declared as
+	// clobbers the way RunEntry does it in loader/runtimeLinker.cpp: a clobber would keep them off
+	// the host stack, leaving PthreadExit with nothing to restore them from.
 	asm volatile("pushq %%r12\n\t"
 	             "pushq %%r13\n\t"
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	             "pushq %%r14\n\t"
 	             "pushq %%r15\n\t"
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	             "movq %%gs:0x08, %%r14\n\t"
 	             "movq %%gs:0x10, %%r15\n\t"
 	             "xorq %%rcx, %%rcx\n\t"
@@ -846,9 +876,9 @@ static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func,
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	             "movq %%r14, %%gs:0x08\n\t"
 	             "movq %%r15, %%gs:0x10\n\t"
+#endif
 	             "popq %%r15\n\t"
 	             "popq %%r14\n\t"
-#endif
 	             "popq %%r13\n\t"
 	             "popq %%r12\n\t"
 	             : "=a"(ret), "+D"(arg), "+S"(func)

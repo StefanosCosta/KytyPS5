@@ -28,7 +28,6 @@ namespace Common {
 static pthread_mutex_t              g_virtual_mutex {};
 static std::map<uintptr_t, size_t>* g_allocs   = nullptr;
 static std::map<uintptr_t, int>*    g_protects = nullptr;
-static std::map<uintptr_t, size_t>* g_arena_blocks; // defined below, near the arena itself
 
 void SysVirtualInit() {
 	pthread_mutexattr_t attr {};
@@ -42,9 +41,8 @@ void SysVirtualInit() {
 	pthread_mutex_init(&g_virtual_mutex, &attr);
 	pthread_mutexattr_destroy(&attr);
 
-	g_allocs       = new std::map<uintptr_t, size_t>;
-	g_protects     = new std::map<uintptr_t, int>;
-	g_arena_blocks = new std::map<uintptr_t, size_t>;
+	g_allocs   = new std::map<uintptr_t, size_t>;
+	g_protects = new std::map<uintptr_t, int>;
 }
 
 static int get_protection_flag(VirtualMemory::Mode mode) {
@@ -143,33 +141,18 @@ static uintptr_t align_up_to(uintptr_t addr, uint64_t alignment) {
 	return (addr + alignment - 1) & ~(alignment - 1);
 }
 
-// Addresses the arena itself handed out, so that freeing one can return it to the arena.
+// The arena deliberately never reuses a freed address, so it walks steadily downward and a guest
+// map/unmap/remap cycle gets a different host address each time. That is what
+// DirectMapUnmapReusesHostAddress in tests/VirtualMemoryAllocationTests.cpp checks, and it fails
+// here.
 //
-// Membership matters: SysVirtualFree also runs for mappings the arena never produced (a guest
-// reservation pinned to a fixed address, or the kernel-chosen fallback below). Some of those land
-// inside the arena window, and moving the cursor to cover memory the arena does not own is how an
-// earlier attempt at this went wrong. Only blocks recorded here are ever reclaimed.
-// (declared above, next to the other bookkeeping maps)
-
-// Return a freed block to the arena by moving the cursor back above it.
+// Returning freed blocks to the arena does make that test pass -- and breaks real games. Recycling
+// an address hands it to a new allocation while the GPU-side caches still hold state keyed to the
+// old one, and the aliasing shows up as "BufferCache: GPU-read access denied" at the first flip.
+// Reproduced with Dreaming Sarah: clean run without the give-back, fatal within seconds with it.
 //
-// The cursor is only a search hint, not an ownership record: allocation walks downward from it and
-// MAP_FIXED_NOREPLACE rejects any slot that is still mapped, so raising it can never hand out live
-// memory -- at worst the walk wastes a few attempts stepping over occupied slots. That is what
-// makes moving it safe even when the freed block is not the most recent one.
-static void ReleaseLowArena(uintptr_t addr, size_t size) {
-	if (size == 0) {
-		return;
-	}
-
-	const auto step = align_up_to(size, LOW_ARENA_GRAIN);
-	auto       top  = g_low_arena_next.load(std::memory_order_relaxed);
-	while (addr + step > top) {
-		if (g_low_arena_next.compare_exchange_weak(top, addr + step, std::memory_order_relaxed)) {
-			return;
-		}
-	}
-}
+// So the address space is intentionally allowed to leak here. Reuse would need the GPU tracking
+// for a range to be invalidated at the point it is released, which is a larger change than this.
 
 // Drop-in replacement for the anonymous mmap calls below. A pinned address is passed straight
 // through; only the "kernel picks" case is redirected into the low arena. MAP_FIXED_NOREPLACE
@@ -183,26 +166,14 @@ static void* map_anonymous(uintptr_t addr, size_t size, int protect, int flags) 
 #ifdef KYTY_FIXED_NOREPLACE
 	const auto step = align_up_to(size, LOW_ARENA_GRAIN);
 	for (int attempt = 0; attempt < 256; attempt++) {
-		// Take the current cursor and step down from it, rather than decrementing unconditionally:
-		// a failed probe must not consume arena space, or a reused slot below an occupied one
-		// would be skipped forever.
-		auto top = g_low_arena_next.load(std::memory_order_relaxed);
+		const auto top = g_low_arena_next.fetch_sub(step, std::memory_order_relaxed);
 		if (top < step || top - step < LOW_ARENA_FLOOR) {
 			break;
 		}
 		const auto hint = (top - step) & ~(LOW_ARENA_GRAIN - 1);
-		if (!g_low_arena_next.compare_exchange_weak(top, hint, std::memory_order_relaxed)) {
-			continue; // another thread moved the cursor; re-read and retry
-		}
-
-		void* ptr = mmap(reinterpret_cast<void*>(hint), size, protect,
-		                 flags | MAP_FIXED_NOREPLACE, -1, 0); // NOLINT
+		void*      ptr  = mmap(reinterpret_cast<void*>(hint), size, protect,
+		                       flags | MAP_FIXED_NOREPLACE, -1, 0); // NOLINT
 		if (ptr != MAP_FAILED) {
-			pthread_mutex_lock(&g_virtual_mutex);
-			if (g_arena_blocks != nullptr) {
-				(*g_arena_blocks)[reinterpret_cast<uintptr_t>(ptr)] = size;
-			}
-			pthread_mutex_unlock(&g_virtual_mutex);
 			return ptr;
 		}
 	}
@@ -529,19 +500,11 @@ bool SysVirtualFree(uint64_t address) {
 	if (munmap(reinterpret_cast<void*>(addr), size) == 0) {
 		uintptr_t page_start = addr >> 12u;
 		uintptr_t page_end   = (addr + size - 1) >> 12u;
-		size_t    arena_size = 0;
 		pthread_mutex_lock(&g_virtual_mutex);
 		for (uintptr_t page = page_start; page <= page_end; page++) {
 			g_protects->erase(page);
 		}
-		if (g_arena_blocks != nullptr) {
-			if (auto a = g_arena_blocks->find(addr); a != g_arena_blocks->end()) {
-				arena_size = a->second;
-				g_arena_blocks->erase(a);
-			}
-		}
 		pthread_mutex_unlock(&g_virtual_mutex);
-		ReleaseLowArena(addr, arena_size);
 		return true;
 	}
 

@@ -17,6 +17,39 @@
 #include <libgen.h> // POSIX basename() lives here on macOS, not in <cstring>
 #endif
 
+// True when the caller is running on this thread's own stack.
+//
+// Guest code executes on stacks the emulator hands it (see RunOnGuestStack in kernel/pthread.cpp)
+// and can corrupt them -- a guest __stack_chk_fail report is by definition that case. backtrace()
+// unwinds whatever it is standing on, so walking from there faults and takes the process with it,
+// destroying the very diagnostic being produced. Windows does not have this problem because
+// RtlVirtualUnwind is driven by unwind tables and stops when it runs out of them.
+static bool OnOwnStack() {
+	const char* probe = reinterpret_cast<const char*>(&probe);
+
+	pthread_attr_t attr {};
+#if defined(__APPLE__)
+	const auto* top  = static_cast<const char*>(pthread_get_stackaddr_np(pthread_self()));
+	const auto  size = pthread_get_stacksize_np(pthread_self());
+	(void)attr;
+	return top != nullptr && size != 0 && probe < top && probe >= top - size;
+#else
+	if (pthread_getattr_np(pthread_self(), &attr) != 0) {
+		return false;
+	}
+	void*  base = nullptr;
+	size_t size = 0;
+	const bool ok =
+	    pthread_attr_getstack(&attr, &base, &size) == 0 && base != nullptr && size != 0;
+	pthread_attr_destroy(&attr);
+	if (!ok) {
+		return false;
+	}
+	const auto* low = static_cast<const char*>(base);
+	return probe >= low && probe < low + size;
+#endif
+}
+
 void SysStackWalk(void** stack, int* depth) {
 	if (stack == nullptr || depth == nullptr || *depth <= 0) {
 		if (depth != nullptr) {
@@ -30,6 +63,14 @@ void SysStackWalk(void** stack, int* depth) {
 	// RtlCaptureContext/RtlVirtualUnwind walk and is already used elsewhere in the tree
 	// (graphics/host_gpu/pageManager.cpp). It needs frame pointers to be reliable, which the build
 	// keeps via -fno-omit-frame-pointer.
+	//
+	// Reporting no frames is a bad outcome; crashing while reporting is a far worse one, so the
+	// walk is skipped entirely unless this is a stack it is safe to unwind.
+	if (!OnOwnStack()) {
+		*depth = 0;
+		return;
+	}
+
 	const int n = ::backtrace(stack, *depth);
 	*depth      = (n < 0 ? 0 : n);
 }
