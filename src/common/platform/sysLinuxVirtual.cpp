@@ -98,6 +98,10 @@ static VirtualMemory::Mode get_protection_flag(int mode) {
 // title then faults on its first operator new with a null mspace. Keeping the arena under
 // 0xFC00000000 stays inside the lower window while still sitting far above the guest's own
 // low-address reservations.
+// Guarded because the arena is reachable only from the MAP_FIXED_NOREPLACE path in map_anonymous
+// below, and macOS compiles this file too -- it has no MAP_FIXED_NOREPLACE, so leaving these at
+// file scope makes every one of them an unused symbol there, which -Wall -Werror rejects.
+#ifdef KYTY_FIXED_NOREPLACE
 static constexpr uintptr_t LOW_ARENA_LIMIT = 0x000000FC00000000ULL; // libc mspace window ceiling
 static constexpr uintptr_t LOW_ARENA_FLOOR = 0x000000A000000000ULL; // 640 GiB
 static constexpr uintptr_t LOW_ARENA_GRAIN = 0x0000000000010000ULL; // 64 KiB
@@ -107,6 +111,7 @@ static_assert(LOW_ARENA_LIMIT <= 0x0000010000000000ULL,
 static_assert(LOW_ARENA_FLOOR < LOW_ARENA_LIMIT, "arena floor must sit below its ceiling");
 
 static std::atomic<uintptr_t> g_low_arena_next {LOW_ARENA_LIMIT};
+#endif
 
 // Record a host reservation, splitting any existing entry it lands inside.
 //
@@ -137,9 +142,11 @@ static void record_alloc(uintptr_t addr, size_t size) {
 	(*g_allocs)[addr] = size;
 }
 
+#ifdef KYTY_FIXED_NOREPLACE
 static uintptr_t align_up_to(uintptr_t addr, uint64_t alignment) {
 	return (addr + alignment - 1) & ~(alignment - 1);
 }
+#endif
 
 // The arena deliberately never reuses a freed address, so it walks steadily downward and a guest
 // map/unmap/remap cycle gets a different host address each time. That is what
