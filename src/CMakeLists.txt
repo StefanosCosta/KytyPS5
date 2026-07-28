@@ -419,11 +419,9 @@ add_kyty_full_emulator_test(virtual_memory_allocation_tests ../tests/VirtualMemo
 target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 	KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)
 
-# These three suites signal failure with throw/try. The clang-cl branch of KYTY_CPP_FLAGS does not
-# pass -fno-exceptions, so they build on Windows, but the Clang/GCC branch does -- which left them
-# failing to compile on Linux and macOS even though their add_test entries are unconditional.
-# Re-enable exceptions for just these targets; the flag is not added under clang-cl, so the Windows
-# command line is unchanged.
+# These three suites signal failure with throw/try, but the Clang/GCC branch of KYTY_CPP_FLAGS
+# passes -fno-exceptions, so they cannot compile off Windows without this. The flag is not added
+# under clang-cl, leaving the Windows command line unchanged.
 if(NOT KYTY_CLANG_CL)
 	foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests
 			virtual_memory_allocation_tests)
@@ -447,8 +445,8 @@ if(BUILD_TESTING)
 	add_test(NAME gpu_tiler
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-tiler-only)
 
-	# These eight were registered inside if(WIN32) with no explanation. Five of them run green on
-	# Linux once the corresponding suites are compiled in, and are now registered everywhere.
+	# These five pass on every platform once the corresponding suites are compiled in, so they are
+	# registered unconditionally rather than under if(WIN32).
 	add_test(NAME texture_cache_layered_image
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --layered-image-only)
 	add_test(NAME texture_cache_image_views
@@ -462,14 +460,10 @@ if(BUILD_TESTING)
 
 	if(WIN32)
 		# The remaining three all run CheckUnifiedTextureCacheFlow, whose multisample-depth stage
-		# does not hold outside the Windows/AMD setup this project develops on. Measured on Linux:
-		#   NVIDIA (RTX 3090, Vulkan 1.4) - "two-sample depth content: color-to-multisample-depth
-		#                                    changed a packed sample value"
-		#   llvmpipe                      - the 2-sample depth format is rejected outright,
-		#                                   "image format does not support required usage:
-		#                                    format=37 type=1 usage=0x17 flags=0x108 samples=2"
-		# Two different failures on two drivers points at the multisample-depth path rather than a
-		# flaky test, so these stay gated until that is understood. See LINUX_PORT.md 4.1.
+		# does not hold outside the Windows/AMD configuration. On Linux, NVIDIA reports a changed
+		# packed sample value after a color-to-multisample-depth copy, and llvmpipe rejects the
+		# 2-sample depth format outright. Two distinct failures on two drivers points at the
+		# multisample-depth path rather than a flaky test, so these stay gated until it is fixed.
 		add_test(NAME texture_cache_image_overlap
 			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-overlap-only)
 		add_test(NAME texture_cache_htile_clear

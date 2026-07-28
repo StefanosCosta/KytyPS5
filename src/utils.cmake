@@ -1,9 +1,7 @@
-# include-what-you-use was gated on `NOT LINUX`, which CLAUDE.md describes backwards as
-# "non-Windows Clang". Linux is now included, but without -Werror: IWYU has never run over the
-# Linux code paths, so it is certain to have a backlog of diagnostics there, and promoting those to
-# errors would break the build for every Linux developer who happens to have the tool installed.
-# Warnings surface the backlog without stopping anyone; give Linux the same KYTY_IWYU_STRICT value
-# as everyone else once it is clean. Windows and macOS still get the exact flag string they had.
+# include-what-you-use also runs on Linux, but without -Werror: it has never run over the Linux
+# code paths, so there is a backlog of diagnostics there and promoting them to errors would break
+# the build for anyone who has the tool installed. Give Linux the same KYTY_IWYU_STRICT value as
+# the other platforms once that backlog is clear. Windows and macOS keep the flag string they had.
 set(KYTY_IWYU_COMMON "-Xiwyu;--cxx17ns;-Qunused-arguments")
 if (LINUX)
 	set(KYTY_IWYU_STRICT "")

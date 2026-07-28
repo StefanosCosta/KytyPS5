@@ -33,8 +33,8 @@ set_target_properties(launcher PROPERTIES AUTOUIC ON AUTOMOC ON AUTORCC ON)
 if(WIN32 AND NOT KYTY_CLANG_CL)
 	set_target_properties(launcher PROPERTIES LINK_FLAGS "${KYTY_LD_OPTIONS}")
 elseif(LINUX)
-	# kyty_emulator links with KYTY_LD_OPTIONS (-fuse-ld=lld) on Linux; the launcher was left on
-	# the default linker, so the two halves of the same build used different ones.
+	# Match kyty_emulator, which links with KYTY_LD_OPTIONS (-fuse-ld=lld) on Linux, so both halves
+	# of the build use the same linker.
 	set_target_properties(launcher PROPERTIES LINK_FLAGS "${KYTY_LD_OPTIONS}")
 endif()
 
@@ -84,10 +84,10 @@ if(WIN32)
     		)
     ")
 elseif(LINUX)
-	# There is no windeployqt equivalent here, so the installed tree shipped a launcher that
-	# needed a matching system Qt 6 while the Windows artifact was self-contained. Copy the Qt
-	# libraries it actually links against plus the plugin directories Qt loads at run time, and
-	# set an rpath so they are found next to the binary.
+	# There is no windeployqt equivalent here, so without this the installed tree needs a matching
+	# system Qt 6 where the Windows artifact is self-contained. Copy the Qt libraries the launcher
+	# links against plus the plugin directories Qt loads at run time, and set an rpath so they are
+	# found next to the binary.
 	set_target_properties(launcher PROPERTIES
 		INSTALL_RPATH "$ORIGIN/lib"
 		BUILD_WITH_INSTALL_RPATH FALSE)

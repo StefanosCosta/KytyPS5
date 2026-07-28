@@ -98,9 +98,8 @@ static VirtualMemory::Mode get_protection_flag(int mode) {
 // title then faults on its first operator new with a null mspace. Keeping the arena under
 // 0xFC00000000 stays inside the lower window while still sitting far above the guest's own
 // low-address reservations.
-// Guarded because the arena is reachable only from the MAP_FIXED_NOREPLACE path in map_anonymous
-// below, and macOS compiles this file too -- it has no MAP_FIXED_NOREPLACE, so leaving these at
-// file scope makes every one of them an unused symbol there, which -Wall -Werror rejects.
+// The arena is reachable only from the MAP_FIXED_NOREPLACE path in map_anonymous below, and macOS
+// compiles this file without that macro, so these are guarded to avoid unused symbols there.
 #ifdef KYTY_FIXED_NOREPLACE
 static constexpr uintptr_t LOW_ARENA_LIMIT = 0x000000FC00000000ULL; // libc mspace window ceiling
 static constexpr uintptr_t LOW_ARENA_FLOOR = 0x000000A000000000ULL; // 640 GiB
@@ -148,18 +147,13 @@ static uintptr_t align_up_to(uintptr_t addr, uint64_t alignment) {
 }
 #endif
 
-// The arena deliberately never reuses a freed address, so it walks steadily downward and a guest
-// map/unmap/remap cycle gets a different host address each time. That is what
-// DirectMapUnmapReusesHostAddress in tests/VirtualMemoryAllocationTests.cpp checks, and it fails
-// here.
+// The arena never reuses a freed address: it walks steadily downward, so a guest map/unmap/remap
+// cycle gets a different host address each time and the address space is allowed to leak.
 //
-// Returning freed blocks to the arena does make that test pass -- and breaks real games. Recycling
-// an address hands it to a new allocation while the GPU-side caches still hold state keyed to the
-// old one, and the aliasing shows up as "BufferCache: GPU-read access denied" at the first flip.
-// Reproduced with Dreaming Sarah: clean run without the give-back, fatal within seconds with it.
-//
-// So the address space is intentionally allowed to leak here. Reuse would need the GPU tracking
-// for a range to be invalidated at the point it is released, which is a larger change than this.
+// Recycling an address is not safe as things stand, because it hands that address to a new
+// allocation while the GPU-side caches still hold state keyed to the old one; the aliasing surfaces
+// as a GPU-read access denial on the next flip. Reuse would first need the GPU tracking for a range
+// to be invalidated at the point it is released.
 
 // Drop-in replacement for the anonymous mmap calls below. A pinned address is passed straight
 // through; only the "kernel picks" case is redirected into the low arena. MAP_FIXED_NOREPLACE

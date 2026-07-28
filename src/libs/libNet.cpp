@@ -697,12 +697,11 @@ struct Http2Request {
 	std::string                                      url;
 	uint64_t                                         content_length = 0;
 	std::vector<std::pair<std::string, std::string>> headers;
-	// There is no HTTP transport behind any of this, so a request never produces a response. Saying
-	// so is the whole point: this used to report a fabricated "204 No Content" success, and
-	// Subnautica's Unity analytics code dereferenced the null download handler that a 204 with no
-	// body leaves behind, faulting at [0x10] inside Il2CppUserAssemblies. libhttp v1 in
-	// network.cpp already models it this way -- HttpSendRequest fails and every accessor hands the
-	// recorded send_result back -- and libhttp2 was the odd one out.
+	// There is no HTTP transport behind any of this, so a request never produces a response, and
+	// the send is reported as failed rather than as a fabricated success. Reporting success with an
+	// empty body leads callers into their parse path with nothing to parse, which is a null
+	// dereference inside the guest. libhttp v1 in network.cpp models it the same way: the send
+	// fails and every accessor returns the recorded send_result.
 	bool         sent        = false;
 	int          send_result = HTTP2_ERROR_BEFORE_SEND;
 	int          status_code = 0;
@@ -1242,9 +1241,9 @@ static int KYTY_SYSV_ABI Http2GetAllResponseHeaders(int req_id, char** header,
 		return HTTP2_ERROR_INVALID_ID;
 	}
 
-	// Null rather than a pointer into an empty std::string: the guest is handed a host heap address
-	// here, and Http2DeleteRequest frees the string out from under it. With no response to report
-	// there is nothing to point at, and null is what libhttp v1 yields in the same situation.
+	// Null rather than a pointer into an empty std::string: this hands the guest a host heap
+	// address that Http2DeleteRequest later frees, so it is only safe to publish when there is a
+	// response to point at. libhttp v1 yields null in the same situation.
 	const auto& headers = request->second.response_headers;
 	*header             = (headers.empty() ? nullptr : const_cast<char*>(headers.c_str()));
 	*header_size        = headers.size();

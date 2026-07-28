@@ -95,7 +95,7 @@ thread_local bool g_in_fault_resolution = false;
 uint32_t CurrentThread() noexcept {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	return GetCurrentThreadId();
-#else
+#elif !defined(__APPLE__)
 	// Zero marks "no owner" in PageState::backing_writer, and Linux never assigns tid 0 to a
 	// thread, so the raw kernel tid can be used directly as an owner token.
 	static thread_local const uint32_t tid = [] {
@@ -106,6 +106,9 @@ uint32_t CurrentThread() noexcept {
 		return raw;
 	}();
 	return tid;
+#else
+	// gettid is Linux-only, and page tracking is not wired up on macOS anyway.
+	FailFast("page tracking thread identity is unsupported on this platform");
 #endif
 }
 

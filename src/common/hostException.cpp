@@ -7,9 +7,13 @@
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
-#else
+#elif !defined(__APPLE__)
 #include <csignal>
 #include <ucontext.h> // IWYU pragma: keep
+#include <unistd.h>
+#else
+// Darwin's <ucontext.h> is a hard #error without _XOPEN_SOURCE, and nothing below needs it here.
+#include <csignal>
 #include <unistd.h>
 #endif
 
@@ -20,6 +24,10 @@
 // IWYU pragma: no_include <wtypes.h>
 
 namespace Common::HostException {
+
+// Everything down to LoadInstalledHandler exists to serve the two fault handlers below, and macOS
+// builds neither. (__APPLE__ is never defined on Windows, so this stays compiled there.)
+#if !defined(__APPLE__)
 
 static std::atomic<Handler> g_handler {nullptr};
 static std::atomic_uint32_t g_install_state {0};
@@ -64,6 +72,7 @@ static Handler LoadInstalledHandler() noexcept {
 	}
 	return handler;
 }
+#endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 
@@ -130,7 +139,7 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) {
 	return handler(info) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
 }
 
-#else
+#elif !defined(__APPLE__)
 
 // x86-64 page-fault error code bits, as delivered in ucontext_t::uc_mcontext.gregs[REG_ERR].
 constexpr uint64_t PAGE_FAULT_ERROR_WRITE        = 0x02;
@@ -208,6 +217,13 @@ static void SignalHandler(int signal_number, siginfo_t* signal_info, void* nativ
 #endif
 
 bool InstallHandler(Handler handler) {
+#if defined(__APPLE__)
+	// The signal handler above reads the register file through glibc's ucontext_t layout, which
+	// Darwin does not share, so it is not built here and there is nothing to install. Reporting
+	// failure is what this returned on every non-Windows platform before the Linux handler existed.
+	(void)handler;
+	return false;
+#else
 	if (handler == nullptr) {
 		return false;
 	}
@@ -248,6 +264,7 @@ bool InstallHandler(Handler handler) {
 
 	g_install_state.store(2, std::memory_order_release);
 	return true;
+#endif
 }
 
 } // namespace Common::HostException

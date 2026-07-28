@@ -135,9 +135,8 @@ static void KYTY_SYSV_ABI asan_init() {
 	sys_dbg_stack_info_t s {};
 	SysStackUsage(s);
 
-	// Both platforms now report the full stack reservation here. Linux used to fall back to
-	// s.addr, which is only the part of the stack that had been faulted in, so the shadow did not
-	// cover memory the guest could still legitimately touch.
+	// The shadow has to cover the whole stack reservation, not just the part currently faulted in,
+	// or it misses memory the guest can still legitimately touch.
 	AllocShadow(s.reserved_addr, reinterpret_cast<uintptr_t>(&s));
 
 	LibKernel::Memory::RegisterCallbacks(KernelAlloc, KernelFree);

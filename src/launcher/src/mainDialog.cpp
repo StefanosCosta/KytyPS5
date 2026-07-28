@@ -45,7 +45,7 @@ constexpr char EMULATOR_EXE[] = "kyty_emulator";
 #if defined(_WIN32)
 constexpr char CMD_EXE[] = "cmd.exe";
 #elif defined(__linux__)
-// The terminal emulator is no longer a fixed name -- see FindTerminal below, which probes for one.
+// The terminal emulator is discovered at run time; see FindTerminal below.
 constexpr char KYTY_BASH_FILE[] = "kyty_run.sh";
 #endif
 #if defined(_WIN32)
@@ -267,9 +267,8 @@ static bool CreateBashScript(const QString& interpreter, const QStringList& args
 
 // Find a terminal emulator to run the generated script in.
 //
-// gnome-terminal used to be hardcoded, so launching a game did nothing at all on KDE, XFCE, Sway
-// or anything else without it -- and nothing reported the failure, because the caller never
-// checked whether the process started. xterm was declared as a fallback but never referenced.
+// Probing rather than assuming a fixed name, so a desktop without gnome-terminal (KDE, XFCE,
+// Sway) can still launch a game.
 //
 // The argument spelling is not consistent between terminals, so each entry carries its own: the
 // GTK ones take "--" to end option parsing, most others take "-e", and kitty takes the command
@@ -391,13 +390,12 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 	process->start();
 #if !defined(_WIN32)
 	// waitForFinished returning false is the normal case here -- the emulator is still running --
-	// so it cannot be used to detect a launch failure. waitForStarted can: a process that never
-	// started at all (a missing terminal emulator, say) was previously indistinguishable from one
-	// running happily, and the user just saw nothing happen.
+	// so it cannot be used to detect a launch failure. waitForStarted can: without it a process
+	// that never started at all, say for a missing terminal emulator, is indistinguishable from
+	// one running happily and the user simply sees nothing happen.
 	//
-	// Deliberately not applied on Windows. The check would be just as useful there, but this is
-	// shared code and Windows is the platform that cannot be re-tested here; leaving its behaviour
-	// exactly as it was is worth more than the improvement. Worth adopting separately.
+	// Scoped to non-Windows to keep the Windows launch path unchanged; it would be equally useful
+	// there and is worth adopting separately.
 	if (!process->waitForStarted(5000)) {
 		QMessageBox::critical(this, tr("Error"),
 		                      tr("Failed to start:\n%1\n\n%2")

@@ -594,9 +594,8 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 		current = next;
 	}
 #else
-	// macOS: unprobed, exactly as this check behaved on every non-Windows platform before. It has
-	// no process_vm_readv, and the Mach equivalent is not something to introduce untested on a
-	// platform that is not built or run here, so the dumps below keep their original behaviour.
+	// macOS has no process_vm_readv, so the range goes unprobed and the dumps below keep the
+	// unguarded behaviour every non-Windows platform had previously.
 	(void)end;
 #endif
 	return true;

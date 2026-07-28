@@ -16,7 +16,7 @@
 #include <windows.h>
 #undef min
 #undef max
-#else
+#elif !defined(__APPLE__)
 #include <sys/syscall.h>
 #include <unistd.h>
 #endif
@@ -52,11 +52,13 @@ private:
 	static uint32_t CurrentThread() noexcept {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		return GetCurrentThreadId();
-#else
+#elif !defined(__APPLE__)
 		// Zero is the "unlocked" owner token, and Linux never assigns tid 0 to a thread, so the
 		// raw kernel tid works directly as an owner identity.
 		static thread_local const uint32_t tid = static_cast<uint32_t>(::syscall(SYS_gettid));
 		return tid;
+#else
+		EXIT("region tracking thread identity is unsupported on this platform\n");
 #endif
 	}
 

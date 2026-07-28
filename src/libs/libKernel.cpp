@@ -638,10 +638,9 @@ static SignalUcontext CreateSignalUcontext(
 	ctx.uc_mcontext.mc_rip = reinterpret_cast<uint64_t>(__builtin_return_address(0));
 
 #if defined(__x86_64__)
-	// Previously only rsp/rbp/rip above were filled and every other register was left zero, so a
-	// guest handler inspecting mc_rax or mc_rdi read garbage. Capture the rest the same way
-	// CreateCurrentGuestCallSignalUcontext below does. The general-purpose registers are read in
-	// one asm block so they are consistent with each other.
+	// A guest handler may inspect any register, not just the rsp/rbp/rip filled above, so capture
+	// the rest the same way CreateCurrentGuestCallSignalUcontext below does. The general-purpose
+	// registers are read in one asm block so they are consistent with each other.
 	uint64_t rax = 0;
 	uint64_t rbx = 0;
 	uint64_t rcx = 0;

@@ -27,9 +27,8 @@ struct SysFileTimeStruct {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	FILETIME time;
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
-	// Windows carries a FILETIME, which is 100ns-resolution, so its SysTimeStruct::Milliseconds is
-	// meaningful. A bare time_t made every converted timestamp here report .000, no matter what the
-	// filesystem recorded. Keeping nanoseconds alongside preserves what stat() actually returns.
+	// time_t alone is whole-second, which would pin SysTimeStruct::Milliseconds at zero where the
+	// Windows FILETIME carries 100ns resolution. Keep the nanoseconds stat() reports alongside it.
 	time_t time;
 	long   nanos;
 #endif
@@ -172,8 +171,8 @@ inline void SysSystemToFileTimeUtc(const SysTimeStruct& f, SysFileTimeStruct& t)
 
 // Retrieves the current local date and time.
 inline void SysGetSystemTime(SysTimeStruct& t) {
-	// clock_gettime rather than time(): the latter only has whole-second resolution, which left
-	// Milliseconds pinned at 0 where the Windows path reports a real value.
+	// clock_gettime rather than time(): the latter is whole-second only, which would leave
+	// Milliseconds at zero where the Windows path reports a real value.
 	timespec  now {};
 	struct tm i {};
 
@@ -194,8 +193,8 @@ inline void SysGetSystemTime(SysTimeStruct& t) {
 
 // Retrieves the current system date and time in Coordinated Universal Time (UTC).
 inline void SysGetSystemTimeUtc(SysTimeStruct& t) {
-	// clock_gettime rather than time(): the latter only has whole-second resolution, which left
-	// Milliseconds pinned at 0 where the Windows path reports a real value.
+	// clock_gettime rather than time(): the latter is whole-second only, which would leave
+	// Milliseconds at zero where the Windows path reports a real value.
 	timespec  now {};
 	struct tm i {};
 

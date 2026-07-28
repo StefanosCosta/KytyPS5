@@ -384,14 +384,13 @@ public:
 				*placeholder_preserved = true;
 			}
 #endif
-			// Reported on Windows only, because only Windows preserves anything. On Linux and
-			// macOS alike there are no placeholders -- Consume/AddFree are Windows-only, and
-			// UnmapViewPreservePlaceholder above is a plain munmap -- so claiming one was kept is
-			// simply false. The lie is not harmless: it sends the caller's rollback path
-			// (restore_chunks in kernel/memory.cpp) through PlaceholderAddressSpace::Consume,
-			// which always returns false off Windows, turning a recoverable unmap failure into a
-			// fatal "reserve-fixed backend-unmap rollback failed". Leaving the flag false routes
-			// rollback to MapFixed instead, which does work on both.
+			// Reported on Windows only, because only Windows preserves anything: elsewhere there
+			// are no placeholders, Consume/AddFree are Windows-only, and
+			// UnmapViewPreservePlaceholder above is a plain munmap. Reporting one was kept would
+			// send the caller's rollback path (restore_chunks in kernel/memory.cpp) through
+			// PlaceholderAddressSpace::Consume, which always fails off Windows, turning a
+			// recoverable unmap failure into a fatal rollback error. Leaving the flag false routes
+			// rollback to MapFixed instead, which works on both.
 			return true;
 		}
 
