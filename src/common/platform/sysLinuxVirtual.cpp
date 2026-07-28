@@ -83,14 +83,27 @@ static VirtualMemory::Mode get_protection_flag(int mode) {
 // lands well above the limit. When the caller does not pin an address, bump-allocate a hint
 // through a low arena instead of letting the kernel choose.
 //
-// The arena is placed at the TOP of the trackable window and grows downward. Guests reserve
+// The arena is placed near the TOP of the trackable window and grows downward. Guests reserve
 // their own ranges from low addresses upward -- an Unreal Engine title asks for a single 512 GiB
 // placeholder at 64 GiB, spanning 64..576 GiB -- so an arena anywhere in the low half fragments
 // that range and the reservation fails, falling back to an untrackable high address. Growing
 // down from the limit keeps the two allocators moving away from each other.
-static constexpr uintptr_t LOW_ARENA_LIMIT = 0x0000010000000000ULL; // 1<<40, the tracker limit
+//
+// The ceiling is 0xFC00000000 rather than the tracker's 1<<40, because guest code validates the
+// addresses it is handed. Sony's libc.prx rejects a heap outside two fixed windows in
+// sceLibcMspaceCreate: it requires either base >= 4 MiB with base + size < 0xFC00000001, or
+// base >= 1<<43 with base + size < 0xF0000000001. Anything between those two windows -- which is
+// exactly where an arena topped out at 1<<40 lands -- makes the call return nullptr, and the
+// title then faults on its first operator new with a null mspace. Keeping the arena under
+// 0xFC00000000 stays inside the lower window while still sitting far above the guest's own
+// low-address reservations.
+static constexpr uintptr_t LOW_ARENA_LIMIT = 0x000000FC00000000ULL; // libc mspace window ceiling
 static constexpr uintptr_t LOW_ARENA_FLOOR = 0x000000A000000000ULL; // 640 GiB
 static constexpr uintptr_t LOW_ARENA_GRAIN = 0x0000000000010000ULL; // 64 KiB
+
+static_assert(LOW_ARENA_LIMIT <= 0x0000010000000000ULL,
+              "arena must stay inside the GPU page tracker's 1<<40 window");
+static_assert(LOW_ARENA_FLOOR < LOW_ARENA_LIMIT, "arena floor must sit below its ceiling");
 
 static std::atomic<uintptr_t> g_low_arena_next {LOW_ARENA_LIMIT};
 

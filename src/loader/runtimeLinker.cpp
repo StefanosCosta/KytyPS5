@@ -36,6 +36,14 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <unistd.h>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#else
+#include <sys/uio.h> // process_vm_readv is glibc/Linux-only
+#endif
 #endif
 
 namespace Libs::LibKernel {
@@ -530,6 +538,92 @@ void KYTY_SYSV_ABI SysStackWalkX86(uint64_t rbp, void** stack, int* depth) {
 	SysStackWalkX86(rbp, rbp, stack, depth);
 }
 
+// Probes whether [addr, addr + size) can be read without faulting.
+//
+// The diagnostic dumps in the exception handler below run with the faulting signal blocked, so a
+// second fault there is not recoverable: the kernel force-delivers it and the process dies before
+// anything is reported. Every dump therefore has to probe before it reads.
+//
+// The check uses process_vm_readv rather than a trial read because it reports EFAULT instead of
+// raising a signal, and because it does not touch the write protection pageManager keeps on guest
+// memory -- a direct read of a tracked page would re-enter the very handler that is running.
+static bool IsReadableRange(uint64_t addr, uint64_t size) {
+	if (addr == 0 || size == 0) {
+		return false;
+	}
+
+	const uint64_t end = addr + size;
+	if (end < addr) {
+		return false;
+	}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	uint64_t current = addr;
+	while (current < end) {
+		MEMORY_BASIC_INFORMATION mbi {};
+		if (VirtualQuery(reinterpret_cast<const void*>(current), &mbi, sizeof(mbi)) == 0 ||
+		    mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
+			return false;
+		}
+		const auto region_end = reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize;
+		if (region_end <= current) {
+			return false;
+		}
+		current = std::min(region_end, end);
+	}
+#else
+	// Readability is page-granular, so one probe byte per page covers the whole range.
+	const auto page_size = static_cast<uint64_t>(sysconf(_SC_PAGESIZE));
+	if (page_size == 0) {
+		return false;
+	}
+
+	for (uint64_t current = addr; current < end;) {
+		uint8_t probe = 0;
+
+#if defined(__APPLE__)
+		// macOS has no process_vm_readv; the Mach equivalent reports KERN_INVALID_ADDRESS
+		// instead of faulting.
+		mach_vm_size_t read_size = 0;
+		if (mach_vm_read_overwrite(mach_task_self(), current, sizeof(probe),
+		                           reinterpret_cast<mach_vm_address_t>(&probe),
+		                           &read_size) != KERN_SUCCESS ||
+		    read_size != sizeof(probe)) {
+			return false;
+		}
+#else
+		iovec local {&probe, sizeof(probe)};
+		iovec remote {reinterpret_cast<void*>(current), sizeof(probe)};
+
+		if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) !=
+		    static_cast<ssize_t>(sizeof(probe))) {
+			return false;
+		}
+#endif
+
+		const uint64_t next = (current & ~(page_size - 1)) + page_size;
+		if (next <= current) { // wrapped at the top of the address space
+			break;
+		}
+		current = next;
+	}
+#endif
+	return true;
+}
+
+// Guard for the two dumps below that have never been guarded on any platform. Probing them is a
+// Linux fix: there, an unguarded read inside the handler is fatal, because the faulting signal is
+// blocked for the duration of the handler and the kernel force-delivers the second fault. Windows
+// keeps its original non-null test, so this stays a no-op there.
+static bool IsDumpableRange(uint64_t addr, uint64_t size) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	(void)size;
+	return addr != 0;
+#else
+	return IsReadableRange(addr, size);
+#endif
+}
+
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
@@ -598,12 +692,18 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			LOGF("code-32: unavailable\n");
 		}
 #else
-		LOGF("code-32:");
-		for (uint64_t i = 0; i < 64; i++) {
-			LOGF(" %02" PRIx32, static_cast<uint32_t>(*reinterpret_cast<const uint8_t*>(
-			                        info->exception_address + i - 32)));
+		const auto fault_addr = info->exception_address;
+		const auto dump_start = (fault_addr >= 32 ? fault_addr - 32 : fault_addr);
+		if (IsReadableRange(dump_start, 64)) {
+			auto* dump_ptr = reinterpret_cast<const uint8_t*>(dump_start);
+			LOGF("code-32:");
+			for (uint32_t i = 0; i < 64; i++) {
+				LOGF(" %02" PRIx32, static_cast<uint32_t>(dump_ptr[i]));
+			}
+			LOGF("\n");
+		} else {
+			LOGF("code-32: unavailable\n");
 		}
-		LOGF("\n");
 #endif
 	} else {
 		LOGF("code: unavailable\n");
@@ -621,36 +721,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 	LOGF("regs: r12=%016" PRIx64 " r13=%016" PRIx64 " r14=%016" PRIx64 " r15=%016" PRIx64 "\n",
 	     info->r12, info->r13, info->r14, info->r15);
 
-	auto is_readable_range = [](uint64_t addr, uint64_t size) {
-		if (addr == 0 || size == 0) {
-			return false;
-		}
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		uint64_t current = addr;
-		uint64_t end     = addr + size;
-		if (end < addr) {
-			return false;
-		}
-		while (current < end) {
-			MEMORY_BASIC_INFORMATION mbi {};
-			if (VirtualQuery(reinterpret_cast<const void*>(current), &mbi, sizeof(mbi)) == 0 ||
-			    mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
-				return false;
-			}
-			const auto region_end = reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize;
-			if (region_end <= current) {
-				return false;
-			}
-			current = std::min(region_end, end);
-		}
-#else
-		(void)addr;
-		(void)size;
-#endif
-		return true;
-	};
-
-	if (is_readable_range(info->rsp, 16u * sizeof(uint64_t))) {
+	if (IsReadableRange(info->rsp, 16u * sizeof(uint64_t))) {
 		auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
 		LOGF("stack:");
 		for (uint64_t i = 0; i < 16; i++) {
@@ -681,6 +752,9 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 #else
 		auto*      dump_ptr  = reinterpret_cast<const uint8_t*>(addr >= 16 ? addr - 16 : addr);
 		const auto dump_size = 32u;
+		if (!IsReadableRange(reinterpret_cast<uint64_t>(dump_ptr), dump_size)) {
+			return;
+		}
 #endif
 
 		LOGF("%s code: addr=%016" PRIx64 ", off=%016" PRIx64 ", module=%s:", name, addr,
@@ -696,7 +770,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 	dump_guest_code("guest rbx[0]", info->rbx);
 	dump_guest_code("guest rcx[0]", info->rcx);
 	dump_guest_code("guest rsi[0]", info->rsi);
-	if (info->rsp != 0) {
+	if (IsDumpableRange(info->rsp, 16u * sizeof(uint64_t))) {
 		auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
 		for (uint64_t i = 0; i < 16; i++) {
 			char name[32] {};
@@ -725,7 +799,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 		}
 
-		auto dump_guest_qwords = [&is_readable_range](const char* name, uint64_t addr) {
+		auto dump_guest_qwords = [](const char* name, uint64_t addr) {
 			if (addr == 0) {
 				LOGF("%s = 0\n", name);
 				return;
@@ -740,7 +814,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 #endif
 
-			if (!is_readable_range(addr, 8u * sizeof(uint64_t))) {
+			if (!IsReadableRange(addr, 8u * sizeof(uint64_t))) {
 				LOGF("%s = %016" PRIx64 " (unmapped)\n", name, addr);
 				return;
 			}
@@ -765,7 +839,8 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		dump_guest_qwords("guest r14", info->r14);
 		dump_guest_qwords("guest r15", info->r15);
 
-		if (info->exception_address == 0x000000090064364e && info->rbx != 0) {
+		if (info->exception_address == 0x000000090064364e &&
+		    IsDumpableRange(info->rbx, sizeof(uint64_t))) {
 			auto* local = reinterpret_cast<const uint64_t*>(info->rbx);
 			dump_guest_qwords("vorbis obj", local[0]);
 			dump_guest_qwords("vorbis len", info->rcx);
