@@ -438,9 +438,31 @@ void SysFileGetLastAccessAndWriteTimeUtc(const std::filesystem::path& name, SysF
 	}
 }
 
-void SysFileGetLastAccessAndWriteTimeUtc(sys_file_t& /*f*/, SysFileTimeStruct& /*a*/,
-                                         SysFileTimeStruct& /*w*/) {
-	EXIT("not implemented\n");
+void SysFileGetLastAccessAndWriteTimeUtc(sys_file_t& f, SysFileTimeStruct& a,
+                                         SysFileTimeStruct& w) {
+	if (f.type == SYS_FILE_FILE) {
+		// fstat on the descriptor rather than stat on a name, mirroring the Windows path that
+		// queries the open handle -- the caller has a file, not a path.
+		struct stat s {};
+
+		const bool ok = (0 == fstat(fileno(f.f), &s));
+
+		a.is_invalid = w.is_invalid = !ok;
+
+		if (ok) {
+			a.time = s.st_atime;
+			w.time = s.st_mtime;
+		}
+	} else if (f.type == SYS_FILE_MEMORY_STAT || f.type == SYS_FILE_MEMORY_DYN) {
+		// Memory-backed files carry no timestamps, so report the current time for both, as the
+		// Windows implementation does.
+		SysTimeStruct t {};
+		SysGetSystemTimeUtc(t);
+		SysSystemToFileTimeUtc(t, a);
+		SysSystemToFileTimeUtc(t, w);
+	} else {
+		a.is_invalid = w.is_invalid = true;
+	}
 }
 
 bool SysFileSetLastAccessTimeUtc(const std::filesystem::path& name, SysFileTimeStruct& access) {
