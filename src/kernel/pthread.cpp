@@ -2768,18 +2768,6 @@ int KYTY_SYSV_ABI PthreadCondDestroy(PthreadCond* cond) {
 
 	int result = 0;
 
-	// TEMPORARY DIAGNOSTIC (remove): does a destroy ever free a cond that still has parked
-	// waiters? Those waiters captured this object in PthreadCondWait and keep polling it after
-	// the delete, while CreateObject resurrects a different object at the same guest slot.
-	{
-		std::lock_guard diag_lock((*cond)->m);
-		if (!(*cond)->waiters.empty()) {
-			printf("COND-DESTROY-WITH-WAITERS: slot=%p obj=%p waiters=%zu name='%s'\n",
-			       static_cast<void*>(cond), static_cast<void*>(*cond), (*cond)->waiters.size(),
-			       (*cond)->name.c_str());
-		}
-	}
-
 	LOGF("\tcond destroy: %s, %d\n", (*cond)->name.c_str(), result);
 
 	delete *cond;
@@ -3114,29 +3102,8 @@ int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 		return cond_value->sequence != sequence || thread->cond_sequence != thread_sequence;
 	};
 
-	// TEMPORARY DIAGNOSTIC (remove): has the guest slot been repointed at a different object
-	// while this thread was parked? If so this waiter is orphaned -- signals now land on the new
-	// object and can never satisfy ready() here, so the wait can never complete.
-	bool     diag_reported  = false;
-	uint64_t diag_poll_count = 0;
-
 	while (!ready()) {
 		cond_value->cv.wait_for(cond_lock, std::chrono::microseconds(SIGNAL_APC_POLL_MICROS));
-
-		diag_poll_count++;
-		if (!diag_reported) {
-			auto* diag_now = std::atomic_ref<PthreadCondPrivate*>(*cond).load(
-			    std::memory_order_acquire);
-			if (diag_now != cond_value) {
-				diag_reported = true;
-				printf("COND-WAIT-ORPHANED: slot=%p captured=%p now=%p polls=%" PRIu64
-				       " thread=%d\n",
-				       static_cast<void*>(cond), static_cast<void*>(cond_value),
-				       static_cast<void*>(diag_now), diag_poll_count,
-				       Common::Thread::GetThreadIdUnique());
-			}
-		}
-
 		if (!ready()) {
 			cond_lock.unlock();
 			KernelDispatchPendingSignalForCurrentThread();
