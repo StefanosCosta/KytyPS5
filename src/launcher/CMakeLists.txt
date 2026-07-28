@@ -32,6 +32,10 @@ set_target_properties(launcher PROPERTIES AUTOUIC ON AUTOMOC ON AUTORCC ON)
 
 if(WIN32 AND NOT KYTY_CLANG_CL)
 	set_target_properties(launcher PROPERTIES LINK_FLAGS "${KYTY_LD_OPTIONS}")
+elseif(LINUX)
+	# kyty_emulator links with KYTY_LD_OPTIONS (-fuse-ld=lld) on Linux; the launcher was left on
+	# the default linker, so the two halves of the same build used different ones.
+	set_target_properties(launcher PROPERTIES LINK_FLAGS "${KYTY_LD_OPTIONS}")
 endif()
 
 add_dependencies(launcher KytyGitVersion)  
@@ -79,6 +83,63 @@ if(WIN32)
 				--no-translations
     		)
     ")
+elseif(LINUX)
+	# There is no windeployqt equivalent here, so the installed tree shipped a launcher that
+	# needed a matching system Qt 6 while the Windows artifact was self-contained. Copy the Qt
+	# libraries it actually links against plus the plugin directories Qt loads at run time, and
+	# set an rpath so they are found next to the binary.
+	set_target_properties(launcher PROPERTIES
+		INSTALL_RPATH "$ORIGIN/lib"
+		BUILD_WITH_INSTALL_RPATH FALSE)
+
+	# Scan the binary in the build tree, not the installed one. The installed copy carries the
+	# $ORIGIN/lib rpath, so on a second install into the same prefix the scan finds both the
+	# system library and the previously deployed copy and fails on the conflict.
+	install(CODE "
+		file(GET_RUNTIME_DEPENDENCIES
+			EXECUTABLES \"${CMAKE_CURRENT_BINARY_DIR}/${launcher_name}\"
+			RESOLVED_DEPENDENCIES_VAR kyty_resolved
+			POST_INCLUDE_REGEXES \"libQt6\" \"libicu\"
+			POST_EXCLUDE_REGEXES \".*\")
+		foreach(kyty_dep \${kyty_resolved})
+			file(INSTALL DESTINATION \"\${CMAKE_INSTALL_PREFIX}/lib\"
+				TYPE SHARED_LIBRARY FOLLOW_SYMLINK_CHAIN FILES \"\${kyty_dep}\")
+		endforeach()
+	")
+
+	# Locate the plugin directory from Qt6::Core rather than assuming a layout: a distribution
+	# package puts it under <libdir>/qt6/plugins, the official installer under <prefix>/plugins.
+	get_target_property(kyty_qt_core_lib Qt6::Core IMPORTED_LOCATION_RELEASE)
+	if(NOT kyty_qt_core_lib)
+		get_target_property(kyty_qt_core_lib Qt6::Core IMPORTED_LOCATION)
+	endif()
+	get_filename_component(kyty_qt_libdir "${kyty_qt_core_lib}" DIRECTORY)
+
+	set(kyty_qt_plugins_dir "")
+	foreach(kyty_candidate
+			"${kyty_qt_libdir}/qt6/plugins"
+			"${kyty_qt_libdir}/../plugins"
+			"${Qt6_DIR}/../../../plugins")
+		if(IS_DIRECTORY "${kyty_candidate}/platforms")
+			get_filename_component(kyty_qt_plugins_dir "${kyty_candidate}" ABSOLUTE)
+			break()
+		endif()
+	endforeach()
+
+	if(kyty_qt_plugins_dir)
+		message(STATUS "Qt plugins for launcher deployment: ${kyty_qt_plugins_dir}")
+		foreach(kyty_qt_plugin platforms tls imageformats xcbglintegrations wayland-shell-integration)
+			if(IS_DIRECTORY "${kyty_qt_plugins_dir}/${kyty_qt_plugin}")
+				install(DIRECTORY "${kyty_qt_plugins_dir}/${kyty_qt_plugin}" DESTINATION "plugins")
+			endif()
+		endforeach()
+		# Without this Qt looks for plugins next to the system Qt, not next to the binary.
+		install(CODE "
+			file(WRITE \"\${CMAKE_INSTALL_PREFIX}/qt.conf\" \"[Paths]\\nPlugins = plugins\\n\")
+		")
+	else()
+		message(WARNING "Qt plugin directory not found; the installed launcher will need a system Qt")
+	endif()
 endif()
 
 

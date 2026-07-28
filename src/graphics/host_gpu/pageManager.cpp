@@ -24,8 +24,6 @@
 #include <cstring>
 #include <execinfo.h>
 #include <fcntl.h>
-#include <string>
-#include <string_view>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -123,55 +121,114 @@ int ToHostProtection(uint32_t protection) {
 
 // Reads the kernel's real protection for a page. Linux has no VirtualQuery equivalent, so this
 // walks /proc/self/maps, which is sorted by address and can therefore stop at the first region
-// that ends past the target. It is only consulted to confirm a shadow that already says the
-// access is permitted -- see AllowsAccess -- so a page PageManager itself protected never
-// reaches here, and the cost stays off the watched-page fault path.
+// that ends past the target.
+//
+// This runs inside the SIGSEGV handler: AllowsAccess consults it to confirm a shadow that already
+// says the access is permitted, and AllowsAccess is called from HandleFault. Everything here must
+// therefore be async-signal-safe -- no allocation, no stdio, no sscanf. The parse is a byte-wise
+// state machine rather than a line buffer so that a mapping line straddling a read boundary needs
+// no carry storage, and so that the arbitrarily long pathname at the end of a line is skipped
+// without ever being held.
 uint32_t QueryHostProtection(uint64_t vaddr) noexcept {
 	int fd = ::open("/proc/self/maps", O_RDONLY | O_CLOEXEC); // NOLINT
 	if (fd < 0) {
 		return UNKNOWN_PROTECTION;
 	}
 
-	uint32_t    result = UNKNOWN_PROTECTION;
-	char        buffer[8192];
-	std::string carry;
+	// Fields of a line, in order: "<start>-<end> <perms> ...<pathname>".
+	enum class Field { Start, End, Perms, Rest };
+
+	uint32_t result     = UNKNOWN_PROTECTION;
+	auto     field      = Field::Start;
+	uint64_t start      = 0;
+	uint64_t end        = 0;
+	char     perms[4]   = {};
+	uint32_t perms_len  = 0;
+	bool     line_valid = true;
+
+	char buffer[8192];
 
 	for (bool done = false; !done;) {
 		const auto got = ::read(fd, buffer, sizeof(buffer));
-		if (got <= 0) {
-			break;
-		}
-		carry.append(buffer, static_cast<size_t>(got));
-
-		size_t line_start = 0;
-		while (true) {
-			const auto newline = carry.find('\n', line_start);
-			if (newline == std::string::npos) {
-				break;
-			}
-			const std::string line = carry.substr(line_start, newline - line_start);
-			line_start             = newline + 1;
-
-			unsigned long start = 0;
-			unsigned long end   = 0;
-			char          perms[8] {};
-			if (std::sscanf(line.c_str(), "%lx-%lx %7s", &start, &end, perms) != 3) {
+		if (got < 0) {
+			if (errno == EINTR) {
 				continue;
 			}
-			if (vaddr < start) {
-				// Regions are address-ordered, so the target is in no mapping at all.
-				done = true;
-				break;
+			break;
+		}
+		if (got == 0) {
+			break;
+		}
+
+		for (ssize_t i = 0; i < got && !done; i++) {
+			const char c = buffer[i];
+
+			if (c == '\n') {
+				field      = Field::Start;
+				start      = 0;
+				end        = 0;
+				perms_len  = 0;
+				line_valid = true;
+				continue;
 			}
-			if (vaddr < end) {
-				result = perms[1] == 'w'   ? READ_WRITE_PROTECTION
-				         : perms[0] == 'r' ? READ_ONLY_PROTECTION
-				                           : NO_ACCESS_PROTECTION;
-				done   = true;
-				break;
+
+			if (!line_valid) {
+				continue;
+			}
+
+			switch (field) {
+				case Field::Start:
+				case Field::End: {
+					uint64_t digit = 0;
+					if (c >= '0' && c <= '9') {
+						digit = static_cast<uint64_t>(c - '0');
+					} else if (c >= 'a' && c <= 'f') {
+						digit = static_cast<uint64_t>(c - 'a') + 10;
+					} else if (c == '-' && field == Field::Start) {
+						field = Field::End;
+						break;
+					} else if (c == ' ' && field == Field::End) {
+						field     = Field::Perms;
+						perms_len = 0;
+						break;
+					} else {
+						// Not a mapping line in the shape expected; skip to the newline.
+						line_valid = false;
+						break;
+					}
+
+					auto& value = (field == Field::Start ? start : end);
+					value       = (value << 4u) | digit;
+					break;
+				}
+
+				case Field::Perms: {
+					if (c != ' ') {
+						if (perms_len < sizeof(perms)) {
+							perms[perms_len] = c;
+						}
+						perms_len++;
+						break;
+					}
+
+					// The permissions field is complete, so the region can be classified.
+					if (vaddr < start) {
+						// Regions are address-ordered, so the target is in no mapping at all.
+						done = true;
+					} else if (vaddr < end && perms_len >= 2) {
+						result = perms[1] == 'w'   ? READ_WRITE_PROTECTION
+						         : perms[0] == 'r' ? READ_ONLY_PROTECTION
+						                           : NO_ACCESS_PROTECTION;
+						done   = true;
+					} else {
+						field = Field::Rest;
+					}
+					break;
+				}
+
+				case Field::Rest: break;
 			}
 		}
-		carry.erase(0, line_start);
 	}
 
 	::close(fd);

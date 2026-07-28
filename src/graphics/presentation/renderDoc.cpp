@@ -19,11 +19,18 @@
 #include <windows.h>
 #undef min
 #undef max
+#else
+#include <dlfcn.h>
+
+// RenderDoc's public API is a Windows-flavoured C interface, and the declarations below are shared
+// verbatim between the two platforms. Rather than duplicate them, give the two Windows spellings
+// they use a Linux meaning: the calling convention is the only one there is on x86-64 System V, and
+// a module handle is just an opaque pointer, which is exactly what dlopen returns.
+#define __cdecl
+using HMODULE = void*;
 #endif
 
 namespace Libs::Graphics {
-
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 
 using RenderDocDevicePointer = void*;
 using RenderDocWindowHandle  = void*;
@@ -107,6 +114,10 @@ static RenderDocDevicePointer GetRenderDocDevicePointer(vk::Instance instance) {
 	return VulkanHandleToPointer(instance);
 }
 
+// Locating the library, resolving its entry point and turning an SDL window into a native handle
+// are the only genuinely platform-specific parts; everything above and below is shared.
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+
 static bool BindRenderDocApi(HMODULE module) {
 	auto* get_api = reinterpret_cast<pRENDERDOC_GetAPI>(GetProcAddress(module, "RENDERDOC_GetAPI"));
 	if (get_api == nullptr) {
@@ -147,9 +158,88 @@ static RenderDocWindowHandle GetRenderDocWindowHandle(SDL_Window* window) {
 	return info.info.win.window;
 }
 
+#else
+
+static bool BindRenderDocApi(HMODULE module) {
+	auto* get_api = reinterpret_cast<pRENDERDOC_GetAPI>(::dlsym(module, "RENDERDOC_GetAPI"));
+	if (get_api == nullptr) {
+		return false;
+	}
+
+	void* api = nullptr;
+	if (get_api(eRENDERDOC_API_Version_1_4_2, &api) == 0 || api == nullptr) {
+		return false;
+	}
+
+	g_module = module;
+	g_api    = static_cast<RenderDocApi*>(api);
+
+	g_api->SetCaptureFilePathTemplate("_RenderDoc/kyty");
+	static RenderDocInputButton capture_keys[] = {eRENDERDOC_Key_F1};
+	g_api->SetCaptureKeys(capture_keys, 1);
+	g_api->UnloadCrashHandler();
+
+	Dl_info info {};
+	if (::dladdr(reinterpret_cast<void*>(get_api), &info) != 0 && info.dli_fname != nullptr) {
+		LOGF("RenderDoc: bound API from %s\n", info.dli_fname);
+	} else {
+		LOGF("RenderDoc: bound API\n");
+	}
+	return true;
+}
+
+static RenderDocWindowHandle GetRenderDocWindowHandle(SDL_Window* window) {
+	if (window == nullptr) {
+		return nullptr;
+	}
+
+	SDL_SysWMinfo info {};
+	SDL_VERSION(&info.version);
+
+	if (SDL_GetWindowWMInfo(window, &info) != SDL_TRUE) {
+		return nullptr;
+	}
+
+#if defined(SDL_VIDEO_DRIVER_X11)
+	if (info.subsystem == SDL_SYSWM_X11) {
+		// RenderDoc takes the raw xlib Window id in the pointer slot, not a Display*.
+		return reinterpret_cast<RenderDocWindowHandle>(
+		    static_cast<uintptr_t>(info.info.x11.window));
+	}
+#endif
+
+	// Wayland exposes no handle RenderDoc understands. Report it once; RenderDocSetActiveWindow
+	// will then skip SetActiveWindow, which costs the in-app overlay but not capture itself --
+	// StartFrameCapture/EndFrameCapture below pass a null device/window pair, meaning "the only
+	// device and window", and that is what IsAvailable allows for on this platform.
+	static std::atomic_bool logged = false;
+	if (!logged.exchange(true)) {
+		LOGF("RenderDoc: no native window handle for SDL subsystem %d (Wayland?); the in-app "
+		     "overlay is unavailable, but --rd captures still work\n",
+		     static_cast<int>(info.subsystem));
+	}
+	return nullptr;
+}
+
+#endif
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+
 static bool IsAvailable() {
 	return g_api != nullptr && g_device != nullptr && g_window != nullptr;
 }
+
+#else
+
+// Unlike the Windows path, a null window handle is survivable here: under Wayland there is no
+// handle to obtain, and the frame-capture calls do not need one. Only SetActiveWindow does.
+static bool IsAvailable() {
+	return g_api != nullptr && g_device != nullptr;
+}
+
+#endif
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 
 void RenderDocInit() {
 	bool expected = false;
@@ -186,6 +276,37 @@ void RenderDocInit() {
 		return;
 	}
 }
+
+#else
+
+void RenderDocInit() {
+	bool expected = false;
+	if (!g_init_done.compare_exchange_strong(expected, true)) {
+		return;
+	}
+
+	// There is no registry to consult. When the process was launched by RenderDoc the library is
+	// already in the address space, and RTLD_NOLOAD binds to that copy without loading a second
+	// one -- which is the case that matters, because only an already-injected RenderDoc has its
+	// Vulkan layer in place. Loading it ourselves afterwards is a best-effort fallback and is
+	// tried second.
+	auto* module = ::dlopen("librenderdoc.so", RTLD_NOW | RTLD_NOLOAD);
+	if (module == nullptr) {
+		module = ::dlopen("librenderdoc.so", RTLD_NOW);
+	}
+	if (module == nullptr) {
+		LOGF("RenderDoc: librenderdoc.so was not found; in-app capture disabled\n");
+		return;
+	}
+
+	if (!BindRenderDocApi(module)) {
+		LOGF("RenderDoc: API 1.4.2 is not available; in-app capture disabled\n");
+		::dlclose(module);
+		return;
+	}
+}
+
+#endif
 
 void RenderDocSetActiveWindow(vk::Instance instance, SDL_Window* window) {
 	if (g_api == nullptr) {
@@ -273,14 +394,5 @@ void RenderDocOnPresent() {
 		LOGF("RenderDoc: capture failed\n");
 	}
 }
-
-#else
-
-void RenderDocInit() {}
-void RenderDocSetActiveWindow(vk::Instance /*instance*/, SDL_Window* /*window*/) {}
-void RenderDocRequestCapture() {}
-void RenderDocOnPresent() {}
-
-#endif
 
 } // namespace Libs::Graphics

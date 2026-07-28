@@ -8,6 +8,8 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <execinfo.h> // backtrace
+#include <pthread.h>  // pthread_getattr_np, for the reserved stack extent
 #include <sys/param.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -15,8 +17,21 @@
 #include <libgen.h> // POSIX basename() lives here on macOS, not in <cstring>
 #endif
 
-void SysStackWalk(void** /*stack*/, int* depth) {
-	*depth = 0;
+void SysStackWalk(void** stack, int* depth) {
+	if (stack == nullptr || depth == nullptr || *depth <= 0) {
+		if (depth != nullptr) {
+			*depth = 0;
+		}
+		return;
+	}
+
+	// Was a stub returning zero frames, which left every EXIT/EXIT_IF fatal report on Linux
+	// printing an empty "--- Stack Trace ---". backtrace() is the counterpart of the Windows
+	// RtlCaptureContext/RtlVirtualUnwind walk and is already used elsewhere in the tree
+	// (graphics/host_gpu/pageManager.cpp). It needs frame pointers to be reliable, which the build
+	// keeps via -fno-omit-frame-pointer.
+	const int n = ::backtrace(stack, *depth);
+	*depth      = (n < 0 ? 0 : n);
 }
 
 void SysStackUsagePrint(sys_dbg_stack_info_t& stack) {
@@ -33,6 +48,36 @@ void SysStackUsage(sys_dbg_stack_info_t& s) {
 
 	[[maybe_unused]] int result = 0;
 
+	memset(&s, 0, sizeof(sys_dbg_stack_info_t));
+
+	// Ask pthread for the stack extent before anything else. Everything below depends on /proc,
+	// which does not exist on macOS -- this function returns early there -- so the reservation has
+	// to be established first if it is to be populated on both platforms. On Linux the /proc walk
+	// then refines addr/commited_*/code_* with what is actually mapped.
+	{
+		pthread_attr_t self_attr {};
+#if defined(__APPLE__)
+		void*        stack_top  = pthread_get_stackaddr_np(pthread_self());
+		const size_t stack_size = pthread_get_stacksize_np(pthread_self());
+		if (stack_top != nullptr && stack_size != 0) {
+			s.reserved_addr = reinterpret_cast<uintptr_t>(stack_top) - stack_size;
+			s.reserved_size = stack_size;
+		}
+		(void)self_attr;
+#else
+		if (pthread_getattr_np(pthread_self(), &self_attr) == 0) {
+			void*  stack_base = nullptr;
+			size_t stack_size = 0;
+			if (pthread_attr_getstack(&self_attr, &stack_base, &stack_size) == 0 &&
+			    stack_base != nullptr && stack_size != 0) {
+				s.reserved_addr = reinterpret_cast<uintptr_t>(stack_base);
+				s.reserved_size = stack_size;
+			}
+			pthread_attr_destroy(&self_attr);
+		}
+#endif
+	}
+
 	char str[1024];
 	char str2[1024];
 	result = sprintf(str, "/proc/%d/exe", static_cast<int>(pid));
@@ -45,8 +90,6 @@ void SysStackUsage(sys_dbg_stack_info_t& s) {
 	const char* name = basename(str2);
 
 	result = sprintf(str, "/proc/%d/maps", static_cast<int>(pid));
-
-	memset(&s, 0, sizeof(sys_dbg_stack_info_t));
 
 	FILE* f = fopen(str, "r");
 
@@ -121,6 +164,13 @@ void SysStackUsage(sys_dbg_stack_info_t& s) {
 	}
 
 	result = fclose(f);
+
+	// If pthread did not report a reservation, fall back to the mapped extent found above so the
+	// field is never left at zero on a host where /proc did work.
+	if (s.reserved_addr == 0) {
+		s.reserved_addr = s.addr;
+		s.reserved_size = s.total_size;
+	}
 }
 
 #endif

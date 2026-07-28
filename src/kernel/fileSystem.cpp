@@ -21,6 +21,8 @@
 #include <cstring>
 #include <filesystem>
 #include <random>
+#include <system_error>
+#include <unordered_map>
 #include <vector>
 
 namespace Libs::LibKernel::FileSystem {
@@ -235,6 +237,72 @@ void MountPoints::Umount(const std::string& folder_or_point) {
 	}
 }
 
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+// Guest paths come from discs mastered on a case-insensitive filesystem, so a title may ship
+// /app0/DATA/foo.dat and then ask for /app0/data/Foo.dat. That resolves on NTFS and fails on ext4.
+// Windows needs none of this, so the whole mechanism is compiled out there.
+//
+// Only paths that do not already exist verbatim take this route, so the common case costs one
+// stat. Results are memoised because guest file opens are hot and a rescan walks whole directories.
+static std::filesystem::path ResolvePathIgnoringCase(const std::filesystem::path& path) {
+	std::error_code ec;
+	if (std::filesystem::exists(path, ec)) {
+		return path;
+	}
+
+	static Common::Mutex                                        cache_mutex;
+	static std::unordered_map<std::string, std::filesystem::path> cache;
+
+	const auto key = path.string();
+	{
+		Common::LockGuard lock(cache_mutex);
+		if (const auto hit = cache.find(key); hit != cache.end()) {
+			return hit->second;
+		}
+	}
+
+	// Walk from the root one component at a time, substituting a case-insensitive match whenever
+	// the exact name is absent. Anything not found is kept verbatim so the caller still reports a
+	// sensible ENOENT path.
+	std::filesystem::path resolved = path.has_root_path() ? path.root_path() : std::filesystem::path(".");
+	bool                  matched  = true;
+
+	for (const auto& component: path.relative_path()) {
+		if (component.empty()) {
+			continue;
+		}
+
+		auto candidate = resolved / component;
+		if (!matched || std::filesystem::exists(candidate, ec)) {
+			resolved = std::move(candidate);
+			continue;
+		}
+
+		bool found = false;
+		for (std::filesystem::directory_iterator entry(resolved, ec), end; entry != end;
+		     entry.increment(ec)) {
+			if (ec) {
+				break;
+			}
+			if (Common::EqualNoCase(entry->path().filename().string(), component.string())) {
+				resolved = entry->path();
+				found    = true;
+				break;
+			}
+		}
+
+		if (!found) {
+			resolved = std::move(candidate);
+			matched  = false;
+		}
+	}
+
+	Common::LockGuard lock(cache_mutex);
+	cache[key] = resolved;
+	return resolved;
+}
+#endif
+
 std::filesystem::path MountPoints::GetRealFilename(const std::string& mounted_file_name) {
 	Common::LockGuard lock(m_mutex);
 
@@ -251,7 +319,11 @@ std::filesystem::path MountPoints::GetRealFilename(const std::string& mounted_fi
 		while (Common::StartsWith(rel_path, '/')) {
 			rel_path = Common::RemoveFirst(rel_path, 1);
 		}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		return p.dir / rel_path;
+#else
+		return ResolvePathIgnoringCase(p.dir / rel_path);
+#endif
 	}
 
 	return mounted_file_name;
@@ -272,7 +344,11 @@ std::filesystem::path MountPoints::GetRealDirectory(const std::string& mounted_d
 		while (Common::StartsWith(rel_path, '/')) {
 			rel_path = Common::RemoveFirst(rel_path, 1);
 		}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		return p.dir / rel_path;
+#else
+		return ResolvePathIgnoringCase(p.dir / rel_path);
+#endif
 	}
 
 	return mounted_directory;

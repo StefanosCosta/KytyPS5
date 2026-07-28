@@ -192,7 +192,11 @@ static void PrintAbortPointerArrayCandidate(const char* name, uint64_t addr) {
 
 	uint64_t rbp = 0;
 	uint64_t rsp = 0;
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// The guard is on the architecture, not the platform: this is GCC-syntax asm that assembles
+	// anywhere x86-64 does, and gating it on Windows left the Linux diagnostics reporting rbp = 0,
+	// rsp = 0. Windows is x64-only, so it still compiles the same two statements. Matches the
+	// pattern catchReturnFromMain already uses below.
+#if defined(__x86_64__) || defined(_M_X64)
 	asm volatile("movq %%rbp, %0" : "=r"(rbp));
 	asm volatile("movq %%rsp, %0" : "=r"(rsp));
 #endif
@@ -419,7 +423,29 @@ static KYTY_SYSV_ABI size_t libc_strftime(char* str, size_t count, const char* f
 		return 0;
 	}
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	// glibc implements %Z by dereferencing tp->tm_zone. Guest code routinely builds a struct tm on
+	// its own stack and fills only the nine standard fields, leaving tm_zone holding whatever
+	// happened to be there -- Subliminal reaches strftime() with tm_zone = 0x30 -- and the
+	// dereference then faults inside host libc, outside any guest module. Copy the struct and drop
+	// the pointer: glibc null-checks tm_zone before reading it, so %Z expands to nothing instead
+	// of crashing.
+	//
+	// tm_gmtoff is deliberately left as the guest set it. It is a plain integer that %z formats
+	// without dereferencing anything, so a junk value can only yield a wrong offset, never a
+	// fault, and preserving it keeps %z correct for the common case where the guest got its
+	// struct tm from libc_localtime()/libc_gmtime() above.
+	//
+	// Scoped to Linux on purpose. Windows and macOS keep the original call untouched: MSVC's
+	// struct tm has neither field and its %Z reads the global tzname, and the macOS path is
+	// deliberately left as it was rather than changed blind on a platform not tested here.
+	std::tm sanitized = *timeptr;
+	sanitized.tm_zone = nullptr;
+
+	return std::strftime(str, count, format, &sanitized);
+#else
 	return std::strftime(str, count, format, timeptr);
+#endif
 }
 
 static KYTY_SYSV_ABI void catchReturnFromMain(int status) {

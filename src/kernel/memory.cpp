@@ -242,6 +242,15 @@ static bool VirtualRangesOverlap(uint64_t left_start, uint64_t left_size, uint64
 static bool CommitFixedHostRange(uint64_t start, uint64_t size, VirtualMemory::Mode mode) {
 	constexpr uint64_t PAGE_SIZE = 0x4000;
 
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+	// mmap/mprotect take a length, so the whole range can be done in one syscall. The per-page
+	// loop below is a fallback for partially-mapped ranges; without this a 2 GiB commit issued
+	// ~131k syscalls, since the range is walked in 16 KiB guest pages.
+	if (size > PAGE_SIZE && VirtualMemory::AllocFixed(start, size, mode)) {
+		return true;
+	}
+#endif
+
 	for (uint64_t addr = start; addr < start + size; addr += PAGE_SIZE) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		MEMORY_BASIC_INFORMATION info {};
@@ -2990,6 +2999,15 @@ static bool ReserveFixedHostRange(uint64_t start, uint64_t size) {
 		}
 	}
 	g_test_host_reservation_pages_before_failure = UINT32_MAX;
+#endif
+
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+	// As in CommitFixedHostRange: one mmap for the whole span when the range is free, falling back
+	// to the page walk when it is not. Nothing has been mutated yet at this point, so a failure
+	// here is free to retry below.
+	if (size > PAGE_SIZE && VirtualMemory::ReserveFixed(start, size)) {
+		return true;
+	}
 #endif
 
 	bool host_mutated = false;

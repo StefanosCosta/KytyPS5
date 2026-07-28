@@ -14,6 +14,33 @@
 #endif
 #else
 #include <arpa/inet.h>
+#include <cerrno>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <sys/ioctl.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+// The link-layer address of an interface is reported through a different address family on each
+// POSIX host: AF_PACKET/sockaddr_ll on Linux, AF_LINK/sockaddr_dl on the BSDs and macOS.
+#if defined(__APPLE__)
+#include <net/if_dl.h>
+#else
+#include <netpacket/packet.h>
+#endif
+
+// Two Winsock spellings appear in socket bodies that are otherwise completely portable. Giving
+// them a Linux meaning lets those bodies be shared verbatim instead of duplicated, which keeps the
+// Windows code untouched.
+static constexpr int SOCKET_ERROR = -1;
+
+static inline int closesocket(int fd) {
+	return ::close(fd);
+}
 #endif
 
 #include "common/assert.h"
@@ -834,7 +861,8 @@ static constexpr int                         SOCKET_FD_MIN = 128;
 static constexpr int                         SOCKET_FD_MAX = 1024;
 static Common::Mutex                         g_socket_mutex;
 static std::array<SocketSlot, SOCKET_FD_MAX> g_sockets;
-static std::atomic_bool                      g_winsock_initialized = false;
+// Only the Winsock startup path reads this; the attribute is a no-op where it does.
+[[maybe_unused]] static std::atomic_bool     g_winsock_initialized = false;
 
 constexpr int      EPOLL_ID_BASE = SOCKET_FD_MAX;
 constexpr uint32_t EPOLL_IN      = 0x00000001;
@@ -925,7 +953,47 @@ static int SetPosixSocketError(int error) {
 		default: break;
 	}
 #else
-	posix_error = error;
+	// The guest's errno space is FreeBSD's, which diverges from Linux's above 34: guest EAGAIN is
+	// 35 where Linux uses 11, guest ECONNRESET is 54 against Linux's 104, and so on. Handing a raw
+	// Linux errno to the guest therefore reads as an unrelated error -- EAGAIN in particular would
+	// arrive as EDEADLK, breaking every non-blocking retry loop. Translate explicitly; values at
+	// or below 34 coincide in both systems and fall through unchanged.
+	switch (error) {
+		case EACCES: posix_error = Posix::POSIX_EACCES; break;
+		case EADDRINUSE: posix_error = Posix::POSIX_EADDRINUSE; break;
+		case EADDRNOTAVAIL: posix_error = Posix::POSIX_EADDRNOTAVAIL; break;
+		case EAFNOSUPPORT: posix_error = Posix::POSIX_EAFNOSUPPORT; break;
+		case EFAULT: posix_error = Posix::POSIX_EFAULT; break;
+		case EINTR: posix_error = Posix::POSIX_EINTR; break;
+		case EINVAL: posix_error = Posix::POSIX_EINVAL; break;
+		case EISCONN: posix_error = Posix::POSIX_EISCONN; break;
+		case EMFILE: posix_error = Posix::POSIX_EMFILE; break;
+		case EMSGSIZE: posix_error = Posix::POSIX_EMSGSIZE; break;
+		case ENOBUFS: posix_error = Posix::POSIX_ENOBUFS; break;
+		case ENETDOWN: posix_error = Posix::POSIX_ENETDOWN; break;
+		case ENETRESET: posix_error = Posix::POSIX_ENETRESET; break;
+		case ENETUNREACH: posix_error = Posix::POSIX_ENETUNREACH; break;
+		case ENOTCONN: posix_error = Posix::POSIX_ENOTCONN; break;
+		case ENOTSOCK: posix_error = Posix::POSIX_ENOTSOCK; break;
+		case EOPNOTSUPP: posix_error = Posix::POSIX_EOPNOTSUPP; break;
+		case EPROTONOSUPPORT: posix_error = Posix::POSIX_EPROTONOSUPPORT; break;
+		case ESHUTDOWN: posix_error = Posix::POSIX_ESHUTDOWN; break;
+		case ETIMEDOUT: posix_error = Posix::POSIX_ETIMEDOUT; break;
+		case EAGAIN: posix_error = Posix::POSIX_EWOULDBLOCK; break;
+		case ECONNABORTED: posix_error = Posix::POSIX_ECONNABORTED; break;
+		case ECONNREFUSED: posix_error = Posix::POSIX_ECONNREFUSED; break;
+		case ECONNRESET: posix_error = Posix::POSIX_ECONNRESET; break;
+		case EDESTADDRREQ: posix_error = Posix::POSIX_EDESTADDRREQ; break;
+		case EHOSTUNREACH: posix_error = Posix::POSIX_EHOSTUNREACH; break;
+		case EINPROGRESS: posix_error = Posix::POSIX_EINPROGRESS; break;
+		case EALREADY: posix_error = Posix::POSIX_EALREADY; break;
+		case EPIPE: posix_error = Posix::POSIX_EPIPE; break;
+		case ENOSPC: posix_error = Posix::POSIX_ENOSPC; break;
+		case EPERM: posix_error = Posix::POSIX_EPERM; break;
+		case EBADF: posix_error = Posix::POSIX_EBADF; break;
+		case ENOMEM: posix_error = Posix::POSIX_ENOMEM; break;
+		default: posix_error = (error <= 34 ? error : Posix::POSIX_EIO); break;
+	}
 #endif
 	*Posix::GetErrorAddr() = posix_error;
 	return -1;
@@ -949,6 +1017,46 @@ static int ConvertFamily(int family) {
 
 static int ConvertSocketOptionLevel(int level) {
 	return (level == 0xffff ? SOL_SOCKET : level);
+}
+
+// Winsock kept the BSD socket-option numbers, so the guest's values pass straight through there,
+// and macOS is a BSD itself. Linux is the odd one out: it renumbered the SOL_SOCKET options, so
+// guest SO_REUSEADDR (4) would land on Linux SO_ERROR and be rejected as read-only, guest
+// SO_KEEPALIVE (8) on SO_RCVBUF, and so on -- silently configuring the wrong thing where it did
+// not outright fail. Only SOL_SOCKET was renumbered; IPPROTO_TCP/IP option numbers agree.
+static int ConvertSocketOptionName(int host_level, int optname) {
+#if defined(_WIN32) || defined(__APPLE__)
+	(void)host_level;
+	return optname;
+#else
+	if (host_level != SOL_SOCKET) {
+		return optname;
+	}
+
+	switch (optname) {
+		case 0x0001: return SO_DEBUG;
+		case 0x0002: return SO_ACCEPTCONN;
+		case 0x0004: return SO_REUSEADDR;
+		case 0x0008: return SO_KEEPALIVE;
+		case 0x0010: return SO_DONTROUTE;
+		case 0x0020: return SO_BROADCAST;
+		case 0x0080: return SO_LINGER;
+		case 0x0100: return SO_OOBINLINE;
+		case 0x0200: return SO_REUSEPORT;
+		case 0x0400: return SO_TIMESTAMP;
+		case 0x1001: return SO_SNDBUF;
+		case 0x1002: return SO_RCVBUF;
+		case 0x1003: return SO_SNDLOWAT;
+		case 0x1004: return SO_RCVLOWAT;
+		case 0x1005: return SO_SNDTIMEO;
+		case 0x1006: return SO_RCVTIMEO;
+		case 0x1007: return SO_ERROR;
+		case 0x1008: return SO_TYPE;
+		// SO_USELOOPBACK (0x40) and SO_NOSIGPIPE (0x800) have no Linux counterpart; the latter is
+		// covered per-call by MSG_NOSIGNAL in ConvertMessageFlags.
+		default: return -1;
+	}
+#endif
 }
 
 static int ConvertMessageFlags(int flags) {
@@ -979,11 +1087,50 @@ static int ConvertMessageFlags(int flags) {
 
 	return host_flags;
 #else
-	return flags;
+	// The guest's MSG_* values are FreeBSD's and do not line up with Linux's: guest MSG_WAITALL is
+	// 0x40, which Linux reads as MSG_DONTWAIT -- the exact opposite instruction. Every flag has to
+	// be translated rather than forwarded. Unlike Winsock, Linux does have MSG_DONTWAIT and
+	// MSG_NOSIGNAL, so those two are honoured here instead of being dropped. This branch is also
+	// compiled for macOS, which has no MSG_NOSIGNAL (it uses the SO_NOSIGPIPE socket option
+	// instead), so that one flag is feature-tested rather than assumed.
+	constexpr int guest_msg_peek      = 0x00000002;
+	constexpr int guest_msg_dontroute = 0x00000004;
+	constexpr int guest_msg_waitall   = 0x00000040;
+	constexpr int guest_msg_dontwait  = 0x00000080;
+	constexpr int guest_msg_nosignal  = 0x00020000;
+
+	int host_flags = 0;
+	if ((flags & guest_msg_peek) != 0) {
+		host_flags |= MSG_PEEK;
+	}
+	if ((flags & guest_msg_dontroute) != 0) {
+		host_flags |= MSG_DONTROUTE;
+	}
+	if ((flags & guest_msg_waitall) != 0) {
+		host_flags |= MSG_WAITALL;
+	}
+	if ((flags & guest_msg_dontwait) != 0) {
+		host_flags |= MSG_DONTWAIT;
+	}
+#if defined(MSG_NOSIGNAL)
+	if ((flags & guest_msg_nosignal) != 0) {
+		host_flags |= MSG_NOSIGNAL;
+	}
+#endif
+
+	flags &= ~(guest_msg_peek | guest_msg_dontroute | guest_msg_waitall | guest_msg_dontwait |
+	           guest_msg_nosignal);
+	if (flags != 0) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EOPNOTSUPP;
+		return -1;
+	}
+
+	return host_flags;
 #endif
 }
 
-#if defined(_WIN32)
+// Guest<->host sockaddr translation is pure byte shuffling over sockaddr_in, which exists in the
+// same shape on both platforms, so these two are shared. Their bodies are unchanged.
 static int ConvertGuestSockaddr(const void* addr, uint32_t addrlen, sockaddr_storage* out,
                                 int* out_len) {
 	EXIT_IF(out == nullptr);
@@ -1052,7 +1199,6 @@ static int ConvertHostSockaddr(const sockaddr_storage* addr, int addrlen, void* 
 	*out_len = guest_addrlen;
 	return 0;
 }
-#endif
 
 static bool GetSocketBackend(int guest_fd, NativeSocket* out) {
 	EXIT_IF(out == nullptr);
@@ -1265,7 +1411,32 @@ int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr
 	freeaddrinfo(result);
 	return NET_ERROR_RESOLVER_ENORECORD;
 #else
-	return NET_ERROR_RESOLVER_ENOTIMPLEMENTED;
+	// getaddrinfo is POSIX, so this mirrors the Windows path exactly.
+	addrinfo hints {};
+	hints.ai_family   = AF_INET;
+	hints.ai_socktype = SOCK_STREAM;
+
+	addrinfo* result = nullptr;
+	const int ret    = ::getaddrinfo(hostname, nullptr, &hints, &result);
+	if (ret != 0 || result == nullptr) {
+		if (result != nullptr) {
+			::freeaddrinfo(result);
+		}
+		return ret == EAI_NONAME ? NET_ERROR_RESOLVER_ENOHOST : NET_ERROR_RESOLVER_EINTERNAL;
+	}
+
+	for (auto* ai = result; ai != nullptr; ai = ai->ai_next) {
+		if (ai->ai_family == AF_INET && ai->ai_addr != nullptr &&
+		    ai->ai_addrlen >= sizeof(sockaddr_in)) {
+			const auto* in = reinterpret_cast<const sockaddr_in*>(ai->ai_addr);
+			std::memcpy(addr, &in->sin_addr, sizeof(in->sin_addr));
+			::freeaddrinfo(result);
+			return OK;
+		}
+	}
+
+	::freeaddrinfo(result);
+	return NET_ERROR_RESOLVER_ENORECORD;
 #endif
 }
 
@@ -1318,7 +1489,11 @@ const char* KYTY_SYSV_ABI NetInetNtop(int af, const void* src, char* dst, uint32
 		return nullptr;
 	}
 #else
-	if (::inet_ntop(af, src, dst, size) == nullptr) {
+	// af is the guest's value, where AF_INET6 is 28. Passing it straight through only worked
+	// because guest and host AF_INET happen to agree on 2; AF_INET6 is 10 here, so every IPv6
+	// lookup failed. Convert it the same way the Windows branch does.
+	const int host_af = ConvertFamily(af);
+	if (host_af < 0 || ::inet_ntop(host_af, src, dst, size) == nullptr) {
 		return nullptr;
 	}
 #endif
@@ -1553,8 +1728,86 @@ int KYTY_SYSV_ABI EpollWait(int eid, NetEpollEvent* events, int maxevents, int t
 	}
 	return count;
 #else
-	(void)timeout;
-	return SetPosixSocketError(Posix::POSIX_ENOSYS);
+	// poll() rather than select(): it has no FD_SETSIZE ceiling, so a guest holding many sockets
+	// in one epoll does not have to be rejected. Deliberately not epoll() -- this branch is also
+	// compiled for macOS, which has kqueue instead, and the registration list is already tracked
+	// in userspace so there is nothing epoll would add.
+	struct HostRegistration {
+		EpollRegistration guest;
+		NativeSocket      socket = INVALID_NATIVE_SOCKET;
+	};
+
+	std::vector<HostRegistration> host_registrations;
+	std::vector<pollfd>           poll_fds;
+	host_registrations.reserve(registrations.size());
+	poll_fds.reserve(registrations.size());
+
+	for (const auto& registration: registrations) {
+		NativeSocket socket = INVALID_NATIVE_SOCKET;
+		if (!GetSocketBackend(registration.id, &socket)) {
+			continue;
+		}
+		pollfd entry {};
+		entry.fd = socket;
+		if ((registration.event.events & EPOLL_IN) != 0) {
+			entry.events |= POLLIN;
+		}
+		if ((registration.event.events & EPOLL_OUT) != 0) {
+			entry.events |= POLLOUT;
+		}
+		poll_fds.push_back(entry);
+		host_registrations.push_back({registration, socket});
+	}
+
+	if (host_registrations.empty()) {
+		return 0;
+	}
+
+	// The guest expresses its timeout in microseconds; poll() takes milliseconds. Round a non-zero
+	// sub-millisecond wait up to 1ms so a short poll never degenerates into a busy spin.
+	int poll_timeout = -1;
+	if (timeout >= 0) {
+		poll_timeout = (timeout == 0 ? 0 : static_cast<int>((timeout + 999) / 1000));
+	}
+
+	int result = 0;
+	while ((result = ::poll(poll_fds.data(), poll_fds.size(), poll_timeout)) == SOCKET_ERROR) {
+		if (errno != EINTR) {
+			return SetPosixSocketError();
+		}
+	}
+	if (result == 0) {
+		return 0;
+	}
+
+	int count = 0;
+	for (size_t i = 0; i < host_registrations.size(); i++) {
+		const auto& revents = poll_fds[i].revents;
+
+		uint32_t ready = 0;
+		if ((revents & POLLIN) != 0) {
+			ready |= EPOLL_IN;
+		}
+		if ((revents & POLLOUT) != 0) {
+			ready |= EPOLL_OUT;
+		}
+		if ((revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+			ready |= EPOLL_ERR;
+		}
+		if (ready == 0) {
+			continue;
+		}
+
+		auto& output    = events[count++];
+		output          = host_registrations[i].guest.event;
+		output.events   = ready;
+		output.reserved = 0;
+		output.ident    = static_cast<uint64_t>(host_registrations[i].guest.id);
+		if (count == maxevents) {
+			break;
+		}
+	}
+	return count;
 #endif
 }
 
@@ -1583,15 +1836,11 @@ int KYTY_SYSV_ABI SocketClose(int s) {
 	}
 	RemoveSocketFromEpolls(s);
 
-#if defined(_WIN32)
 	if (closesocket(socket) == SOCKET_ERROR) {
 		return NET_ERROR_EBADF;
 	}
 
 	return OK;
-#else
-	return NET_ERROR_ENOSYS;
-#endif
 }
 
 int KYTY_SYSV_ABI Socket(int family, int type, int protocol) {
@@ -1612,7 +1861,6 @@ int KYTY_SYSV_ABI Socket(int family, int type, int protocol) {
 		return -1;
 	}
 
-#if defined(_WIN32)
 	NativeSocket socket = ::socket(host_family, type, protocol);
 	if (socket == INVALID_NATIVE_SOCKET) {
 		return SetPosixSocketError();
@@ -1627,10 +1875,6 @@ int KYTY_SYSV_ABI Socket(int family, int type, int protocol) {
 
 	LOGF("\t fd = %d\n", fd);
 	return fd;
-#else
-	*Posix::GetErrorAddr() = Posix::POSIX_ENOSYS;
-	return -1;
-#endif
 }
 
 int KYTY_SYSV_ABI Bind(int s, const void* addr, uint32_t addrlen) {
@@ -1647,7 +1891,6 @@ int KYTY_SYSV_ABI Bind(int s, const void* addr, uint32_t addrlen) {
 		return -1;
 	}
 
-#if defined(_WIN32)
 	sockaddr_storage host_addr {};
 	int              host_addrlen = 0;
 	if (ConvertGuestSockaddr(addr, addrlen, &host_addr, &host_addrlen) != 0) {
@@ -1660,10 +1903,6 @@ int KYTY_SYSV_ABI Bind(int s, const void* addr, uint32_t addrlen) {
 	}
 
 	return 0;
-#else
-	*Posix::GetErrorAddr() = Posix::POSIX_ENOSYS;
-	return -1;
-#endif
 }
 
 int KYTY_SYSV_ABI Connect(int s, const void* addr, uint32_t addrlen) {
@@ -1680,7 +1919,6 @@ int KYTY_SYSV_ABI Connect(int s, const void* addr, uint32_t addrlen) {
 		return -1;
 	}
 
-#if defined(_WIN32)
 	sockaddr_storage host_addr {};
 	int              host_addrlen = 0;
 	if (ConvertGuestSockaddr(addr, addrlen, &host_addr, &host_addrlen) != 0) {
@@ -1693,10 +1931,6 @@ int KYTY_SYSV_ABI Connect(int s, const void* addr, uint32_t addrlen) {
 	}
 
 	return 0;
-#else
-	*Posix::GetErrorAddr() = Posix::POSIX_ENOSYS;
-	return -1;
-#endif
 }
 
 int KYTY_SYSV_ABI Listen(int s, int backlog) {
@@ -1712,16 +1946,11 @@ int KYTY_SYSV_ABI Listen(int s, int backlog) {
 		return -1;
 	}
 
-#if defined(_WIN32)
 	if (::listen(socket, backlog) == SOCKET_ERROR) {
 		return SetPosixSocketError();
 	}
 
 	return 0;
-#else
-	*Posix::GetErrorAddr() = Posix::POSIX_ENOSYS;
-	return -1;
-#endif
 }
 
 int KYTY_SYSV_ABI Accept(int s, void* addr, uint32_t* addrlen) {
@@ -1767,8 +1996,34 @@ int KYTY_SYSV_ABI Accept(int s, void* addr, uint32_t* addrlen) {
 
 	return fd;
 #else
-	*Posix::GetErrorAddr() = Posix::POSIX_ENOSYS;
-	return -1;
+	// Identical to the Windows path except that accept() takes a socklen_t* here, not an int*.
+	sockaddr_storage host_addr {};
+	socklen_t        host_addrlen = sizeof(host_addr);
+	NativeSocket accepted = ::accept(socket, reinterpret_cast<sockaddr*>(&host_addr), &host_addrlen);
+	if (accepted == INVALID_NATIVE_SOCKET) {
+		return SetPosixSocketError();
+	}
+
+	const int fd = AllocSocketFd(accepted);
+	if (fd < 0) {
+		closesocket(accepted);
+		*Posix::GetErrorAddr() = Posix::POSIX_EMFILE;
+		return -1;
+	}
+
+	if (addr != nullptr || addrlen != nullptr) {
+		if (addr == nullptr || addrlen == nullptr) {
+			SocketClose(fd);
+			*Posix::GetErrorAddr() = Posix::POSIX_EFAULT;
+			return -1;
+		}
+		if (ConvertHostSockaddr(&host_addr, static_cast<int>(host_addrlen), addr, addrlen) != 0) {
+			SocketClose(fd);
+			return -1;
+		}
+	}
+
+	return fd;
 #endif
 }
 
@@ -1790,16 +2045,11 @@ int KYTY_SYSV_ABI Shutdown(int s, int how) {
 		return -1;
 	}
 
-#if defined(_WIN32)
 	if (::shutdown(socket, how) == SOCKET_ERROR) {
 		return SetPosixSocketError();
 	}
 
 	return 0;
-#else
-	*Posix::GetErrorAddr() = Posix::POSIX_ENOSYS;
-	return -1;
-#endif
 }
 
 int KYTY_SYSV_ABI Getsockname(int s, void* addr, uint32_t* addrlen) {
@@ -1827,8 +2077,14 @@ int KYTY_SYSV_ABI Getsockname(int s, void* addr, uint32_t* addrlen) {
 
 	return ConvertHostSockaddr(&host_addr, host_addrlen, addr, addrlen);
 #else
-	*Posix::GetErrorAddr() = Posix::POSIX_ENOSYS;
-	return -1;
+	sockaddr_storage host_addr {};
+	socklen_t        host_addrlen = sizeof(host_addr);
+	if (::getsockname(socket, reinterpret_cast<sockaddr*>(&host_addr), &host_addrlen) ==
+	    SOCKET_ERROR) {
+		return SetPosixSocketError();
+	}
+
+	return ConvertHostSockaddr(&host_addr, static_cast<int>(host_addrlen), addr, addrlen);
 #endif
 }
 
@@ -1856,8 +2112,19 @@ int KYTY_SYSV_ABI Getsockopt(int s, int level, int optname, void* optval, uint32
 	*optlen = static_cast<uint32_t>(len);
 	return 0;
 #else
-	*Posix::GetErrorAddr() = Posix::POSIX_ENOSYS;
-	return -1;
+	const int host_level   = ConvertSocketOptionLevel(level);
+	const int host_optname = ConvertSocketOptionName(host_level, optname);
+	if (host_optname < 0) {
+		*Posix::GetErrorAddr() = Posix::POSIX_ENOPROTOOPT;
+		return -1;
+	}
+
+	socklen_t len = static_cast<socklen_t>(*optlen);
+	if (::getsockopt(socket, host_level, host_optname, optval, &len) == SOCKET_ERROR) {
+		return SetPosixSocketError();
+	}
+	*optlen = static_cast<uint32_t>(len);
+	return 0;
 #endif
 }
 
@@ -1894,8 +2161,31 @@ int KYTY_SYSV_ABI Setsockopt(int s, int level, int optname, const void* optval, 
 
 	return 0;
 #else
-	*Posix::GetErrorAddr() = Posix::POSIX_ENOSYS;
-	return -1;
+	// The guest asks for non-blocking mode through a socket option rather than fcntl; Winsock
+	// routes that to ioctlsocket, and the POSIX equivalent is an ioctl on the descriptor.
+	constexpr int ORBIS_SO_NBIO = 0x1200;
+	if (ConvertSocketOptionLevel(level) == SOL_SOCKET && optname == ORBIS_SO_NBIO &&
+	    optlen >= sizeof(int)) {
+		int enabled = (*static_cast<const int*>(optval) != 0 ? 1 : 0);
+		if (::ioctl(socket, FIONBIO, &enabled) == SOCKET_ERROR) {
+			return SetPosixSocketError();
+		}
+		return 0;
+	}
+
+	const int host_level   = ConvertSocketOptionLevel(level);
+	const int host_optname = ConvertSocketOptionName(host_level, optname);
+	if (host_optname < 0) {
+		*Posix::GetErrorAddr() = Posix::POSIX_ENOPROTOOPT;
+		return -1;
+	}
+
+	if (::setsockopt(socket, host_level, host_optname, optval, static_cast<socklen_t>(optlen)) ==
+	    SOCKET_ERROR) {
+		return SetPosixSocketError();
+	}
+
+	return 0;
 #endif
 }
 
@@ -1928,8 +2218,19 @@ int64_t KYTY_SYSV_ABI Send(int s, const void* buf, uint64_t len, int flags) {
 
 	return result;
 #else
-	*Posix::GetErrorAddr() = Posix::POSIX_ENOSYS;
-	return -1;
+	const int host_flags = ConvertMessageFlags(flags);
+	if (host_flags < 0) {
+		return -1;
+	}
+
+	// send() returns ssize_t here, so unlike the Windows path there is no need to clamp the length
+	// to INT_MAX to keep the result representable.
+	const auto result = ::send(socket, buf, static_cast<size_t>(len), host_flags);
+	if (result == SOCKET_ERROR) {
+		return SetPosixSocketError();
+	}
+
+	return static_cast<int64_t>(result);
 #endif
 }
 
@@ -1962,8 +2263,17 @@ int64_t KYTY_SYSV_ABI Recv(int s, void* buf, uint64_t len, int flags) {
 
 	return result;
 #else
-	*Posix::GetErrorAddr() = Posix::POSIX_ENOSYS;
-	return -1;
+	const int host_flags = ConvertMessageFlags(flags);
+	if (host_flags < 0) {
+		return -1;
+	}
+
+	const auto result = ::recv(socket, buf, static_cast<size_t>(len), host_flags);
+	if (result == SOCKET_ERROR) {
+		return SetPosixSocketError();
+	}
+
+	return static_cast<int64_t>(result);
 #endif
 }
 
@@ -2088,8 +2398,112 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 
 	return result;
 #else
-	*Posix::GetErrorAddr() = Posix::POSIX_ENOSYS;
-	return -1;
+	// Same shape as the Windows path, with two differences: select() here needs a real nfds
+	// (highest descriptor + 1, not the ignored 0 Winsock accepts), and the empty-set case sleeps
+	// with nanosleep instead of Sleep().
+	fd_set host_read {};
+	fd_set host_write {};
+	fd_set host_except {};
+	FD_ZERO(&host_read);
+	FD_ZERO(&host_write);
+	FD_ZERO(&host_except);
+
+	std::array<int, FD_SETSIZE> read_map {};
+	std::array<int, FD_SETSIZE> write_map {};
+	std::array<int, FD_SETSIZE> except_map {};
+	int                         read_count   = 0;
+	int                         write_count  = 0;
+	int                         except_count = 0;
+	NativeSocket                max_socket   = INVALID_NATIVE_SOCKET;
+
+	for (int fd = 0; fd < nfds; fd++) {
+		NativeSocket socket = INVALID_NATIVE_SOCKET;
+		if (!GetSocketBackend(fd, &socket)) {
+			continue;
+		}
+		// FD_SET on a descriptor at or beyond FD_SETSIZE writes outside the fd_set.
+		if (socket >= FD_SETSIZE) {
+			return SetPosixSocketError(Posix::POSIX_EINVAL);
+		}
+		bool selected = false;
+		if (GuestFdIsSet(readfds, fd) && read_count < FD_SETSIZE) {
+			FD_SET(socket, &host_read);
+			read_map[static_cast<size_t>(read_count++)] = fd;
+			selected                                    = true;
+		}
+		if (GuestFdIsSet(writefds, fd) && write_count < FD_SETSIZE) {
+			FD_SET(socket, &host_write);
+			write_map[static_cast<size_t>(write_count++)] = fd;
+			selected                                      = true;
+		}
+		if (GuestFdIsSet(exceptfds, fd) && except_count < FD_SETSIZE) {
+			FD_SET(socket, &host_except);
+			except_map[static_cast<size_t>(except_count++)] = fd;
+			selected                                        = true;
+		}
+		if (selected && socket > max_socket) {
+			max_socket = socket;
+		}
+	}
+
+	timeval  host_timeout {};
+	timeval* host_timeout_ptr = nullptr;
+	if (timeout != nullptr) {
+		const auto* guest_timeout = static_cast<const NetTimeval*>(timeout);
+		host_timeout.tv_sec       = static_cast<time_t>(guest_timeout->tv_sec);
+		host_timeout.tv_usec      = static_cast<suseconds_t>(guest_timeout->tv_usec);
+		host_timeout_ptr          = &host_timeout;
+	}
+
+	fd_set* read_ptr   = (read_count != 0 ? &host_read : nullptr);
+	fd_set* write_ptr  = (write_count != 0 ? &host_write : nullptr);
+	fd_set* except_ptr = (except_count != 0 ? &host_except : nullptr);
+	if (read_ptr == nullptr && write_ptr == nullptr && except_ptr == nullptr) {
+		if (host_timeout_ptr != nullptr) {
+			timespec sleep_for {};
+			sleep_for.tv_sec  = host_timeout.tv_sec;
+			sleep_for.tv_nsec = static_cast<long>(host_timeout.tv_usec) * 1000;
+			while (::nanosleep(&sleep_for, &sleep_for) != 0 && errno == EINTR) {
+			}
+		}
+		GuestFdZero(readfds, nfds);
+		GuestFdZero(writefds, nfds);
+		GuestFdZero(exceptfds, nfds);
+		return 0;
+	}
+
+	const int result =
+	    ::select(max_socket + 1, read_ptr, write_ptr, except_ptr, host_timeout_ptr);
+	if (result == SOCKET_ERROR) {
+		return SetPosixSocketError();
+	}
+
+	GuestFdZero(readfds, nfds);
+	GuestFdZero(writefds, nfds);
+	GuestFdZero(exceptfds, nfds);
+	for (int i = 0; i < read_count; i++) {
+		NativeSocket socket = INVALID_NATIVE_SOCKET;
+		if (GetSocketBackend(read_map[static_cast<size_t>(i)], &socket) &&
+		    FD_ISSET(socket, &host_read)) {
+			GuestFdSet(readfds, read_map[static_cast<size_t>(i)]);
+		}
+	}
+	for (int i = 0; i < write_count; i++) {
+		NativeSocket socket = INVALID_NATIVE_SOCKET;
+		if (GetSocketBackend(write_map[static_cast<size_t>(i)], &socket) &&
+		    FD_ISSET(socket, &host_write)) {
+			GuestFdSet(writefds, write_map[static_cast<size_t>(i)]);
+		}
+	}
+	for (int i = 0; i < except_count; i++) {
+		NativeSocket socket = INVALID_NATIVE_SOCKET;
+		if (GetSocketBackend(except_map[static_cast<size_t>(i)], &socket) &&
+		    FD_ISSET(socket, &host_except)) {
+			GuestFdSet(exceptfds, except_map[static_cast<size_t>(i)]);
+		}
+	}
+
+	return result;
 #endif
 }
 
@@ -2893,9 +3307,12 @@ static void CopyIpv4String(char* dst, size_t dst_size, const sockaddr* addr) {
 	const auto* in = reinterpret_cast<const sockaddr_in*>(addr);
 	inet_ntop(AF_INET, &in->sin_addr, dst, static_cast<socklen_t>(dst_size));
 #else
-	(void)dst;
-	(void)dst_size;
-	(void)addr;
+	if (dst == nullptr || dst_size == 0 || addr == nullptr || addr->sa_family != AF_INET) {
+		return;
+	}
+
+	const auto* in = reinterpret_cast<const sockaddr_in*>(addr);
+	::inet_ntop(AF_INET, &in->sin_addr, dst, static_cast<socklen_t>(dst_size));
 #endif
 }
 
@@ -2910,9 +3327,15 @@ static void CopyIpv4Netmask(char* dst, size_t dst_size, uint8_t prefix_len) {
 	in.S_un.S_addr = htonl(mask);
 	inet_ntop(AF_INET, &in, dst, static_cast<socklen_t>(dst_size));
 #else
-	(void)dst;
-	(void)dst_size;
-	(void)prefix_len;
+	if (dst == nullptr || dst_size == 0 || prefix_len > 32) {
+		return;
+	}
+
+	// Same as the Windows path; in_addr just spells its member s_addr here rather than S_un.S_addr.
+	const uint32_t mask = (prefix_len == 0 ? 0 : (0xffffffffu << (32u - prefix_len)));
+	in_addr        in {};
+	in.s_addr = htonl(mask);
+	::inet_ntop(AF_INET, &in, dst, static_cast<socklen_t>(dst_size));
 #endif
 }
 
@@ -2991,7 +3414,147 @@ static HostNetworkInfo QueryHostNetworkInfo() {
 
 	return info;
 #else
-	info.connected = true;
+	// getifaddrs is the POSIX counterpart of GetAdaptersAddresses. It reports one node per
+	// address family per interface rather than one node per interface, so the link-layer address
+	// has to be collected in a second pass over the same interface name.
+	ifaddrs* interfaces = nullptr;
+	if (::getifaddrs(&interfaces) != 0 || interfaces == nullptr) {
+		return info;
+	}
+
+	const char* chosen_name = nullptr;
+
+	for (auto* it = interfaces; it != nullptr; it = it->ifa_next) {
+		if (it->ifa_addr == nullptr || (it->ifa_flags & IFF_UP) == 0 ||
+		    (it->ifa_flags & IFF_LOOPBACK) != 0) {
+			continue;
+		}
+
+		if (it->ifa_addr->sa_family == AF_INET) {
+			const auto* in = reinterpret_cast<const sockaddr_in*>(it->ifa_addr);
+			const auto  ip = ntohl(in->sin_addr.s_addr);
+			if ((ip & 0xff000000u) == 0x7f000000u || ip == 0) {
+				continue;
+			}
+
+			info.connected = true;
+			chosen_name    = it->ifa_name;
+			CopyIpv4String(info.ip_address, sizeof(info.ip_address), it->ifa_addr);
+
+			if (it->ifa_netmask != nullptr && it->ifa_netmask->sa_family == AF_INET) {
+				// getifaddrs hands back a mask, but CopyIpv4Netmask takes a prefix length, so
+				// count the set bits to convert.
+				const auto* mask_in = reinterpret_cast<const sockaddr_in*>(it->ifa_netmask);
+				const auto  bits    = static_cast<uint8_t>(
+                    __builtin_popcount(static_cast<unsigned>(mask_in->sin_addr.s_addr)));
+				CopyIpv4Netmask(info.netmask, sizeof(info.netmask), bits);
+			}
+			break;
+		}
+
+		if (it->ifa_addr->sa_family == AF_INET6) {
+			const auto* in6 = reinterpret_cast<const sockaddr_in6*>(it->ifa_addr);
+			if (IN6_IS_ADDR_LOOPBACK(&in6->sin6_addr) == 0 &&
+			    IN6_IS_ADDR_UNSPECIFIED(&in6->sin6_addr) == 0) {
+				info.connected = true;
+			}
+		}
+	}
+
+	if (chosen_name != nullptr) {
+		for (auto* it = interfaces; it != nullptr; it = it->ifa_next) {
+			if (it->ifa_addr == nullptr || std::strcmp(it->ifa_name, chosen_name) != 0) {
+				continue;
+			}
+#if defined(__APPLE__)
+			if (it->ifa_addr->sa_family == AF_LINK) {
+				const auto* dl = reinterpret_cast<const sockaddr_dl*>(it->ifa_addr);
+				if (dl->sdl_alen >= sizeof(info.ether_addr.data)) {
+					std::memcpy(info.ether_addr.data, LLADDR(const_cast<sockaddr_dl*>(dl)),
+					            sizeof(info.ether_addr.data));
+				}
+				break;
+			}
+#else
+			if (it->ifa_addr->sa_family == AF_PACKET) {
+				const auto* ll = reinterpret_cast<const sockaddr_ll*>(it->ifa_addr);
+				if (ll->sll_halen >= sizeof(info.ether_addr.data)) {
+					std::memcpy(info.ether_addr.data, ll->sll_addr, sizeof(info.ether_addr.data));
+				}
+				break;
+			}
+#endif
+		}
+	}
+
+	::freeifaddrs(interfaces);
+
+#if !defined(__APPLE__)
+	// The default gateway is not exposed through getifaddrs. /proc/net/route lists it as the entry
+	// whose destination is 0.0.0.0, with the address in little-endian hex.
+	if (info.connected) {
+		if (auto* route = std::fopen("/proc/net/route", "r"); route != nullptr) {
+			char line[512] {};
+			(void)std::fgets(line, sizeof(line), route); // header
+			while (std::fgets(line, sizeof(line), route) != nullptr) {
+				char     iface[64] {};
+				uint32_t destination = 0;
+				uint32_t gateway     = 0;
+				// NOLINTNEXTLINE(cert-err34-c)
+				if (std::sscanf(line, "%63s %x %x", iface, &destination, &gateway) != 3) {
+					continue;
+				}
+				if (destination != 0 || gateway == 0) {
+					continue;
+				}
+				sockaddr_in gateway_addr {};
+				gateway_addr.sin_family      = AF_INET;
+				gateway_addr.sin_addr.s_addr = gateway;
+				CopyIpv4String(info.default_route, sizeof(info.default_route),
+				               reinterpret_cast<const sockaddr*>(&gateway_addr));
+				break;
+			}
+			std::fclose(route);
+		}
+	}
+
+	// Wireless interfaces expose this directory; wired ones do not.
+	if (chosen_name != nullptr) {
+		std::string wireless_path = "/sys/class/net/";
+		wireless_path += chosen_name;
+		wireless_path += "/wireless";
+		info.wireless = (::access(wireless_path.c_str(), F_OK) == 0);
+	}
+#endif
+
+	// Both platforms publish the resolvers here.
+	if (info.connected) {
+		if (auto* resolv = std::fopen("/etc/resolv.conf", "r"); resolv != nullptr) {
+			char line[512] {};
+			int  dns_index = 0;
+			while (dns_index < 2 && std::fgets(line, sizeof(line), resolv) != nullptr) {
+				char server[64] {};
+				// NOLINTNEXTLINE(cert-err34-c)
+				if (std::sscanf(line, " nameserver %63s", server) != 1) {
+					continue;
+				}
+				in_addr parsed {};
+				if (::inet_pton(AF_INET, server, &parsed) != 1) {
+					continue;
+				}
+				sockaddr_in dns_addr {};
+				dns_addr.sin_family = AF_INET;
+				dns_addr.sin_addr   = parsed;
+				CopyIpv4String(dns_index == 0 ? info.primary_dns : info.secondary_dns,
+				               dns_index == 0 ? sizeof(info.primary_dns)
+				                              : sizeof(info.secondary_dns),
+				               reinterpret_cast<const sockaddr*>(&dns_addr));
+				dns_index++;
+			}
+			std::fclose(resolv);
+		}
+	}
+
 	return info;
 #endif
 }

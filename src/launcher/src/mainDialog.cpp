@@ -45,8 +45,7 @@ constexpr char EMULATOR_EXE[] = "kyty_emulator";
 #if defined(_WIN32)
 constexpr char CMD_EXE[] = "cmd.exe";
 #elif defined(__linux__)
-constexpr char GNOME[]          = "gnome-terminal";
-constexpr char XTERM[]          = "xterm";
+// The terminal emulator is no longer a fixed name -- see FindTerminal below, which probes for one.
 constexpr char KYTY_BASH_FILE[] = "kyty_run.sh";
 #endif
 #if defined(_WIN32)
@@ -265,6 +264,68 @@ static bool CreateBashScript(const QString& interpreter, const QStringList& args
 	}
 	return false;
 }
+
+// Find a terminal emulator to run the generated script in.
+//
+// gnome-terminal used to be hardcoded, so launching a game did nothing at all on KDE, XFCE, Sway
+// or anything else without it -- and nothing reported the failure, because the caller never
+// checked whether the process started. xterm was declared as a fallback but never referenced.
+//
+// The argument spelling is not consistent between terminals, so each entry carries its own: the
+// GTK ones take "--" to end option parsing, most others take "-e", and kitty takes the command
+// directly. $TERMINAL is honoured first, then Debian's x-terminal-emulator alternative, then the
+// common emulators in rough order of popularity.
+static bool FindTerminal(QString* program, QStringList* prefix) {
+	struct TerminalSpec {
+		const char* executable;
+		const char* separator; // nullptr when the command follows immediately
+	};
+
+	static const TerminalSpec candidates[] = {
+	    {"x-terminal-emulator", "-e"}, {"gnome-terminal", "--"}, {"konsole", "-e"},
+	    {"xfce4-terminal", "-x"},      {"mate-terminal", "--"},  {"tilix", "-e"},
+	    {"alacritty", "-e"},           {"kitty", nullptr},       {"foot", nullptr},
+	    {"wezterm", "-e"},             {"urxvt", "-e"},          {"xterm", "-e"},
+	};
+
+	const auto try_candidate = [program, prefix](const QString& executable, const char* separator) {
+		const auto resolved = QStandardPaths::findExecutable(executable);
+		if (resolved.isEmpty()) {
+			return false;
+		}
+		*program = resolved;
+		prefix->clear();
+		if (separator != nullptr) {
+			*prefix << QString::fromLatin1(separator);
+		}
+		return true;
+	};
+
+	if (const auto from_env = qEnvironmentVariable("TERMINAL"); !from_env.isEmpty()) {
+		// An explicit choice wins. If it names a terminal listed below, reuse that entry's
+		// convention rather than guessing -- gnome-terminal deprecated -e, for instance. Only fall
+		// back to -e for something unrecognised, as that is the most widely accepted spelling.
+		const auto env_name  = QFileInfo(from_env).fileName();
+		const char* separator = "-e";
+		for (const auto& candidate: candidates) {
+			if (env_name == QLatin1String(candidate.executable)) {
+				separator = candidate.separator;
+				break;
+			}
+		}
+		if (try_candidate(from_env, separator)) {
+			return true;
+		}
+	}
+
+	for (const auto& candidate: candidates) {
+		if (try_candidate(QString::fromLatin1(candidate.executable), candidate.separator)) {
+			return true;
+		}
+	}
+
+	return false;
+}
 #endif
 
 void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
@@ -289,8 +350,17 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 	}
 
 	{
-		process->setProgram(GNOME);
-		process->setArguments({"--", "bash", "-c", bash_file_name});
+		QString     terminal;
+		QStringList terminal_prefix;
+		if (FindTerminal(&terminal, &terminal_prefix)) {
+			process->setProgram(terminal);
+			process->setArguments(terminal_prefix + QStringList {"bash", "-c", bash_file_name});
+		} else {
+			// No terminal emulator anywhere. Running the script directly still starts the game;
+			// only the console output is lost, which beats doing nothing.
+			process->setProgram(QStringLiteral("bash"));
+			process->setArguments({QStringLiteral("-c"), bash_file_name});
+		}
 	}
 #elif defined(_WIN32)
 	{
@@ -319,6 +389,22 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 	});
 #endif
 	process->start();
+#if !defined(_WIN32)
+	// waitForFinished returning false is the normal case here -- the emulator is still running --
+	// so it cannot be used to detect a launch failure. waitForStarted can: a process that never
+	// started at all (a missing terminal emulator, say) was previously indistinguishable from one
+	// running happily, and the user just saw nothing happen.
+	//
+	// Deliberately not applied on Windows. The check would be just as useful there, but this is
+	// shared code and Windows is the platform that cannot be re-tested here; leaving its behaviour
+	// exactly as it was is worth more than the improvement. Worth adopting separately.
+	if (!process->waitForStarted(5000)) {
+		QMessageBox::critical(this, tr("Error"),
+		                      tr("Failed to start:\n%1\n\n%2")
+		                          .arg(process->program(), process->errorString()));
+		return;
+	}
+#endif
 	process->waitForFinished(100);
 }
 

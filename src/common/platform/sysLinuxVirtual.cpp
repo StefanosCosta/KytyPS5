@@ -12,6 +12,7 @@
 #include <map>
 #include <pthread.h>
 #include <sys/mman.h>
+#include <unistd.h> // sysconf(_SC_PAGESIZE) for the decommit alignment
 
 // IWYU pragma: no_include <asm/mman-common.h>
 // IWYU pragma: no_include <asm/mman.h>
@@ -27,6 +28,7 @@ namespace Common {
 static pthread_mutex_t              g_virtual_mutex {};
 static std::map<uintptr_t, size_t>* g_allocs   = nullptr;
 static std::map<uintptr_t, int>*    g_protects = nullptr;
+static std::map<uintptr_t, size_t>* g_arena_blocks; // defined below, near the arena itself
 
 void SysVirtualInit() {
 	pthread_mutexattr_t attr {};
@@ -40,8 +42,9 @@ void SysVirtualInit() {
 	pthread_mutex_init(&g_virtual_mutex, &attr);
 	pthread_mutexattr_destroy(&attr);
 
-	g_allocs   = new std::map<uintptr_t, size_t>;
-	g_protects = new std::map<uintptr_t, int>;
+	g_allocs       = new std::map<uintptr_t, size_t>;
+	g_protects     = new std::map<uintptr_t, int>;
+	g_arena_blocks = new std::map<uintptr_t, size_t>;
 }
 
 static int get_protection_flag(VirtualMemory::Mode mode) {
@@ -107,8 +110,65 @@ static_assert(LOW_ARENA_FLOOR < LOW_ARENA_LIMIT, "arena floor must sit below its
 
 static std::atomic<uintptr_t> g_low_arena_next {LOW_ARENA_LIMIT};
 
+// Record a host reservation, splitting any existing entry it lands inside.
+//
+// g_allocs is keyed by start address, so a plain `(*g_allocs)[addr] = size` silently replaces a
+// larger reservation that already covers `addr` -- and takes its length with it. That is how a
+// small fixed mapping placed at the start of a big reserved window destroyed the window's record:
+// the entry shrank from the window size to the mapping size, and freeing the mapping then erased
+// it outright, leaving the rest of the window unaccounted for and its later munmap failing with
+// EACCES. Split instead, mirroring what SysVirtualFreeRange already does on the way out.
+//
+// The caller must hold g_virtual_mutex.
+static void record_alloc(uintptr_t addr, size_t size) {
+	auto next = g_allocs->upper_bound(addr);
+	if (next != g_allocs->begin()) {
+		auto       it         = std::prev(next);
+		const auto alloc_addr = it->first;
+		const auto alloc_end  = alloc_addr + it->second;
+		if (alloc_addr <= addr && addr + size <= alloc_end) {
+			g_allocs->erase(it);
+			if (alloc_addr < addr) {
+				(*g_allocs)[alloc_addr] = addr - alloc_addr;
+			}
+			if (addr + size < alloc_end) {
+				(*g_allocs)[addr + size] = alloc_end - (addr + size);
+			}
+		}
+	}
+	(*g_allocs)[addr] = size;
+}
+
 static uintptr_t align_up_to(uintptr_t addr, uint64_t alignment) {
 	return (addr + alignment - 1) & ~(alignment - 1);
+}
+
+// Addresses the arena itself handed out, so that freeing one can return it to the arena.
+//
+// Membership matters: SysVirtualFree also runs for mappings the arena never produced (a guest
+// reservation pinned to a fixed address, or the kernel-chosen fallback below). Some of those land
+// inside the arena window, and moving the cursor to cover memory the arena does not own is how an
+// earlier attempt at this went wrong. Only blocks recorded here are ever reclaimed.
+// (declared above, next to the other bookkeeping maps)
+
+// Return a freed block to the arena by moving the cursor back above it.
+//
+// The cursor is only a search hint, not an ownership record: allocation walks downward from it and
+// MAP_FIXED_NOREPLACE rejects any slot that is still mapped, so raising it can never hand out live
+// memory -- at worst the walk wastes a few attempts stepping over occupied slots. That is what
+// makes moving it safe even when the freed block is not the most recent one.
+static void ReleaseLowArena(uintptr_t addr, size_t size) {
+	if (size == 0) {
+		return;
+	}
+
+	const auto step = align_up_to(size, LOW_ARENA_GRAIN);
+	auto       top  = g_low_arena_next.load(std::memory_order_relaxed);
+	while (addr + step > top) {
+		if (g_low_arena_next.compare_exchange_weak(top, addr + step, std::memory_order_relaxed)) {
+			return;
+		}
+	}
 }
 
 // Drop-in replacement for the anonymous mmap calls below. A pinned address is passed straight
@@ -123,14 +183,26 @@ static void* map_anonymous(uintptr_t addr, size_t size, int protect, int flags) 
 #ifdef KYTY_FIXED_NOREPLACE
 	const auto step = align_up_to(size, LOW_ARENA_GRAIN);
 	for (int attempt = 0; attempt < 256; attempt++) {
-		const auto top = g_low_arena_next.fetch_sub(step, std::memory_order_relaxed);
+		// Take the current cursor and step down from it, rather than decrementing unconditionally:
+		// a failed probe must not consume arena space, or a reused slot below an occupied one
+		// would be skipped forever.
+		auto top = g_low_arena_next.load(std::memory_order_relaxed);
 		if (top < step || top - step < LOW_ARENA_FLOOR) {
 			break;
 		}
 		const auto hint = (top - step) & ~(LOW_ARENA_GRAIN - 1);
-		void*      ptr  = mmap(reinterpret_cast<void*>(hint), size, protect,
-		                       flags | MAP_FIXED_NOREPLACE, -1, 0); // NOLINT
+		if (!g_low_arena_next.compare_exchange_weak(top, hint, std::memory_order_relaxed)) {
+			continue; // another thread moved the cursor; re-read and retry
+		}
+
+		void* ptr = mmap(reinterpret_cast<void*>(hint), size, protect,
+		                 flags | MAP_FIXED_NOREPLACE, -1, 0); // NOLINT
 		if (ptr != MAP_FAILED) {
+			pthread_mutex_lock(&g_virtual_mutex);
+			if (g_arena_blocks != nullptr) {
+				(*g_arena_blocks)[reinterpret_cast<uintptr_t>(ptr)] = size;
+			}
+			pthread_mutex_unlock(&g_virtual_mutex);
 			return ptr;
 		}
 	}
@@ -155,7 +227,7 @@ uint64_t SysVirtualAlloc(uint64_t address, uint64_t size, VirtualMemory::Mode mo
 
 	if (ptr != MAP_FAILED) {
 		pthread_mutex_lock(&g_virtual_mutex);
-		(*g_allocs)[ret_addr] = size;
+		record_alloc(ret_addr, size);
 		uintptr_t page_start  = ret_addr >> 12u;
 		uintptr_t page_end    = (ret_addr + size - 1) >> 12u;
 		for (uintptr_t page = page_start; page <= page_end; page++) {
@@ -218,7 +290,7 @@ uint64_t SysVirtualAllocAligned(uint64_t address, uint64_t size, VirtualMemory::
 	}
 
 	pthread_mutex_lock(&g_virtual_mutex);
-	(*g_allocs)[ret_addr] = size;
+	record_alloc(ret_addr, size);
 	uintptr_t page_start  = ret_addr >> 12u;
 	uintptr_t page_end    = (ret_addr + size - 1) >> 12u;
 	for (uintptr_t page = page_start; page <= page_end; page++) {
@@ -282,7 +354,7 @@ bool SysVirtualAllocFixed(uint64_t address, uint64_t size, VirtualMemory::Mode m
 
 	if (ptr != MAP_FAILED) {
 		pthread_mutex_lock(&g_virtual_mutex);
-		(*g_allocs)[ret_addr] = size;
+		record_alloc(ret_addr, size);
 		uintptr_t page_start  = ret_addr >> 12u;
 		uintptr_t page_end    = (ret_addr + size - 1) >> 12u;
 		for (uintptr_t page = page_start; page <= page_end; page++) {
@@ -349,7 +421,7 @@ uint64_t SysVirtualReserveAligned(uint64_t address, uint64_t size, uint64_t alig
 	}
 
 	pthread_mutex_lock(&g_virtual_mutex);
-	(*g_allocs)[ret_addr] = size;
+	record_alloc(ret_addr, size);
 	uintptr_t page_start  = ret_addr >> 12u;
 	uintptr_t page_end    = (ret_addr + size - 1) >> 12u;
 	for (uintptr_t page = page_start; page <= page_end; page++) {
@@ -387,7 +459,7 @@ bool SysVirtualReserveFixed(uint64_t address, uint64_t size) {
 
 	if (ptr != MAP_FAILED) {
 		pthread_mutex_lock(&g_virtual_mutex);
-		(*g_allocs)[ret_addr] = size;
+		record_alloc(ret_addr, size);
 		uintptr_t page_start  = ret_addr >> 12u;
 		uintptr_t page_end    = (ret_addr + size - 1) >> 12u;
 		for (uintptr_t page = page_start; page <= page_end; page++) {
@@ -402,7 +474,39 @@ bool SysVirtualReserveFixed(uint64_t address, uint64_t size) {
 }
 
 bool SysVirtualDecommit(uint64_t address, uint64_t size) {
-	return SysVirtualProtect(address, size, VirtualMemory::Mode::NoAccess);
+	// Windows VirtualFree(MEM_DECOMMIT) returns the physical pages while keeping the reservation.
+	// mprotect alone only removes access, so the pages stayed resident and guest
+	// sceKernelReleaseDirectMemory never gave anything back -- RSS grew monotonically over a
+	// session. madvise supplies the missing half: the mapping and its address stay reserved, but
+	// the backing pages are dropped and read back as zero when touched again.
+	//
+	// MADV_DONTNEED is the Linux spelling and drops the pages immediately. macOS gives
+	// MADV_DONTNEED a weaker, advisory meaning and uses MADV_FREE for this, so prefer that where
+	// it exists. Failure is not fatal: the mapping is still protected, only the memory is not
+	// reclaimed.
+	if (!SysVirtualProtect(address, size, VirtualMemory::Mode::NoAccess)) {
+		return false;
+	}
+
+	if (size != 0) {
+#if defined(__APPLE__)
+		constexpr int RECLAIM_ADVICE = MADV_FREE;
+#else
+		constexpr int RECLAIM_ADVICE = MADV_DONTNEED;
+#endif
+		const auto page_size = static_cast<uintptr_t>(sysconf(_SC_PAGESIZE));
+		if (page_size != 0) {
+			// madvise requires a page-aligned base; round inward so no page outside the requested
+			// range is ever discarded.
+			const auto begin = (static_cast<uintptr_t>(address) + page_size - 1) & ~(page_size - 1);
+			const auto end   = (static_cast<uintptr_t>(address) + size) & ~(page_size - 1);
+			if (end > begin) {
+				::madvise(reinterpret_cast<void*>(begin), end - begin, RECLAIM_ADVICE);
+			}
+		}
+	}
+
+	return true;
 }
 
 bool SysVirtualFree(uint64_t address) {
@@ -425,11 +529,19 @@ bool SysVirtualFree(uint64_t address) {
 	if (munmap(reinterpret_cast<void*>(addr), size) == 0) {
 		uintptr_t page_start = addr >> 12u;
 		uintptr_t page_end   = (addr + size - 1) >> 12u;
+		size_t    arena_size = 0;
 		pthread_mutex_lock(&g_virtual_mutex);
 		for (uintptr_t page = page_start; page <= page_end; page++) {
 			g_protects->erase(page);
 		}
+		if (g_arena_blocks != nullptr) {
+			if (auto a = g_arena_blocks->find(addr); a != g_arena_blocks->end()) {
+				arena_size = a->second;
+				g_arena_blocks->erase(a);
+			}
+		}
 		pthread_mutex_unlock(&g_virtual_mutex);
+		ReleaseLowArena(addr, arena_size);
 		return true;
 	}
 
@@ -454,15 +566,39 @@ bool SysVirtualFreeRange(uint64_t address, uint64_t size) {
 		pthread_mutex_unlock(&g_virtual_mutex);
 		return false;
 	}
-	auto       it         = std::prev(next);
-	const auto alloc_addr = it->first;
-	const auto alloc_end  = alloc_addr + it->second;
-	if (addr < alloc_addr || end > alloc_end || munmap(reinterpret_cast<void*>(addr), size) != 0) {
+
+	// The range may span several adjacent entries rather than sitting inside one: record_alloc
+	// splits a reservation whenever a smaller fixed mapping is placed inside it, so a guest that
+	// reserves a pool and commits pieces of it ends up with the pool described by a run of
+	// entries. Releasing the pool as a whole then has to consume all of them. Walk the run first
+	// and confirm it covers the request with no gap -- a gap means the caller is freeing memory it
+	// never reserved, which stays an error.
+	auto       first      = std::prev(next);
+	const auto alloc_addr = first->first;
+	if (addr < alloc_addr || alloc_addr + first->second <= addr) {
 		pthread_mutex_unlock(&g_virtual_mutex);
 		return false;
 	}
 
-	g_allocs->erase(it);
+	auto      last   = first;
+	uintptr_t cursor = alloc_addr + first->second;
+	while (cursor < end) {
+		auto following = std::next(last);
+		if (following == g_allocs->end() || following->first != cursor) {
+			pthread_mutex_unlock(&g_virtual_mutex);
+			return false;
+		}
+		last   = following;
+		cursor = following->first + following->second;
+	}
+	const auto alloc_end = cursor;
+
+	if (munmap(reinterpret_cast<void*>(addr), size) != 0) {
+		pthread_mutex_unlock(&g_virtual_mutex);
+		return false;
+	}
+
+	g_allocs->erase(first, std::next(last));
 	if (alloc_addr < addr) {
 		(*g_allocs)[alloc_addr] = addr - alloc_addr;
 	}

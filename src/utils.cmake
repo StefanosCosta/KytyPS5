@@ -1,20 +1,33 @@
+# include-what-you-use was gated on `NOT LINUX`, which CLAUDE.md describes backwards as
+# "non-Windows Clang". Linux is now included, but without -Werror: IWYU has never run over the
+# Linux code paths, so it is certain to have a backlog of diagnostics there, and promoting those to
+# errors would break the build for every Linux developer who happens to have the tool installed.
+# Warnings surface the backlog without stopping anyone; give Linux the same KYTY_IWYU_STRICT value
+# as everyone else once it is clean. Windows and macOS still get the exact flag string they had.
+set(KYTY_IWYU_COMMON "-Xiwyu;--cxx17ns;-Qunused-arguments")
+if (LINUX)
+	set(KYTY_IWYU_STRICT "")
+else()
+	set(KYTY_IWYU_STRICT ";-Werror")
+endif()
+
 function(include_what_you_use target dirs)
-  if (NOT LINUX AND CLANG AND ("${target}" IN_LIST KYTY_IWYU))
+  if (CLANG AND ("${target}" IN_LIST KYTY_IWYU))
     find_program (CLANG_IWYU_EXE NAMES "include-what-you-use")
     if (CLANG_IWYU_EXE)
-		set_target_properties(${target} PROPERTIES CXX_INCLUDE_WHAT_YOU_USE "${CLANG_IWYU_EXE};-Xiwyu;--cxx17ns;-Qunused-arguments;-Werror")
+		set_target_properties(${target} PROPERTIES CXX_INCLUDE_WHAT_YOU_USE "${CLANG_IWYU_EXE};${KYTY_IWYU_COMMON}${KYTY_IWYU_STRICT}")
     endif()
   endif()
 endfunction()
 
 function(include_what_you_use_with_mappings target dirs mappings)
-  if (NOT LINUX AND CLANG AND ("${target}" IN_LIST KYTY_IWYU))
+  if (CLANG AND ("${target}" IN_LIST KYTY_IWYU))
     find_program (CLANG_IWYU_EXE NAMES "include-what-you-use")
     if (CLANG_IWYU_EXE)
 		foreach(map ${mappings})
 			list(APPEND mapdirs ";-Xiwyu;--mapping_file=${map}")
 		endforeach()
-		set_target_properties(${target} PROPERTIES CXX_INCLUDE_WHAT_YOU_USE "${CLANG_IWYU_EXE};${mapdirs};-Xiwyu;--cxx17ns;-Qunused-arguments;-Werror")
+		set_target_properties(${target} PROPERTIES CXX_INCLUDE_WHAT_YOU_USE "${CLANG_IWYU_EXE};${mapdirs};${KYTY_IWYU_COMMON}${KYTY_IWYU_STRICT}")
     endif()
   endif()
 endfunction()

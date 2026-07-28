@@ -37,12 +37,10 @@
 #endif
 #include <windows.h>
 #else
-#include <unistd.h>
-#if defined(__APPLE__)
-#include <mach/mach.h>
-#include <mach/mach_vm.h>
-#else
+#include <dlfcn.h> // dladdr, the counterpart of GetModuleFileNameA
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
 #include <sys/uio.h> // process_vm_readv is glibc/Linux-only
+#include <unistd.h>  // sysconf(_SC_PAGESIZE), getpid
 #endif
 #endif
 
@@ -571,7 +569,7 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 		}
 		current = std::min(region_end, end);
 	}
-#else
+#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
 	// Readability is page-granular, so one probe byte per page covers the whole range.
 	const auto page_size = static_cast<uint64_t>(sysconf(_SC_PAGESIZE));
 	if (page_size == 0) {
@@ -581,17 +579,6 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 	for (uint64_t current = addr; current < end;) {
 		uint8_t probe = 0;
 
-#if defined(__APPLE__)
-		// macOS has no process_vm_readv; the Mach equivalent reports KERN_INVALID_ADDRESS
-		// instead of faulting.
-		mach_vm_size_t read_size = 0;
-		if (mach_vm_read_overwrite(mach_task_self(), current, sizeof(probe),
-		                           reinterpret_cast<mach_vm_address_t>(&probe),
-		                           &read_size) != KERN_SUCCESS ||
-		    read_size != sizeof(probe)) {
-			return false;
-		}
-#else
 		iovec local {&probe, sizeof(probe)};
 		iovec remote {reinterpret_cast<void*>(current), sizeof(probe)};
 
@@ -599,7 +586,6 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 		    static_cast<ssize_t>(sizeof(probe))) {
 			return false;
 		}
-#endif
 
 		const uint64_t next = (current & ~(page_size - 1)) + page_size;
 		if (next <= current) { // wrapped at the top of the address space
@@ -607,6 +593,11 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 		}
 		current = next;
 	}
+#else
+	// macOS: unprobed, exactly as this check behaved on every non-Windows platform before. It has
+	// no process_vm_readv, and the Mach equivalent is not something to introduce untested on a
+	// platform that is not built or run here, so the dumps below keep their original behaviour.
+	(void)end;
 #endif
 	return true;
 }
@@ -614,13 +605,13 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 // Guard for the two dumps below that have never been guarded on any platform. Probing them is a
 // Linux fix: there, an unguarded read inside the handler is fatal, because the faulting signal is
 // blocked for the duration of the handler and the kernel force-delivers the second fault. Windows
-// keeps its original non-null test, so this stays a no-op there.
+// and macOS keep their original non-null test, so this stays a no-op on both.
 static bool IsDumpableRange(uint64_t addr, uint64_t size) {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	return IsReadableRange(addr, size);
+#else
 	(void)size;
 	return addr != 0;
-#else
-	return IsReadableRange(addr, size);
 #endif
 }
 
@@ -668,6 +659,12 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		if (GetModuleFileNameA(owner_module, module_name, MAX_PATH) != 0) {
 			LOGF("exception module: %s\n", module_name);
 		}
+	}
+#else
+	Dl_info module_info {};
+	if (::dladdr(reinterpret_cast<void*>(info->exception_address), &module_info) != 0 &&
+	    module_info.dli_fname != nullptr) {
+		LOGF("exception module: %s\n", module_info.dli_fname);
 	}
 #endif
 	if (info->exception_address != 0) {

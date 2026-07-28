@@ -23,6 +23,14 @@ struct sys_dbg_stack_info_t {
 	size_t    commited_size;
 	size_t    total_size;
 	size_t    code_size;
+
+	// The full extent pthread reports for the stack, as opposed to the part currently mapped that
+	// /proc/self/maps shows. Present so consumers that want the whole reservation -- libDbgAsan's
+	// shadow, which otherwise only covered the committed portion -- can read the same field name
+	// on both platforms. No guard page equivalent is exposed: the kernel grows the main stack on
+	// demand rather than reserving one.
+	uintptr_t reserved_addr;
+	size_t    reserved_size;
 #endif
 };
 

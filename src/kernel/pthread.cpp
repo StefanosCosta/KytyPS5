@@ -46,6 +46,20 @@
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <fmt/format.h>
 #include <pthread_time.h>
+#elif !defined(__APPLE__)
+// gettid has no libc wrapper before glibc 2.30, so go through syscall() as the rest of the tree
+// does (see graphics/host_gpu/regionManager.h). macOS has neither and uses pthread_threadid_np.
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+#include <csignal> // pthread_kill is declared here, not in <pthread.h>
+#endif
+
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS && (defined(_M_X64) || defined(__x86_64__))
+// __rdtsc lives in <intrin.h> on Windows, which is already pulled in above.
+#include <x86intrin.h>
 #endif
 
 #ifdef pthread_attr_getguardsize
@@ -93,8 +107,24 @@ static constexpr int KERNEL_PTHREAD_MUTEX_RECURSIVE  = 2;
 static constexpr int KERNEL_PTHREAD_MUTEX_NORMAL     = 3;
 static constexpr int KERNEL_PTHREAD_MUTEX_ADAPTIVE   = 4;
 
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+// The OS-level id of the calling thread, as reported to the guest through PthreadGetHostThreadId
+// and used by sceKernelRaiseException to find a target. Zero means "unknown"; no OS assigns it,
+// which is what the field was left holding here before. The Windows callers keep their own inline
+// GetCurrentThreadId() call untouched.
+static uint64_t GetHostThreadId() {
+#if defined(__APPLE__)
+	uint64_t tid = 0;
+	pthread_threadid_np(nullptr, &tid);
+	return tid;
+#else
+	return static_cast<uint64_t>(::syscall(SYS_gettid));
+#endif
+}
+#endif
+
 static uint64_t KernelReadTscNative() {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS && (defined(_M_X64) || defined(__x86_64__))
+#if defined(_M_X64) || defined(__x86_64__)
 	return __rdtsc();
 #else
 	return Common::Timer::QueryPerformanceCounter();
@@ -103,7 +133,7 @@ static uint64_t KernelReadTscNative() {
 
 static uint64_t KernelGetTscFrequencyNative() {
 	static const uint64_t frequency = [] {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS && (defined(_M_X64) || defined(__x86_64__))
+#if defined(_M_X64) || defined(__x86_64__)
 		const auto host_frequency = Common::Timer::QueryPerformanceFrequency();
 		if (host_frequency == 0) {
 			return uint64_t {1000000000};
@@ -860,6 +890,31 @@ static void UpdateCurrentThreadStackAttr(PthreadAttr* attr) {
 		(*attr)->stack_size = high - low;
 		(*attr)->stack_user = true;
 	}
+#elif defined(__APPLE__)
+	// macOS reports the stack top and its size rather than a base/limit pair, and grows down from
+	// the returned address.
+	void*        top  = pthread_get_stackaddr_np(pthread_self());
+	const size_t size = pthread_get_stacksize_np(pthread_self());
+
+	if (top != nullptr && size != 0) {
+		(*attr)->stack_addr = static_cast<void*>(static_cast<uint8_t*>(top) - size);
+		(*attr)->stack_size = size;
+		(*attr)->stack_user = true;
+	}
+#else
+	// Without this the main thread's guest PthreadAttr keeps its default (null) stack bounds, so
+	// PthreadGetGuestStack fails and the signal-context sanitizer cannot validate rsp/rbp.
+	pthread_attr_t self_attr {};
+	if (pthread_getattr_np(pthread_self(), &self_attr) == 0) {
+		void*  base = nullptr;
+		size_t size = 0;
+		if (pthread_attr_getstack(&self_attr, &base, &size) == 0 && base != nullptr && size != 0) {
+			(*attr)->stack_addr = base;
+			(*attr)->stack_size = size;
+			(*attr)->stack_user = true;
+		}
+		pthread_attr_destroy(&self_attr);
+	}
 #endif
 }
 
@@ -900,6 +955,8 @@ void PthreadInitSelfForMainThread() {
 	uint64_t os_thread_id = 0;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	os_thread_id = static_cast<uint64_t>(GetCurrentThreadId());
+#else
+	os_thread_id = GetHostThreadId();
 #endif
 	g_pthread_self->host_thread_id = os_thread_id;
 	g_pthread_main                 = g_pthread_self;
@@ -2711,6 +2768,18 @@ int KYTY_SYSV_ABI PthreadCondDestroy(PthreadCond* cond) {
 
 	int result = 0;
 
+	// TEMPORARY DIAGNOSTIC (remove): does a destroy ever free a cond that still has parked
+	// waiters? Those waiters captured this object in PthreadCondWait and keep polling it after
+	// the delete, while CreateObject resurrects a different object at the same guest slot.
+	{
+		std::lock_guard diag_lock((*cond)->m);
+		if (!(*cond)->waiters.empty()) {
+			printf("COND-DESTROY-WITH-WAITERS: slot=%p obj=%p waiters=%zu name='%s'\n",
+			       static_cast<void*>(cond), static_cast<void*>(*cond), (*cond)->waiters.size(),
+			       (*cond)->name.c_str());
+		}
+	}
+
 	LOGF("\tcond destroy: %s, %d\n", (*cond)->name.c_str(), result);
 
 	delete *cond;
@@ -3045,8 +3114,29 @@ int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 		return cond_value->sequence != sequence || thread->cond_sequence != thread_sequence;
 	};
 
+	// TEMPORARY DIAGNOSTIC (remove): has the guest slot been repointed at a different object
+	// while this thread was parked? If so this waiter is orphaned -- signals now land on the new
+	// object and can never satisfy ready() here, so the wait can never complete.
+	bool     diag_reported  = false;
+	uint64_t diag_poll_count = 0;
+
 	while (!ready()) {
 		cond_value->cv.wait_for(cond_lock, std::chrono::microseconds(SIGNAL_APC_POLL_MICROS));
+
+		diag_poll_count++;
+		if (!diag_reported) {
+			auto* diag_now = std::atomic_ref<PthreadCondPrivate*>(*cond).load(
+			    std::memory_order_acquire);
+			if (diag_now != cond_value) {
+				diag_reported = true;
+				printf("COND-WAIT-ORPHANED: slot=%p captured=%p now=%p polls=%" PRIu64
+				       " thread=%d\n",
+				       static_cast<void*>(cond), static_cast<void*>(cond_value),
+				       static_cast<void*>(diag_now), diag_poll_count,
+				       Common::Thread::GetThreadIdUnique());
+			}
+		}
+
 		if (!ready()) {
 			cond_lock.unlock();
 			KernelDispatchPendingSignalForCurrentThread();
@@ -3091,6 +3181,20 @@ int PthreadGetUniqueId(Pthread thread) {
 uint64_t PthreadGetHostThreadId(Pthread thread) {
 	return thread != nullptr ? thread->host_thread_id : 0;
 }
+
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+// Raise a host signal on another guest thread. Kept here rather than in the caller so that
+// pthread_t, whose representation is opaque and platform-specific, does not have to be exposed
+// through pthread.h. Used by sceKernelRaiseException to deliver a guest signal on its target
+// thread instead of the calling one.
+bool PthreadKillHost(Pthread thread, int host_signal) {
+	if (thread == nullptr || thread->free) {
+		return false;
+	}
+
+	return ::pthread_kill(thread->p, host_signal) == 0;
+}
+#endif
 
 void PthreadQueuePendingSignal(Pthread thread, int signum) {
 	if (thread == nullptr || signum < 0 || signum >= 64) {
@@ -3189,6 +3293,8 @@ static void* RunThread(void* arg) {
 	uint64_t os_thread_id = 0;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	os_thread_id = static_cast<uint64_t>(GetCurrentThreadId());
+#else
+	os_thread_id = GetHostThreadId();
 #endif
 	thread->host_thread_id = os_thread_id;
 

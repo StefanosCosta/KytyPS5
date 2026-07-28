@@ -12,6 +12,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <dirent.h>
+#include <fcntl.h> // posix_fadvise on Linux, F_RDAHEAD on macOS
 #include <filesystem>
 #include <system_error>
 #include <sys/stat.h>
@@ -42,8 +43,44 @@ struct sys_file_t {
 	};
 };
 
+// POSIX.1-2008 names these timespec members st_atim/st_mtim; macOS keeps the older BSD spelling.
+#if defined(__APPLE__)
+#define KYTY_STAT_ATIME_NS(st) ((st).st_atimespec.tv_nsec)
+#define KYTY_STAT_MTIME_NS(st) ((st).st_mtimespec.tv_nsec)
+#else
+#define KYTY_STAT_ATIME_NS(st) ((st).st_atim.tv_nsec)
+#define KYTY_STAT_MTIME_NS(st) ((st).st_mtim.tv_nsec)
+#endif
+
 static std::filesystem::path get_internal_name(const std::filesystem::path& name) {
 	return name.is_absolute() ? name : (std::filesystem::path(".") / name);
+}
+
+// Pass the guest's access-pattern hint on to the kernel. The Windows implementation maps it to
+// FILE_FLAG_RANDOM_ACCESS / FILE_FLAG_SEQUENTIAL_SCAN; the hint was simply dropped here, so
+// readahead stayed at the default for both patterns.
+static void apply_cache_hint(FILE* f, sys_file_cache_type_t cache_type) {
+	if (f == nullptr) {
+		return;
+	}
+
+#if !defined(__APPLE__)
+	int advice = POSIX_FADV_NORMAL;
+	switch (cache_type) {
+		case SYS_FILE_CACHE_RANDOM_ACCESS: advice = POSIX_FADV_RANDOM; break;
+		case SYS_FILE_CACHE_SEQUENTIAL_SCAN: advice = POSIX_FADV_SEQUENTIAL; break;
+		case SYS_FILE_CACHE_AUTO:
+		default: return;
+	}
+	::posix_fadvise(fileno(f), 0, 0, advice);
+#else
+	// macOS has no posix_fadvise; F_RDAHEAD is the closest equivalent it offers.
+	if (cache_type == SYS_FILE_CACHE_SEQUENTIAL_SCAN) {
+		::fcntl(fileno(f), F_RDAHEAD, 1);
+	} else if (cache_type == SYS_FILE_CACHE_RANDOM_ACCESS) {
+		::fcntl(fileno(f), F_RDAHEAD, 0);
+	}
+#endif
 }
 
 void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read) {
@@ -139,7 +176,7 @@ sys_file_t* SysFileCreate(const std::filesystem::path& file_name) {
 }
 
 sys_file_t* SysFileOpenR(const std::filesystem::path& file_name,
-                         sys_file_cache_type_t /*cache_type*/) {
+                         sys_file_cache_type_t cache_type) {
 	auto* ret = new sys_file_t;
 
 	ret->type = SYS_FILE_FILE;
@@ -152,6 +189,8 @@ sys_file_t* SysFileOpenR(const std::filesystem::path& file_name,
 	if (f == nullptr) {
 		ret->type = SYS_FILE_ERROR;
 	}
+
+	apply_cache_hint(f, cache_type);
 
 	ret->f = f;
 
@@ -183,7 +222,7 @@ sys_file_t* SysFileCreate() {
 }
 
 sys_file_t* SysFileOpenW(const std::filesystem::path& file_name,
-                         sys_file_cache_type_t /*cache_type*/) {
+                         sys_file_cache_type_t cache_type) {
 	auto* ret = new sys_file_t;
 
 	auto real_name     = get_internal_name(file_name);
@@ -196,6 +235,8 @@ sys_file_t* SysFileOpenW(const std::filesystem::path& file_name,
 	} else {
 		ret->type = SYS_FILE_FILE;
 	}
+
+	apply_cache_hint(f, cache_type);
 
 	ret->f = f;
 
@@ -203,7 +244,7 @@ sys_file_t* SysFileOpenW(const std::filesystem::path& file_name,
 }
 
 sys_file_t* SysFileOpenRw(const std::filesystem::path& file_name,
-                          sys_file_cache_type_t /*cache_type*/) {
+                          sys_file_cache_type_t cache_type) {
 	auto* ret = new sys_file_t;
 
 	auto real_name     = get_internal_name(file_name);
@@ -216,6 +257,8 @@ sys_file_t* SysFileOpenRw(const std::filesystem::path& file_name,
 	} else {
 		ret->type = SYS_FILE_FILE;
 	}
+
+	apply_cache_hint(f, cache_type);
 
 	ret->f = f;
 
@@ -242,11 +285,19 @@ uint64_t SysFileSize(sys_file_t& f) {
 	[[maybe_unused]] int result = 0;
 
 	if (f.type == SYS_FILE_FILE) {
-		uint32_t pos  = ftell(f.f);
-		result        = fseek(f.f, 0, SEEK_END);
-		uint32_t size = ftell(f.f);
-		result        = fseek(f.f, pos, SEEK_SET);
-		return size;
+		// off_t/ftello rather than long/ftell: PS5 game data files routinely exceed 4 GiB, and
+		// the previous uint32_t truncation reported those at size modulo 4 GiB. The Windows
+		// implementation has always used GetFileSizeEx, which is 64-bit.
+		const off_t pos = ftello(f.f);
+		if (pos < 0) {
+			return 0;
+		}
+		if (fseeko(f.f, 0, SEEK_END) != 0) {
+			return 0;
+		}
+		const off_t size = ftello(f.f);
+		result           = fseeko(f.f, pos, SEEK_SET);
+		return (size < 0 ? 0 : static_cast<uint64_t>(size));
 	}
 
 	if (f.type == SYS_FILE_MEMORY_STAT || f.type == SYS_FILE_MEMORY_DYN) {
@@ -397,6 +448,7 @@ SysFileTimeStruct SysFileGetLastAccessTimeUtc(const std::filesystem::path& name)
 	} else {
 		r.is_invalid = false;
 		r.time       = s.st_atime;
+		r.nanos      = KYTY_STAT_ATIME_NS(s);
 	}
 
 	return r;
@@ -415,6 +467,7 @@ SysFileTimeStruct SysFileGetLastWriteTimeUtc(const std::filesystem::path& name) 
 	} else {
 		r.is_invalid = false;
 		r.time       = s.st_mtime;
+		r.nanos      = KYTY_STAT_MTIME_NS(s);
 	}
 
 	return r;
@@ -434,7 +487,9 @@ void SysFileGetLastAccessAndWriteTimeUtc(const std::filesystem::path& name, SysF
 		a.is_invalid = false;
 		w.is_invalid = false;
 		a.time       = s.st_atime;
+		a.nanos      = KYTY_STAT_ATIME_NS(s);
 		w.time       = s.st_mtime;
+		w.nanos      = KYTY_STAT_MTIME_NS(s);
 	}
 }
 
@@ -450,8 +505,10 @@ void SysFileGetLastAccessAndWriteTimeUtc(sys_file_t& f, SysFileTimeStruct& a,
 		a.is_invalid = w.is_invalid = !ok;
 
 		if (ok) {
-			a.time = s.st_atime;
-			w.time = s.st_mtime;
+			a.time  = s.st_atime;
+			a.nanos = KYTY_STAT_ATIME_NS(s);
+			w.time  = s.st_mtime;
+			w.nanos = KYTY_STAT_MTIME_NS(s);
 		}
 	} else if (f.type == SYS_FILE_MEMORY_STAT || f.type == SYS_FILE_MEMORY_DYN) {
 		// Memory-backed files carry no timestamps, so report the current time for both, as the
@@ -603,8 +660,10 @@ void SysFileFindFiles(const std::filesystem::path& path, std::vector<sys_file_fi
 			r.size                        = static_cast<uint64_t>(s.st_size);
 			r.last_access_time.is_invalid = false;
 			r.last_access_time.time       = s.st_atime;
+			r.last_access_time.nanos      = KYTY_STAT_ATIME_NS(s);
 			r.last_write_time.is_invalid  = false;
 			r.last_write_time.time        = s.st_mtime;
+			r.last_write_time.nanos       = KYTY_STAT_MTIME_NS(s);
 
 			out.push_back(r);
 		}

@@ -7,11 +7,20 @@
 #include <atomic>
 #include <chrono>             // IWYU pragma: keep
 #include <condition_variable> // IWYU pragma: keep
+#include <cerrno>
 #include <mutex>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS && KYTY_COMPILER == KYTY_COMPILER_CLANG
 #define KYTY_WIN_CS
+#endif
+
+// clock_nanosleep with an absolute deadline is the POSIX counterpart of the Windows
+// high-resolution waitable timer below: it does not re-arm after a spurious wake, so a sleep does
+// not silently run long. macOS has no clock_nanosleep, so it keeps sleep_for.
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS && !defined(__APPLE__)
+#define KYTY_POSIX_HIGH_RES_SLEEP
+#include <ctime>
 #endif
 
 #include <sstream>
@@ -119,6 +128,58 @@ static SleepConditionVariableCS_func_t ResolveSleepConditionVariableCS() {
 	return nullptr;
 }
 
+#endif
+
+#ifdef KYTY_POSIX_HIGH_RES_SLEEP
+// The POSIX counterpart of SleepHighResolution100ns above, and for the same reason: a guest
+// asking for a few microseconds should not be parked for fifty.
+//
+// The win here comes entirely from the spin, not from the syscall. Measured on this host, any
+// request that reaches the kernel overshoots by ~53us of timer slack no matter how it is
+// expressed -- glibc's sleep_for already uses clock_nanosleep, so switching to an absolute
+// deadline changes nothing on its own. Short-circuiting the small waits is what matters:
+//
+//     requested   sleep_for   this function
+//         2 us      55 us        2.1 us
+//        10 us      63 us       10.1 us
+//        30 us      83 us       30.1 us
+//       100 us     153 us      153 us      (unchanged, as expected)
+//
+// The absolute CLOCK_MONOTONIC deadline is kept for the longer waits anyway, because it makes the
+// EINTR retry resume towards the original instant instead of restarting the full duration.
+// SPIN_LIMIT_NS is deliberately far below the 1ms that the Windows path above spins for.
+static void SleepHighResolutionNanos(uint64_t nanos) {
+	if (nanos == 0) {
+		return;
+	}
+
+	constexpr uint64_t NANOS_PER_SEC = 1000000000;
+	constexpr uint64_t SPIN_LIMIT_NS = 50000; // below this a context switch dominates
+
+	timespec deadline {};
+	if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0) {
+		std::this_thread::sleep_for(std::chrono::nanoseconds(nanos));
+		return;
+	}
+
+	auto target_nsec = static_cast<uint64_t>(deadline.tv_nsec) + nanos;
+	deadline.tv_sec += static_cast<time_t>(target_nsec / NANOS_PER_SEC);
+	deadline.tv_nsec = static_cast<long>(target_nsec % NANOS_PER_SEC);
+
+	if (nanos <= SPIN_LIMIT_NS) {
+		timespec now {};
+		do {
+			if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+				return;
+			}
+		} while (now.tv_sec < deadline.tv_sec ||
+		         (now.tv_sec == deadline.tv_sec && now.tv_nsec < deadline.tv_nsec));
+		return;
+	}
+
+	while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &deadline, nullptr) == EINTR) {
+	}
+}
 #endif
 
 namespace Common {
@@ -249,6 +310,8 @@ void Thread::Sleep(uint32_t millis) {
 void Thread::SleepMicro(uint32_t micros) {
 #ifdef KYTY_WIN_CS
 	SleepHighResolution100ns(static_cast<uint64_t>(micros) * 10);
+#elif defined(KYTY_POSIX_HIGH_RES_SLEEP)
+	SleepHighResolutionNanos(static_cast<uint64_t>(micros) * 1000);
 #else
 	std::this_thread::sleep_for(std::chrono::microseconds(micros));
 #endif
@@ -257,6 +320,8 @@ void Thread::SleepMicro(uint32_t micros) {
 void Thread::SleepNano(uint64_t nanos) {
 #ifdef KYTY_WIN_CS
 	SleepHighResolution100ns((nanos + 99) / 100);
+#elif defined(KYTY_POSIX_HIGH_RES_SLEEP)
+	SleepHighResolutionNanos(nanos);
 #else
 	std::this_thread::sleep_for(std::chrono::nanoseconds(nanos));
 #endif

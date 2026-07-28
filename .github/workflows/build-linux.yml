@@ -20,19 +20,31 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update
+          # The bundled SDL2 silently disables any backend whose development package is absent.
+          # Without the audio/Wayland/udev entries below it configures with SDL_ALSA=OFF,
+          # SDL_PULSEAUDIO=OFF, SDL_PIPEWIRE=OFF, SDL_LIBUDEV=OFF, SDL_WAYLAND=OFF and
+          # SDL_DBUS=OFF, leaving SDL_OSS as the only audio driver -- an emulator with no working
+          # sound, no gamepad hotplug and no Wayland support, built without a single warning.
           sudo apt-get install --no-install-recommends --yes \
             clang \
             glslang-tools \
+            libasound2-dev \
+            libdbus-1-dev \
             libgl1-mesa-dev \
+            libpulse-dev \
+            libudev-dev \
+            libwayland-dev \
             libx11-dev \
             libxcursor-dev \
             libxext-dev \
             libxfixes-dev \
             libxi-dev \
+            libxkbcommon-dev \
             libxrandr-dev \
             libxss-dev \
             lld \
-            ninja-build
+            ninja-build \
+            wayland-protocols
 
       - name: Install Qt 6.10.3
         uses: jurplel/install-qt-action@v4
@@ -57,12 +69,31 @@ jobs:
       - name: Configure
         shell: bash
         run: |
+          mkdir -p _Build
           cmake -S src -B _Build/linux \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER=clang \
             -DCMAKE_CXX_COMPILER=clang++ \
-            -DCMAKE_PREFIX_PATH="$Qt6_DIR"
+            -DCMAKE_PREFIX_PATH="$Qt6_DIR" 2>&1 | tee _Build/configure.log
+          exit "${PIPESTATUS[0]}"
+
+      - name: Verify SDL2 backends
+        shell: bash
+        run: |
+          # A missing development package does not fail the build, it just turns a backend off.
+          # Assert on the feature summary so an incomplete dependency list is caught here rather
+          # than by a user with no sound.
+          status=0
+          for feature in SDL_ALSA SDL_PULSEAUDIO SDL_WAYLAND SDL_X11 SDL_LIBUDEV SDL_DBUS; do
+            if grep -qE "^--   ${feature} +\\(Wanted: ON\\): ON" _Build/configure.log; then
+              echo "ok   ${feature}"
+            else
+              echo "FAIL ${feature} is not enabled - its development package is probably missing"
+              status=1
+            fi
+          done
+          exit "$status"
 
       - name: Build
         shell: bash
@@ -74,9 +105,67 @@ jobs:
         run: |
           cmake --install _Build/linux --prefix _Build/linux/install
 
+      - name: Verify artifacts
+        shell: bash
+        run: |
+          file _Build/linux/install/launcher
+          file _Build/linux/install/kyty_emulator
+          # Confirm the binaries are the expected architecture and are not accidentally static or
+          # missing their interpreter.
+          file _Build/linux/install/kyty_emulator | grep -q "ELF 64-bit LSB .*x86-64"
+          ldd _Build/linux/install/kyty_emulator > /dev/null
+          _Build/linux/install/kyty_emulator --help > /dev/null
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: KytyPS5-Linux
           path: _Build/linux/install/**
           if-no-files-found: error
+
+  # Publishes the Linux build as an extra asset on the same release the Windows workflow creates.
+  # Deliberately a separate job in this workflow rather than a change to build.yml's release job:
+  # artifacts do not cross workflow boundaries, and more importantly nothing here may be able to
+  # fail the Windows release. It uploads to the release if one exists and creates it otherwise,
+  # matching build.yml, and continue-on-error keeps a packaging problem from failing the build.
+  release-linux:
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download build
+        uses: actions/download-artifact@v4
+        with:
+          name: KytyPS5-Linux
+          path: KytyPS5-Linux
+
+      - name: Set release name
+        shell: bash
+        run: |
+          echo "RELEASE_NAME=KytyPS5-$(date -u +'%Y-%m-%d')-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+
+      - name: Package build
+        shell: bash
+        run: |
+          chmod +x KytyPS5-Linux/launcher KytyPS5-Linux/kyty_emulator || true
+          tar -czf "$RELEASE_NAME-linux-x86_64.tar.gz" KytyPS5-Linux
+
+      - name: Attach to release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          asset="$RELEASE_NAME-linux-x86_64.tar.gz"
+          if gh release view "$RELEASE_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$RELEASE_NAME" "$asset" --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$RELEASE_NAME" "$asset" \
+              --generate-notes \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "$RELEASE_NAME"
+          fi

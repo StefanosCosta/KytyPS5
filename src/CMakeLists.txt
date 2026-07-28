@@ -251,6 +251,31 @@ endif()
 
 set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL2-static xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9)
 
+# The prebuilt ffmpeg archives are static, and each platform has to supply the system libraries
+# they were built against. 3rdparty/ffmpeg-core names them for Windows and macOS but not for Linux,
+# where the link only succeeded because these happened to be pulled in transitively by something
+# else. Named here rather than in that file because it is a submodule (shadps4-emu/ext-ffmpeg-core)
+# and edits there would not survive a submodule update.
+if(LINUX)
+	find_package(Threads REQUIRED)
+	list(APPEND kyty_emulator_link_libraries m ${CMAKE_DL_LIBS} Threads::Threads)
+
+	# zlib and bzip2/lzma are optional in an ffmpeg build, so link whichever this host provides
+	# instead of hard-failing on a differently configured prebuilt.
+	find_package(ZLIB)
+	if(ZLIB_FOUND)
+		list(APPEND kyty_emulator_link_libraries ZLIB::ZLIB)
+	endif()
+	find_library(KYTY_BZ2_LIBRARY bz2)
+	if(KYTY_BZ2_LIBRARY)
+		list(APPEND kyty_emulator_link_libraries ${KYTY_BZ2_LIBRARY})
+	endif()
+	find_library(KYTY_LZMA_LIBRARY lzma)
+	if(KYTY_LZMA_LIBRARY)
+		list(APPEND kyty_emulator_link_libraries ${KYTY_LZMA_LIBRARY})
+	endif()
+endif()
+
 set(inc_headers
 	${CMAKE_CURRENT_SOURCE_DIR}
 	${KYTY_THIRD_PARTY_DIR}/SDL2/include
@@ -394,6 +419,18 @@ add_kyty_full_emulator_test(virtual_memory_allocation_tests ../tests/VirtualMemo
 target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 	KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)
 
+# These three suites signal failure with throw/try. The clang-cl branch of KYTY_CPP_FLAGS does not
+# pass -fno-exceptions, so they build on Windows, but the Clang/GCC branch does -- which left them
+# failing to compile on Linux and macOS even though their add_test entries are unconditional.
+# Re-enable exceptions for just these targets; the flag is not added under clang-cl, so the Windows
+# command line is unchanged.
+if(NOT KYTY_CLANG_CL)
+	foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests
+			virtual_memory_allocation_tests)
+		target_compile_options(${kyty_exception_test} PRIVATE -fexceptions)
+	endforeach()
+endif()
+
 if(BUILD_TESTING)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
@@ -410,23 +447,35 @@ if(BUILD_TESTING)
 	add_test(NAME gpu_tiler
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-tiler-only)
 
+	# These eight were registered inside if(WIN32) with no explanation. Five of them run green on
+	# Linux once the corresponding suites are compiled in, and are now registered everywhere.
+	add_test(NAME texture_cache_layered_image
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --layered-image-only)
+	add_test(NAME texture_cache_image_views
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-view-cache-only)
+	add_test(NAME texture_cache_storage_sampled
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --storage-sampled-only)
+	add_test(NAME texture_cache_depth_readback
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --depth-readback-only)
+	add_test(NAME buffer_cache_dirty_gc
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-gc-only)
+
 	if(WIN32)
+		# The remaining three all run CheckUnifiedTextureCacheFlow, whose multisample-depth stage
+		# does not hold outside the Windows/AMD setup this project develops on. Measured on Linux:
+		#   NVIDIA (RTX 3090, Vulkan 1.4) - "two-sample depth content: color-to-multisample-depth
+		#                                    changed a packed sample value"
+		#   llvmpipe                      - the 2-sample depth format is rejected outright,
+		#                                   "image format does not support required usage:
+		#                                    format=37 type=1 usage=0x17 flags=0x108 samples=2"
+		# Two different failures on two drivers points at the multisample-depth path rather than a
+		# flaky test, so these stay gated until that is understood. See LINUX_PORT.md 4.1.
 		add_test(NAME texture_cache_image_overlap
 			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-overlap-only)
 		add_test(NAME texture_cache_htile_clear
 			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --htile-clear-only)
-		add_test(NAME texture_cache_layered_image
-			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --layered-image-only)
-		add_test(NAME texture_cache_image_views
-			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-view-cache-only)
-		add_test(NAME texture_cache_storage_sampled
-			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --storage-sampled-only)
-		add_test(NAME texture_cache_depth_readback
-			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --depth-readback-only)
 		add_test(NAME buffer_cache_ranges
 			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-range-only)
-		add_test(NAME buffer_cache_dirty_gc
-			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-gc-only)
 	endif()
 endif()
 
@@ -446,6 +495,9 @@ endif()
 if (CLANG AND NOT KYTY_CLANG_CL)
 	target_link_libraries(kyty_emulator pthread)
 endif()
+# dlopen/dlsym/dladdr for the RenderDoc loader. Folded into libc from glibc 2.34, so this is empty
+# on a current distro and on Windows, and supplies -ldl on older ones.
+target_link_libraries(kyty_emulator ${CMAKE_DL_LIBS})
 target_include_directories(kyty_emulator PRIVATE ${inc_headers})
 
 clang_tidy_check(kyty_emulator "" "${check_headers}" "${inc_headers}")
