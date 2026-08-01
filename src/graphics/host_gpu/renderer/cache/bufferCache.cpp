@@ -283,16 +283,24 @@ bool BufferCache::SynchronizeBacking(uint64_t vaddr, uint64_t size) {
 		CacheRange affected {.address = page_begin, .size = page_end - page_begin};
 		{
 			FaultSafeCacheLock lock(this, m_mutex);
-			bool               changed = true;
-			while (changed) {
-				changed = false;
-				for (const auto& [address, cached]: m_buffers) {
-					const CacheRange previous = affected;
-					if (ResolveOverlap(affected, {address, cached->size}) &&
-					    (previous.address != affected.address || previous.size != affected.size)) {
-						changed = true;
-					}
+			// m_buffers holds disjoint ranges: whenever a new buffer is created it absorbs and
+			// erases every entry it overlaps. So the transitive closure of overlap is reached by
+			// one ordered walk outwards from the range, the same way ObtainBuffer merges. The
+			// previous formulation rescanned the whole map until nothing grew, which is O(n^2)
+			// and was the single largest cost in the frame.
+			auto first = m_buffers.lower_bound(affected.address);
+			while (first != m_buffers.begin()) {
+				auto previous = std::prev(first);
+				if (!ResolveOverlap(affected, {previous->second->vaddr, previous->second->size})) {
+					break;
 				}
+				first = previous;
+			}
+			for (auto candidate = first; candidate != m_buffers.end(); ++candidate) {
+				if (candidate->first >= affected.address + affected.size) {
+					break;
+				}
+				(void)ResolveOverlap(affected, {candidate->second->vaddr, candidate->second->size});
 			}
 		}
 		{
@@ -1025,10 +1033,23 @@ void BufferCache::InvalidateImageAliases(uint64_t vaddr, uint64_t size) {
 	}
 	FaultSafeCacheLock lock(this, m_mutex);
 	const auto         end = vaddr + size;
-	for (const auto& [address, cached]: m_buffers) {
-		const auto cached_end = address + cached->size;
-		const auto begin      = std::max(vaddr, address);
-		const auto range_end  = std::min(end, cached_end);
+	// Only the entries overlapping [vaddr, end) can contribute. m_buffers is ordered and its
+	// ranges are disjoint, so the first candidate is either the entry at lower_bound or the one
+	// immediately before it, and the walk can stop as soon as an entry starts past the range.
+	auto first = m_buffers.lower_bound(vaddr);
+	if (first != m_buffers.begin()) {
+		auto previous = std::prev(first);
+		if (previous->second->vaddr + previous->second->size > vaddr) {
+			first = previous;
+		}
+	}
+	for (auto candidate = first; candidate != m_buffers.end() && candidate->first < end;
+	     ++candidate) {
+		const auto& address    = candidate->first;
+		const auto& cached     = candidate->second;
+		const auto  cached_end = address + cached->size;
+		const auto  begin      = std::max(vaddr, address);
+		const auto  range_end  = std::min(end, cached_end);
 		if (begin >= range_end) {
 			continue;
 		}

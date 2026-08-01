@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "common/dateTime.h"
 #include "common/emulatorConfig.h"
+#include "common/hleTrace.h"
 #include "common/logging/log.h"
 #include "common/singleton.h"
 #include "common/stringUtils.h"
@@ -1990,7 +1991,7 @@ int KYTY_SYSV_ABI PthreadMutexUnlock(PthreadMutex* mutex) {
 }
 
 int KYTY_SYSV_ABI PthreadAttrInit(PthreadAttr* attr) {
-	// PRINT_NAME();
+	PRINT_NAME();
 
 	*attr = new PthreadAttrPrivate {};
 
@@ -2025,7 +2026,7 @@ int KYTY_SYSV_ABI PthreadAttrInit(PthreadAttr* attr) {
 }
 
 int KYTY_SYSV_ABI PthreadAttrDestroy(PthreadAttr* attr) {
-	// PRINT_NAME();
+	PRINT_NAME();
 
 	auto* attr_value = GetPthreadAttrValue(attr, "PthreadAttrDestroy");
 	if (attr_value == nullptr) {
@@ -2044,7 +2045,7 @@ int KYTY_SYSV_ABI PthreadAttrDestroy(PthreadAttr* attr) {
 }
 
 int KYTY_SYSV_ABI PthreadAttrGet(Pthread thread, PthreadAttr* attr) {
-	// PRINT_NAME();
+	PRINT_NAME();
 
 	if (thread == nullptr || attr == nullptr || *attr == nullptr) {
 		return KERNEL_ERROR_EINVAL;
@@ -2054,7 +2055,7 @@ int KYTY_SYSV_ABI PthreadAttrGet(Pthread thread, PthreadAttr* attr) {
 }
 
 int KYTY_SYSV_ABI PthreadAttrGetaffinity(const PthreadAttr* attr, KernelCpumask* mask) {
-	// PRINT_NAME();
+	PRINT_NAME();
 
 	if (mask == nullptr || attr == nullptr || *attr == nullptr) {
 		return KERNEL_ERROR_EINVAL;
@@ -2066,7 +2067,7 @@ int KYTY_SYSV_ABI PthreadAttrGetaffinity(const PthreadAttr* attr, KernelCpumask*
 }
 
 int KYTY_SYSV_ABI PthreadAttrGetdetachstate(const PthreadAttr* attr, int* state) {
-	// PRINT_NAME();
+	PRINT_NAME();
 
 	if (state == nullptr || attr == nullptr || *attr == nullptr) {
 		return KERNEL_ERROR_EINVAL;
@@ -2090,7 +2091,7 @@ int KYTY_SYSV_ABI PthreadAttrGetdetachstate(const PthreadAttr* attr, int* state)
 }
 
 int KYTY_SYSV_ABI PthreadAttrGetguardsize(const PthreadAttr* attr, size_t* guard_size) {
-	// PRINT_NAME();
+	PRINT_NAME();
 
 	if (guard_size == nullptr || attr == nullptr || *attr == nullptr) {
 		return KERNEL_ERROR_EINVAL;
@@ -2102,7 +2103,7 @@ int KYTY_SYSV_ABI PthreadAttrGetguardsize(const PthreadAttr* attr, size_t* guard
 }
 
 int KYTY_SYSV_ABI PthreadAttrGetinheritsched(const PthreadAttr* attr, int* inherit_sched) {
-	// PRINT_NAME();
+	PRINT_NAME();
 
 	if (inherit_sched == nullptr || attr == nullptr || *attr == nullptr) {
 		return KERNEL_ERROR_EINVAL;
@@ -2120,7 +2121,7 @@ int KYTY_SYSV_ABI PthreadAttrGetinheritsched(const PthreadAttr* attr, int* inher
 }
 
 int KYTY_SYSV_ABI PthreadAttrGetschedparam(const PthreadAttr* attr, KernelSchedParam* param) {
-	// PRINT_NAME();
+	PRINT_NAME();
 
 	if (param == nullptr || attr == nullptr || *attr == nullptr) {
 		return KERNEL_ERROR_EINVAL;
@@ -2147,7 +2148,7 @@ int KYTY_SYSV_ABI PthreadAttrGetschedparam(const PthreadAttr* attr, KernelSchedP
 }
 
 int KYTY_SYSV_ABI PthreadAttrGetschedpolicy(const PthreadAttr* attr, int* policy) {
-	// PRINT_NAME();
+	PRINT_NAME();
 
 	if (policy == nullptr || attr == nullptr || *attr == nullptr) {
 		return KERNEL_ERROR_EINVAL;
@@ -2169,7 +2170,7 @@ int KYTY_SYSV_ABI PthreadAttrGetschedpolicy(const PthreadAttr* attr, int* policy
 }
 
 int KYTY_SYSV_ABI PthreadAttrGetsolosched(const PthreadAttr* attr, int* solosched) {
-	// PRINT_NAME();
+	PRINT_NAME();
 
 	if (solosched == nullptr || attr == nullptr || *attr == nullptr) {
 		return KERNEL_ERROR_EINVAL;
@@ -2182,7 +2183,7 @@ int KYTY_SYSV_ABI PthreadAttrGetsolosched(const PthreadAttr* attr, int* solosche
 
 int KYTY_SYSV_ABI PthreadAttrGetstack(const PthreadAttr* __restrict attr,
                                       void** __restrict stack_addr, size_t* __restrict stack_size) {
-	// PRINT_NAME();
+	PRINT_NAME();
 
 	if (stack_size == nullptr || stack_addr == nullptr || attr == nullptr || *attr == nullptr) {
 		return KERNEL_ERROR_EINVAL;
@@ -2195,7 +2196,7 @@ int KYTY_SYSV_ABI PthreadAttrGetstack(const PthreadAttr* __restrict attr,
 }
 
 int KYTY_SYSV_ABI PthreadAttrGetstackaddr(const PthreadAttr* attr, void** stack_addr) {
-	// PRINT_NAME();
+	PRINT_NAME();
 
 	if (stack_addr == nullptr || attr == nullptr || *attr == nullptr) {
 		return KERNEL_ERROR_EINVAL;
@@ -2207,7 +2208,7 @@ int KYTY_SYSV_ABI PthreadAttrGetstackaddr(const PthreadAttr* attr, void** stack_
 }
 
 int KYTY_SYSV_ABI PthreadAttrGetstacksize(const PthreadAttr* attr, size_t* stack_size) {
-	// PRINT_NAME();
+	PRINT_NAME();
 
 	if (stack_size == nullptr || attr == nullptr || *attr == nullptr) {
 		return KERNEL_ERROR_EINVAL;
@@ -2219,7 +2220,7 @@ int KYTY_SYSV_ABI PthreadAttrGetstacksize(const PthreadAttr* attr, size_t* stack
 }
 
 int KYTY_SYSV_ABI PthreadAttrSetaffinity(PthreadAttr* attr, KernelCpumask mask) {
-	// PRINT_NAME();
+	PRINT_NAME();
 
 	auto* attr_value = GetPthreadAttrValue(attr, "PthreadAttrSetaffinity");
 	if (attr_value == nullptr) {
@@ -2232,7 +2233,7 @@ int KYTY_SYSV_ABI PthreadAttrSetaffinity(PthreadAttr* attr, KernelCpumask mask) 
 }
 
 int KYTY_SYSV_ABI PthreadAttrSetdetachstate(PthreadAttr* attr, int state) {
-	// PRINT_NAME();
+	PRINT_NAME();
 
 	auto* attr_value = GetPthreadAttrValue(attr, "PthreadAttrSetdetachstate");
 	if (attr_value == nullptr) {
@@ -2258,7 +2259,7 @@ int KYTY_SYSV_ABI PthreadAttrSetdetachstate(PthreadAttr* attr, int state) {
 }
 
 int KYTY_SYSV_ABI PthreadAttrSetguardsize(PthreadAttr* attr, size_t guard_size) {
-	// PRINT_NAME();
+	PRINT_NAME();
 
 	auto* attr_value = GetPthreadAttrValue(attr, "PthreadAttrSetguardsize");
 	if (attr_value == nullptr) {
@@ -2271,7 +2272,7 @@ int KYTY_SYSV_ABI PthreadAttrSetguardsize(PthreadAttr* attr, size_t guard_size) 
 }
 
 int KYTY_SYSV_ABI PthreadAttrSetinheritsched(PthreadAttr* attr, int inherit_sched) {
-	// PRINT_NAME();
+	PRINT_NAME();
 
 	auto* attr_value = GetPthreadAttrValue(attr, "PthreadAttrSetinheritsched");
 	if (attr_value == nullptr) {
@@ -2295,7 +2296,7 @@ int KYTY_SYSV_ABI PthreadAttrSetinheritsched(PthreadAttr* attr, int inherit_sche
 }
 
 int KYTY_SYSV_ABI PthreadAttrSetschedparam(PthreadAttr* attr, const KernelSchedParam* param) {
-	// PRINT_NAME();
+	PRINT_NAME();
 
 	auto* attr_value = GetPthreadAttrValue(attr, "PthreadAttrSetschedparam");
 	if (param == nullptr || attr_value == nullptr) {
@@ -2342,7 +2343,7 @@ int KYTY_SYSV_ABI PthreadAttrSetschedparam(PthreadAttr* attr, const KernelSchedP
 }
 
 int KYTY_SYSV_ABI PthreadAttrSetschedpolicy(PthreadAttr* attr, int policy) {
-	// PRINT_NAME();
+	PRINT_NAME();
 
 	auto* attr_value = GetPthreadAttrValue(attr, "PthreadAttrSetschedpolicy");
 	if (attr_value == nullptr) {
@@ -2363,7 +2364,7 @@ int KYTY_SYSV_ABI PthreadAttrSetschedpolicy(PthreadAttr* attr, int policy) {
 }
 
 int KYTY_SYSV_ABI PthreadAttrSetsolosched(PthreadAttr* attr, int solosched) {
-	// PRINT_NAME();
+	PRINT_NAME();
 
 	auto* attr_value = GetPthreadAttrValue(attr, "PthreadAttrSetsolosched");
 	if (attr_value == nullptr) {
@@ -2376,7 +2377,7 @@ int KYTY_SYSV_ABI PthreadAttrSetsolosched(PthreadAttr* attr, int solosched) {
 }
 
 int KYTY_SYSV_ABI PthreadAttrSetstack(PthreadAttr* attr, void* addr, size_t size) {
-	// PRINT_NAME();
+	PRINT_NAME();
 
 	auto* attr_value = GetPthreadAttrValue(attr, "PthreadAttrSetstack");
 	if (addr == nullptr || size < GUEST_PTHREAD_STACK_MIN || attr_value == nullptr) {
@@ -2393,7 +2394,7 @@ int KYTY_SYSV_ABI PthreadAttrSetstack(PthreadAttr* attr, void* addr, size_t size
 }
 
 int KYTY_SYSV_ABI PthreadAttrSetstackaddr(PthreadAttr* attr, void* addr) {
-	// PRINT_NAME();
+	PRINT_NAME();
 
 	auto* attr_value = GetPthreadAttrValue(attr, "PthreadAttrSetstackaddr");
 	if (addr == nullptr || attr_value == nullptr) {
@@ -2409,7 +2410,7 @@ int KYTY_SYSV_ABI PthreadAttrSetstackaddr(PthreadAttr* attr, void* addr) {
 }
 
 int KYTY_SYSV_ABI PthreadAttrSetstacksize(PthreadAttr* attr, size_t stack_size) {
-	// PRINT_NAME();
+	PRINT_NAME();
 
 	auto* attr_value = GetPthreadAttrValue(attr, "PthreadAttrSetstacksize");
 	if (stack_size < GUEST_PTHREAD_STACK_MIN || attr_value == nullptr) {
@@ -3323,6 +3324,14 @@ bool PthreadHasPendingSignal(Pthread thread, int signum) {
 	return (thread->pending_signal_mask.load(std::memory_order_acquire) & mask) != 0;
 }
 
+bool PthreadHasAnyPendingSignal(Pthread thread) {
+	if (thread == nullptr) {
+		return false;
+	}
+
+	return thread->pending_signal_mask.load(std::memory_order_acquire) != 0;
+}
+
 bool PthreadTakePendingSignal(Pthread thread, int signum) {
 	if (thread == nullptr || signum < 0 || signum >= 64) {
 		return false;
@@ -3396,6 +3405,8 @@ static void* RunThread(void* arg) {
 	void* ret    = nullptr;
 
 	thread->unique_id = Common::Thread::GetThreadIdUnique();
+
+	Common::HleTrace::NameCurrentThread(thread->name.c_str());
 
 	g_pthread_self = thread;
 
@@ -3826,6 +3837,8 @@ int KYTY_SYSV_ABI PthreadRename(Pthread thread, const char* name) {
 
 	thread->name = std::string(name);
 
+	Common::HleTrace::SetThreadName(thread->unique_id, name);
+
 	return OK;
 }
 
@@ -3877,6 +3890,7 @@ int KYTY_SYSV_ABI KernelClockGetres(KernelClockid clock_id, KernelTimespec* tp) 
 
 int KYTY_SYSV_ABI KernelClockGettime(KernelClockid clock_id, KernelTimespec* tp) {
 	// Called constantly by Python frame/timer code.
+	TRACE_NAME();
 
 	if (tp == nullptr) {
 		return KERNEL_ERROR_EFAULT;
@@ -3908,6 +3922,7 @@ int KYTY_SYSV_ABI KernelClockGettime(KernelClockid clock_id, KernelTimespec* tp)
 
 int KYTY_SYSV_ABI KernelGettimeofday(KernelTimeval* tp) {
 	// PRINT_NAME();
+	TRACE_NAME();
 
 	if (tp == nullptr) {
 		return KERNEL_ERROR_EFAULT;
@@ -3937,6 +3952,7 @@ int KYTY_SYSV_ABI KernelGettimeofday(KernelTimeval* tp) {
 
 int KYTY_SYSV_ABI KernelGettimezone(KernelTimezone* tz) {
 	// Hot path in Unity's time/date code.
+	TRACE_NAME();
 
 	if (tz == nullptr) {
 		return KERNEL_ERROR_EFAULT;
@@ -4024,10 +4040,12 @@ uint64_t KYTY_SYSV_ABI KernelGetTscFrequency() {
 }
 
 uint64_t KYTY_SYSV_ABI KernelReadTsc() {
+	TRACE_NAME();
 	return KernelReadTscNative();
 }
 
 uint64_t KYTY_SYSV_ABI KernelGetProcessTime() {
+	TRACE_NAME();
 	const auto frequency = KernelGetTscFrequencyNative();
 	if (frequency == 0) {
 		return static_cast<uint64_t>(Loader::Timer::GetTimeMs() * 1000.0);
@@ -4039,6 +4057,7 @@ uint64_t KYTY_SYSV_ABI KernelGetProcessTime() {
 }
 
 uint64_t KYTY_SYSV_ABI KernelGetProcessTimeCounter() {
+	TRACE_NAME();
 	return KernelGetElapsedTsc();
 }
 
@@ -4057,6 +4076,7 @@ void KYTY_SYSV_ABI KernelSetThreadDtors(thread_dtors_func_t dtors) {
 }
 
 int KYTY_SYSV_ABI KernelUsleep(KernelUseconds microseconds) {
+	TRACE_NAME();
 	Common::Timer t;
 	t.Start();
 	SleepMicroWithSignalPoll(microseconds);
