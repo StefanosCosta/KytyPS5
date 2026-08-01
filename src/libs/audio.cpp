@@ -243,8 +243,19 @@ bool Audio::OpenSdlDevice(PortOut* port) {
 	port->audio_spec = obtained;
 	SDL_PauseAudioDevice(port->audio_device, 0);
 
-	LOGF("AudioOut: opened SDL device (%d Hz, %u ch, format 0x%04x)\n", obtained.freq,
-	     obtained.channels, obtained.format);
+	// Report the backend SDL actually selected: it falls back through its driver list silently, so
+	// "the device opened" alone says nothing about which subsystem is carrying the audio. The
+	// device is opened as nullptr (the backend's default sink) and SDL2 offers no way to name that
+	// device, so do not try -- SDL_GetAudioDeviceName(0, 0) is the first *enumerated* device, which
+	// is a different thing and reporting it as the output is actively misleading.
+	// obtained.samples matters as much as the format: SDL_AUDIO_ALLOW_ANY_CHANGE lets the backend
+	// pick its own period size, and if it pulls a larger block than we queue per push, any shortfall
+	// leaves a gap on that period -- which is periodic, and periodic is a tone.
+	const char* driver = SDL_GetCurrentAudioDriver();
+	LOGF("AudioOut: opened SDL device (%d Hz, %u ch, format 0x%04x, samples=%u [asked %u]) "
+	     "driver=%s device=<default>\n",
+	     obtained.freq, obtained.channels, obtained.format, obtained.samples, desired.samples,
+	     driver != nullptr ? driver : "?");
 	return true;
 }
 
@@ -364,14 +375,57 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
 	}
 
 	if (blocking) {
-		const auto min_queued_size = queue_size * 2u;
-		const auto wait_start      = LibKernel::KernelGetProcessTime();
+		// Keep roughly TARGET_LATENCY_MICROS of audio queued rather than a fixed two buffers. A
+		// guest that submits small buffers -- FMOD uses 256 frames, i.e. 5.3 ms at 48 kHz -- left
+		// only ~10 ms of cushion under the old fixed multiple, so any scheduling hiccup underran the
+		// device and the output broke up. Expressing the target in time makes it independent of the
+		// guest's buffer size; the floor keeps at least two buffers for very large ones.
+		constexpr uint64_t TARGET_LATENCY_MICROS = 40000;
+
+		const auto buffer_micros =
+		    (port->freq != 0 ? (1000000ULL * port->samples_num) / port->freq : 0);
+		const auto buffers = (buffer_micros != 0
+		                          ? static_cast<uint32_t>((TARGET_LATENCY_MICROS + buffer_micros - 1) /
+		                                                  buffer_micros)
+		                          : 2u);
+		const auto min_queued_size = queue_size * std::clamp(buffers, 2u, 16u);
+
+		const auto wait_start = LibKernel::KernelGetProcessTime();
 		while (SDL_GetQueuedAudioSize(port->audio_device) > min_queued_size) {
 			if (LibKernel::KernelGetProcessTime() - wait_start > 200000) {
 				SDL_ClearQueuedAudio(port->audio_device);
 				break;
 			}
 			Common::Thread::SleepMicro(1000);
+		}
+	}
+
+	// KYTY_AUDIO_STATS=1: quantify output health. An underrun (the device drained completely before
+	// we got here) is what choppiness sounds like, and a flush is an outright dropout; both are
+	// invisible otherwise.
+	static const bool stats_enabled = (::getenv("KYTY_AUDIO_STATS") != nullptr);
+	if (stats_enabled) {
+		static std::atomic_uint64_t submitted {0};
+		static std::atomic_uint64_t underruns {0};
+		static std::atomic_uint64_t deepest {0};
+
+		const auto queued = SDL_GetQueuedAudioSize(port->audio_device);
+		if (queued == 0) {
+			underruns.fetch_add(1, std::memory_order_relaxed);
+		}
+		auto seen = deepest.load(std::memory_order_relaxed);
+		while (queued > seen && !deepest.compare_exchange_weak(seen, queued)) {
+		}
+
+		const auto n = submitted.fetch_add(1, std::memory_order_relaxed) + 1;
+		if ((n % 500) == 0) {
+			const auto buffer_micros =
+			    (port->freq != 0 ? (1000000ULL * port->samples_num) / port->freq : 0);
+			LOGF("AudioOutStats: submitted=%" PRIu64 " underruns=%" PRIu64 " (%.2f%%) "
+			     "deepest_queue=%" PRIu64 "B buffer=%" PRIu64 "us\n",
+			     n, underruns.load(), 100.0 * static_cast<double>(underruns.load()) /
+			                              static_cast<double>(n),
+			     deepest.load(), buffer_micros);
 		}
 	}
 
@@ -511,7 +565,21 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 		max_wait_time      = (wait_time > max_wait_time ? wait_time : max_wait_time);
 	}
 
-	if (blocking && max_wait_time != 0) {
+	// Two independent rate limiters used to run here: this wall-clock sleep, and QueueSdlAudio's
+	// block on the device queue depth. The sleep pins submission to exactly 1x realtime, so the
+	// queue can never build a cushion -- measured at 96% underruns, which is what choppy output is.
+	// When every port has a real device, the device's own consumption is the correct clock: let
+	// QueueSdlAudio provide the backpressure and drop the sleep. The sleep is still needed for ports
+	// with no device (a failed open, or a vibration port), where nothing else would pace the guest.
+	bool all_ports_have_device = true;
+	for (uint32_t i = 0; i < num; i++) {
+		if (m_out_ports[params[i].handle.GetId()].audio_device == 0) {
+			all_ports_have_device = false;
+			break;
+		}
+	}
+
+	if (blocking && max_wait_time != 0 && !all_ports_have_device) {
 		Common::Thread::SleepMicro(max_wait_time);
 	}
 
