@@ -4,6 +4,7 @@
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <limits>
@@ -247,20 +248,20 @@ static int KYTY_SYSV_ABI RtcGetCurrentTick(RtcTick* tick) {
 		return RTC_ERROR_DATETIME_UNINITIALIZED;
 	}
 
-	const auto now  = Common::DateTime::FromSystemUTC();
-	const auto date = now.GetDate();
-	const auto tod  = now.GetTime();
+	// Real sceRtcGetCurrentTick is microsecond-resolution, and RtcGetTickResolution() above already
+	// promises the guest 1000000. Building the tick out of DateTime::FromSystemUTC quantised it to
+	// milliseconds, because that path keeps only whole Msec, so consecutive calls inside the same
+	// millisecond returned an identical tick and any guest delta computed from them was exactly
+	// zero. Derive it from a single microsecond reading instead of a calendar round-trip, anchored
+	// on the Unix epoch, so the calendar and sub-second parts cannot disagree at a second boundary.
+	const auto now_us =
+	    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+	                              std::chrono::system_clock::now().time_since_epoch())
+	                              .count());
 
-	RtcDateTime time {};
-	time.year        = static_cast<uint16_t>(date.Year());
-	time.month       = static_cast<uint16_t>(date.Month());
-	time.day         = static_cast<uint16_t>(date.Day());
-	time.hour        = static_cast<uint16_t>(tod.Hour24());
-	time.minute      = static_cast<uint16_t>(tod.Minute());
-	time.second      = static_cast<uint16_t>(tod.Second());
-	time.microsecond = static_cast<uint32_t>(tod.Msec() * 1000);
+	tick->tick = RTC_UNIX_EPOCH_TICKS + now_us;
 
-	return RtcGetTick(&time, tick);
+	return OK;
 }
 
 static int KYTY_SYSV_ABI RtcGetCurrentNetworkTick(RtcTick* tick) {

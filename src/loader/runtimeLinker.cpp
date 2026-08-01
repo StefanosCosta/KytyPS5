@@ -23,6 +23,7 @@
 #include "loader/x64InstructionEmulator.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -145,7 +146,7 @@ static bool PatchGuestMemory64(uint64_t vaddr, uint64_t value) {
 }
 
 static uint64_t AllocateUnresolvedImportThunk(uint64_t record_id) {
-	constexpr uint64_t thunk_size = 162;
+	constexpr uint64_t thunk_size = 165; // +3 for the xmm0 clear on the fall-through path
 
 	if (g_unresolved_stub_thunk_pages.empty() ||
 	    g_unresolved_stub_thunk_offset + thunk_size > UNRESOLVED_STUB_PAGE_SIZE) {
@@ -251,6 +252,16 @@ static uint64_t AllocateUnresolvedImportThunk(uint64_t record_id) {
 	emit(0x41);
 	emit(0xff);
 	emit(0xe3); // jmp r11
+
+	// Fall-through: the import really is unresolved and we return 0. The xmm restore above put the
+	// *caller's* xmm0 back, so without this an unresolved import whose real signature returns
+	// float/double handed the guest whatever it happened to pass in its first FP argument --
+	// arbitrary, and on an audio thread plausibly a NaN that then propagates into DSP state.
+	// Return 0.0 instead, to match the integer return already being zeroed below.
+	emit(0x0f);
+	emit(0x57);
+	emit(0xc0); // xorps xmm0, xmm0
+
 	emit(0x31);
 	emit(0xc0); // xor eax, eax
 	emit(0xc3); // ret
@@ -315,8 +326,23 @@ static KYTY_SYSV_ABI uint64_t ResolveImportStubWithId(uint64_t record_id) {
 		}
 	}
 
+	// Log the first call per symbol rather than the first 1024 calls overall: a single hot
+	// unresolved import used to exhaust the budget and hide every other one, so the *set* of
+	// unresolved imports -- which is what tells you whether a stubbed function is on a path that
+	// matters -- was never visible.
+	// Lock-free: this runs on every call to an unresolved import, which can be hot, and the record
+	// vector is copied on push_back so it cannot hold an atomic member.
+	static std::array<std::atomic_uint64_t, 1024> logged_bits {};
+
+	bool first_for_symbol = false;
+	if (record_id < logged_bits.size() * 64) {
+		auto&      word = logged_bits[record_id / 64];
+		const auto bit  = uint64_t {1} << (record_id % 64);
+		first_for_symbol = (word.fetch_or(bit, std::memory_order_relaxed) & bit) == 0;
+	}
+
 	const auto log_index = g_unresolved_stub_call_log_count.fetch_add(1);
-	if (log_index < 1024) {
+	if (first_for_symbol || log_index < 1024) {
 		if (record_id < g_stubbed_imports.size()) {
 			const auto& record = g_stubbed_imports[record_id];
 			printf("Unresolved import stub called: %s\n", record.name.c_str());
