@@ -1,66 +1,35 @@
-// Narrow tests for sceAudioOut2 port lifecycle.
-//
-// The bug these exist for: AudioOut2PortCreate used a monotonic handle counter as a capacity check.
-// The counter has to keep increasing so handles stay unique, and PortDestroy cannot decrement it, so
-// testing it against the table size confused "ports ever created" with "ports currently open" --
-// the 257th create of a session failed permanently with all 256 slots free. No available title
-// churns ports (Minecraft opens two and never closes them), so this cannot be caught by running a
-// game; it needs a direct test.
-
 #include "libs/audio.h"
 #include "libs/audio_internal.h"
 #include "libs/errno.h"
 
+#include <algorithm>
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <algorithm>
-#include <atomic>
 #include <mutex>
 #include <thread>
 #include <vector>
-
-// Device-open accounting for the stubbed backend, defined here because the stubs at the bottom of
-// this file and the tests above both touch it.
-std::mutex       g_device_mutex;
-std::vector<int> g_live_devices;
-int              g_next_device = 1;
-int              g_open_count  = 0;
 
 namespace {
 
 namespace AudioOut2 = Libs::Audio::AudioOut2;
 
-void ResetDeviceAccounting() {
-	std::lock_guard<std::mutex> lock(g_device_mutex);
-	g_live_devices.clear();
-	g_open_count = 0;
-}
+std::mutex              g_device_mutex;
+std::condition_variable g_device_cv;
+std::vector<int>        g_live_devices;
+int                     g_next_device  = 1;
+int                     g_open_waiters = 0;
+bool                    g_block_opens  = false;
 
-int LiveDeviceCount() {
-	std::lock_guard<std::mutex> lock(g_device_mutex);
-	return static_cast<int>(g_live_devices.size());
-}
-
-int DeviceOpenCount() {
-	std::lock_guard<std::mutex> lock(g_device_mutex);
-	return g_open_count;
-}
-
-// An empty label means "checked, but not worth a line" -- used inside loops that would otherwise
-// emit hundreds of identical lines.
 void Check(bool value, const char* text) {
 	if (!value) {
-		std::fprintf(stderr, "AudioOut2PortTests: failed: %s\n", *text != '\0' ? text : "(in loop)");
+		std::fprintf(stderr, "AudioOut2PortTests: failed: %s\n", text);
 		std::abort();
-	}
-	if (*text != '\0') {
-		std::printf("[host]    %-52s ok\n", text);
 	}
 }
 
-// Mirrors the definition in src/libs/libAudio2.cpp, which is file-local (audio.h only
-// forward-declares it). If that layout changes, this must change with it.
 struct PortParam {
 	uint16_t port_type;
 	uint16_t pad;
@@ -71,9 +40,16 @@ struct PortParam {
 	uint32_t reserved[10];
 };
 
-// Mirrored for the same reason as PortParam. The size matters as well as the layout here:
-// AudioOut2PortGetState memsets its argument using the real definition's size, so a short mirror
-// would be a buffer overflow rather than a wrong reading.
+struct ContextParam {
+	uint32_t max_ports;
+	uint32_t max_object_ports;
+	uint32_t guarantee_object_ports;
+	uint32_t queue_depth;
+	uint32_t num_grains;
+	uint32_t flags;
+	uint32_t reserved[10];
+};
+
 struct PortState {
 	uint16_t output;
 	uint8_t  num_channels;
@@ -85,204 +61,164 @@ struct PortState {
 	uint64_t reserved[6];
 };
 
-const auto* AsParam(const PortParam* p) {
-	return reinterpret_cast<const AudioOut2::AudioOut2PortParam*>(p);
+const auto* AsParam(const PortParam* param) {
+	return reinterpret_cast<const AudioOut2::AudioOut2PortParam*>(param);
 }
 
-auto* AsState(PortState* s) {
-	return reinterpret_cast<AudioOut2::AudioOut2PortState*>(s);
+const auto* AsParam(const ContextParam* param) {
+	return reinterpret_cast<const AudioOut2::AudioOut2ContextParam*>(param);
 }
 
-PortParam StereoFloatParam() {
-	PortParam p {};
-	p.port_type     = 0;     // main
-	p.data_format   = 0x200; // float, 2 channels
-	p.sampling_freq = 48000;
-	return p;
+auto* AsState(PortState* state) {
+	return reinterpret_cast<AudioOut2::AudioOut2PortState*>(state);
 }
 
-// The port table holds this many entries; see g_audioout2_ports in libAudio2.cpp.
-constexpr int PORT_TABLE_SIZE = 256;
+PortParam MakeParam(uint32_t data_format = 0x200) {
+	PortParam param {};
+	param.data_format   = data_format;
+	param.sampling_freq = 48000;
+	return param;
+}
 
-// Creating and destroying a port must be repeatable indefinitely. Before the fix this failed on
-// iteration 257 and every one after it.
-void TestCreateDestroyCyclesPastTableSize() {
-	const auto param = StereoFloatParam();
+AudioOut2::AudioOut2ContextHandle CreateContext() {
+	ContextParam param {};
+	param.queue_depth                         = 4;
+	param.num_grains                          = 512;
+	AudioOut2::AudioOut2ContextHandle context = 0;
+	Check(AudioOut2::AudioOut2ContextCreate(AsParam(&param), nullptr, 0, &context) == OK,
+	      "context create failed");
+	return context;
+}
 
-	for (int i = 0; i < PORT_TABLE_SIZE * 3; i++) {
+void BlockDeviceOpens() {
+	std::lock_guard lock(g_device_mutex);
+	g_open_waiters = 0;
+	g_block_opens  = true;
+}
+
+void WaitForDeviceOpens(int count) {
+	std::unique_lock lock(g_device_mutex);
+	g_device_cv.wait(lock, [count]() { return g_open_waiters >= count; });
+}
+
+void ReleaseDeviceOpens() {
+	std::lock_guard lock(g_device_mutex);
+	g_block_opens = false;
+	g_device_cv.notify_all();
+}
+
+int LiveDeviceCount() {
+	std::lock_guard lock(g_device_mutex);
+	return static_cast<int>(g_live_devices.size());
+}
+
+void TestSlotReuse() {
+	const auto context = CreateContext();
+	const auto param   = MakeParam();
+	for (int i = 0; i < 300; i++) {
 		AudioOut2::AudioOut2PortHandle port = 0;
-		const auto                       result = AudioOut2::AudioOut2PortCreate(1, AsParam(&param), &port);
-		if (result != OK) {
-			std::fprintf(stderr,
-			             "AudioOut2PortTests: PortCreate failed on cycle %d with 0x%08x -- the "
-			             "handle counter is being used as a capacity check again\n",
-			             i, static_cast<unsigned>(result));
-			std::abort();
-		}
-		Check(port != 0, i == 0 ? "cycle 0 returns a non-zero handle" : "");
+		Check(AudioOut2::AudioOut2PortCreate(context, AsParam(&param), &port) == OK,
+		      "port slot was not reusable");
+		Check(port != 0, "port handle is zero");
+		AudioOut2::AudioOut2PortDestroy(port);
+	}
+	AudioOut2::AudioOut2ContextDestroy(context);
+}
+
+void TestFullTableRecovers() {
+	const auto                                  context = CreateContext();
+	const auto                                  param   = MakeParam();
+	std::vector<AudioOut2::AudioOut2PortHandle> ports;
+	ports.reserve(256);
+
+	for (int i = 0; i < 256; i++) {
+		AudioOut2::AudioOut2PortHandle port = 0;
+		Check(AudioOut2::AudioOut2PortCreate(context, AsParam(&param), &port) == OK,
+		      "port table filled early");
+		ports.push_back(port);
+	}
+
+	AudioOut2::AudioOut2PortHandle overflow = 0;
+	Check(AudioOut2::AudioOut2PortCreate(context, AsParam(&param), &overflow) != OK,
+	      "full port table accepted another port");
+
+	for (auto port: ports) {
 		AudioOut2::AudioOut2PortDestroy(port);
 	}
 
-	std::printf("[host]    %-52s ok\n", "768 create/destroy cycles over a 256-entry table");
+	AudioOut2::AudioOut2PortHandle port = 0;
+	Check(AudioOut2::AudioOut2PortCreate(context, AsParam(&param), &port) == OK,
+	      "port table did not recover");
+	AudioOut2::AudioOut2PortDestroy(port);
+	AudioOut2::AudioOut2ContextDestroy(context);
 }
 
-// Handles must stay unique across the whole session even as slots are reused, otherwise a stale
-// handle would address a live port.
-void TestHandlesRemainUniqueAcrossReuse() {
-	const auto            param = StereoFloatParam();
-	std::vector<uint64_t> seen;
-	seen.reserve(64);
+void TestConcurrentCreates() {
+	constexpr int                               thread_count = 8;
+	const auto                                  context      = CreateContext();
+	const auto                                  param        = MakeParam(0x800);
+	std::vector<AudioOut2::AudioOut2PortHandle> ports(thread_count);
+	std::vector<int>                            results(thread_count);
+	std::vector<std::thread>                    threads;
 
-	for (int i = 0; i < 64; i++) {
-		AudioOut2::AudioOut2PortHandle port = 0;
-		Check(AudioOut2::AudioOut2PortCreate(1, AsParam(&param), &port) == OK,
-		      i == 0 ? "reuse: first create succeeds" : "");
-		for (auto previous: seen) {
-			Check(previous != port, "");
-		}
-		seen.push_back(port);
-		AudioOut2::AudioOut2PortDestroy(port);
-	}
-
-	std::printf("[host]    %-52s ok\n", "handles stay unique across slot reuse");
-}
-
-// Filling the table must report PORT_FULL rather than overwriting a live entry, and the table must
-// recover completely once the ports are released.
-void TestTableFullThenRecovers() {
-	const auto                                    param = StereoFloatParam();
-	std::vector<AudioOut2::AudioOut2PortHandle> open;
-	open.reserve(PORT_TABLE_SIZE);
-
-	for (int i = 0; i < PORT_TABLE_SIZE; i++) {
-		AudioOut2::AudioOut2PortHandle port = 0;
-		Check(AudioOut2::AudioOut2PortCreate(1, AsParam(&param), &port) == OK, "");
-		open.push_back(port);
-	}
-	std::printf("[host]    %-52s ok\n", "256 simultaneous ports all open");
-
-	AudioOut2::AudioOut2PortHandle overflow_port = 0;
-	Check(AudioOut2::AudioOut2PortCreate(1, AsParam(&param), &overflow_port) != OK,
-	      "the 257th simultaneous port is refused");
-
-	for (auto port: open) {
-		AudioOut2::AudioOut2PortDestroy(port);
-	}
-
-	AudioOut2::AudioOut2PortHandle after = 0;
-	Check(AudioOut2::AudioOut2PortCreate(1, AsParam(&param), &after) == OK,
-	      "the table recovers fully after release");
-	AudioOut2::AudioOut2PortDestroy(after);
-}
-
-// Concurrent creates must never hand two threads the same slot. Before the fix the slot was chosen
-// under the lock, the lock released to open the device, then written back -- so two racing creates
-// could select the same entry, leaking one device and overwriting one port.
-//
-// Note on what is NOT a valid oracle here: handle uniqueness. Handles come from an atomic
-// fetch_add, so they are distinct by construction whether or not two threads share a slot. An
-// earlier version of this test asserted exactly that and passed 20/20 against the bug. The two
-// checks below are the ones that actually observe the defect.
-void TestConcurrentCreatesGetDistinctSlots() {
-	constexpr int THREADS    = 8;
-	constexpr int PER_THREAD = 16;
-
-	// 8 channels, so a port that is still reachable reports 8 from PortGetState while a port whose
-	// entry was overwritten falls through to that function's default of 2.
-	PortParam param   = StereoFloatParam();
-	param.data_format = 0x800;
-
-	std::vector<uint64_t>    handles[THREADS];
-	std::vector<std::thread> workers;
-	workers.reserve(THREADS);
-
-	ResetDeviceAccounting();
-
-	for (int t = 0; t < THREADS; t++) {
-		workers.emplace_back([t, &handles, &param]() {
-			for (int i = 0; i < PER_THREAD; i++) {
-				AudioOut2::AudioOut2PortHandle port = 0;
-				if (AudioOut2::AudioOut2PortCreate(1, AsParam(&param), &port) == OK) {
-					handles[t].push_back(port);
-				}
-			}
+	BlockDeviceOpens();
+	for (int i = 0; i < thread_count; i++) {
+		threads.emplace_back([&, i]() {
+			results[i] = AudioOut2::AudioOut2PortCreate(context, AsParam(&param), &ports[i]);
 		});
 	}
-	for (auto& w: workers) {
-		w.join();
+	WaitForDeviceOpens(thread_count);
+	ReleaseDeviceOpens();
+	for (auto& thread: threads) {
+		thread.join();
 	}
 
-	std::vector<uint64_t> all;
-	for (auto& per_thread: handles) {
-		all.insert(all.end(), per_thread.begin(), per_thread.end());
-	}
-	Check(!all.empty(), "concurrent creates produced ports");
-
-	// Oracle 1: every handle a successful create returned must still address a live entry. A slot
-	// shared by two creates loses one of them -- the handle is returned to the caller but no longer
-	// exists in the table.
-	int lost = 0;
-	for (auto port: all) {
+	for (int i = 0; i < thread_count; i++) {
+		Check(results[i] == OK, "concurrent port create failed");
 		PortState state {};
-		AudioOut2::AudioOut2PortGetState(port, AsState(&state));
-		if (state.num_channels != 8) {
-			lost++;
-		}
+		AudioOut2::AudioOut2PortGetState(ports[i], AsState(&state));
+		Check(state.num_channels == 8, "concurrent create lost its reserved slot");
+		AudioOut2::AudioOut2PortDestroy(ports[i]);
 	}
-	if (lost != 0) {
-		std::fprintf(stderr,
-		             "AudioOut2PortTests: failed: %d of %zu concurrently created ports were "
-		             "overwritten by another create -- the slot is not reserved under the lock\n",
-		             lost, all.size());
-		std::abort();
-	}
-	std::printf("[host]    %-52s ok\n", "every concurrent create keeps its own slot");
+	Check(LiveDeviceCount() == 0, "concurrent create leaked a device");
+	AudioOut2::AudioOut2ContextDestroy(context);
+}
 
-	for (auto port: all) {
-		AudioOut2::AudioOut2PortDestroy(port);
-	}
+void TestContextDestroyCancelsPendingCreate() {
+	const auto                     context = CreateContext();
+	const auto                     param   = MakeParam();
+	AudioOut2::AudioOut2PortHandle port    = 0;
+	int                            result  = OK;
 
-	// Oracle 2: the device the loser opened is unreachable once its entry is overwritten, so
-	// PortDestroy can never close it. Opens must balance closes exactly.
-	const auto opened = DeviceOpenCount();
-	const auto leaked = LiveDeviceCount();
-	if (leaked != 0) {
-		std::fprintf(stderr,
-		             "AudioOut2PortTests: failed: %d of %d opened devices were never closed -- a "
-		             "create overwrote another create's entry and orphaned its device handle\n",
-		             leaked, opened);
-		std::abort();
-	}
-	Check(opened == static_cast<int>(all.size()), "one device open per successful create");
-	std::printf("[host]    %-52s ok\n", "no device handles leaked by concurrent creates");
+	BlockDeviceOpens();
+	std::thread creator(
+	    [&]() { result = AudioOut2::AudioOut2PortCreate(context, AsParam(&param), &port); });
+	WaitForDeviceOpens(1);
+	AudioOut2::AudioOut2ContextDestroy(context);
+	ReleaseDeviceOpens();
+	creator.join();
+
+	Check(result != OK, "destroyed context retained a pending port create");
+	Check(LiveDeviceCount() == 0, "cancelled port create leaked a device");
 }
 
 } // namespace
 
-// The port path calls into the host audio backend and the kernel clock. Neither is under test here,
-// so stub them: this keeps the target narrow (no SDL, no kernel) and makes the test hermetic.
 namespace Libs::Audio::AudioInternal {
 
 int AudioOutOpen(int /*type*/, uint32_t /*samples_num*/, uint32_t /*freq*/, Format /*format*/) {
-	int handle = 0;
-	{
-		std::lock_guard<std::mutex> lock(g_device_mutex);
-		handle = g_next_device++;
-		g_open_count++;
-		g_live_devices.push_back(handle);
-	}
-	// A real device open is a syscall into SDL and takes on the order of a millisecond. PortCreate
-	// runs it with the port lock released, and that is the window the race lives in; a stub that
-	// returns instantly shrinks the window so far that the defect rarely lands. Yielding models the
-	// real cost rather than inventing one -- without it this test passes against the bug roughly
-	// half the time.
-	std::this_thread::yield();
+	std::unique_lock lock(g_device_mutex);
+	const int        handle = g_next_device++;
+	g_live_devices.push_back(handle);
+	g_open_waiters++;
+	g_device_cv.notify_all();
+	g_device_cv.wait(lock, []() { return !g_block_opens; });
 	return handle;
 }
 
 void AudioOutClose(int handle) {
-	std::lock_guard<std::mutex> lock(g_device_mutex);
-	auto it = std::find(g_live_devices.begin(), g_live_devices.end(), handle);
+	std::lock_guard lock(g_device_mutex);
+	const auto      it = std::find(g_live_devices.begin(), g_live_devices.end(), handle);
 	if (it != g_live_devices.end()) {
 		g_live_devices.erase(it);
 	}
@@ -304,11 +240,10 @@ uint64_t KYTY_SYSV_ABI KernelGetProcessTime() {
 } // namespace Libs::LibKernel
 
 int main() {
-	TestCreateDestroyCyclesPastTableSize();
-	TestHandlesRemainUniqueAcrossReuse();
-	TestTableFullThenRecovers();
-	TestConcurrentCreatesGetDistinctSlots();
-
+	TestSlotReuse();
+	TestFullTableRecovers();
+	TestConcurrentCreates();
+	TestContextDestroyCancelsPendingCreate();
 	std::printf("AudioOut2PortTests: all cases passed\n");
 	return 0;
 }

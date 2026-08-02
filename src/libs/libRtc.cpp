@@ -248,19 +248,11 @@ static int KYTY_SYSV_ABI RtcGetCurrentTick(RtcTick* tick) {
 		return RTC_ERROR_DATETIME_UNINITIALIZED;
 	}
 
-	// Real sceRtcGetCurrentTick is microsecond-resolution, and RtcGetTickResolution() above already
-	// promises the guest 1000000. Building the tick out of DateTime::FromSystemUTC quantised it to
-	// milliseconds, because that path keeps only whole Msec, so consecutive calls inside the same
-	// millisecond returned an identical tick and any guest delta computed from them was exactly
-	// zero. Derive it from a single microsecond reading instead of a calendar round-trip, anchored
-	// on the Unix epoch, so the calendar and sub-second parts cannot disagree at a second boundary.
 	const auto now_us =
 	    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
 	                              std::chrono::system_clock::now().time_since_epoch())
 	                              .count());
-
 	tick->tick = RTC_UNIX_EPOCH_TICKS + now_us;
-
 	return OK;
 }
 

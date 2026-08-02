@@ -313,6 +313,9 @@ function(add_kyty_full_emulator_test target source)
 		target_link_libraries(${target} onecore)
 		add_custom_command(TARGET ${target} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different "${KYTY_THIRD_PARTY_DIR}/winpthread/bin/libwinpthread-1.dll" $<TARGET_FILE_DIR:${target}>/libwinpthread-1.dll)
 	endif()
+	# The macOS x86_64 guest address space needs its .zerofill segments anchored
+	# by linker flags, or the kernel kills the binary on load (posix_spawn EIO).
+	configure_macos_guest_address_space(${target})
 endfunction()
 
 function(configure_macos_guest_address_space target)
@@ -342,6 +345,11 @@ add_executable(page_manager_tests EXCLUDE_FROM_ALL
 	graphics/host_gpu/pageManager.cpp
 )
 target_include_directories(page_manager_tests PRIVATE ${inc_headers})
+
+add_executable(bit_array_tests EXCLUDE_FROM_ALL
+	../tests/BitArrayTests.cpp
+)
+target_include_directories(bit_array_tests PRIVATE ${inc_headers})
 
 add_executable(memory_tracker_tests EXCLUDE_FROM_ALL
 	../tests/MemoryTrackerTests.cpp
@@ -440,7 +448,6 @@ target_sources(shader_recompiler_compute_tests PRIVATE
 add_kyty_full_emulator_test(virtual_memory_allocation_tests ../tests/VirtualMemoryAllocationTests.cpp)
 target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 	KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)
-configure_macos_guest_address_space(virtual_memory_allocation_tests)
 
 # These tests use exceptions.
 if(NOT KYTY_CLANG_CL)
@@ -451,10 +458,15 @@ if(NOT KYTY_CLANG_CL)
 endif()
 
 if(BUILD_TESTING)
+	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
+	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
+	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
+	add_test(NAME shader_stage_runtime COMMAND $<TARGET_FILE:shader_stage_runtime_tests>)
+	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
 	add_test(NAME resource_mutex COMMAND $<TARGET_FILE:resource_mutex_tests>)
 	add_test(NAME event_queue_lifetime COMMAND $<TARGET_FILE:event_queue_lifetime_tests>)
 	add_test(NAME audio_out2_port COMMAND $<TARGET_FILE:audio_out2_port_tests>)
@@ -490,6 +502,22 @@ if(BUILD_TESTING)
 		add_test(NAME buffer_cache_ranges
 			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-range-only)
 	endif()
+
+	add_custom_target(kyty_tests DEPENDS
+		shader_cfg_tests
+		scalar_provenance_tests
+		image_page_table_tests
+		memory_tracker_tests
+		page_manager_tests
+		bit_array_tests
+		shader_vertex_metadata_tests
+		shader_stage_runtime_tests
+		resource_tracking_tests
+		resource_mutex_tests
+		event_queue_lifetime_tests
+		shader_recompiler_compute_tests
+		virtual_memory_allocation_tests
+	)
 endif()
 
 
@@ -523,7 +551,12 @@ set(KYTY_EMULATOR_MAP_LINK_PATH "${CMAKE_CURRENT_BINARY_DIR}/${KYTY_EMULATOR_MAP
 set(KYTY_EMULATOR_PDB_LINK_PATH "${CMAKE_CURRENT_BINARY_DIR}/kyty_emulator.pdb")
 
 if(KYTY_CLANG_CL)
-	set_target_properties(kyty_emulator PROPERTIES LINK_FLAGS "/DYNAMICBASE:NO /DEBUG:FULL /PDB:${KYTY_EMULATOR_PDB_LINK_PATH} /lldmap:${KYTY_EMULATOR_MAP_LINK_PATH}")
+	target_link_options(kyty_emulator PRIVATE
+		"/DYNAMICBASE:NO"
+		"/DEBUG:FULL"
+		"/PDB:${KYTY_EMULATOR_PDB_LINK_PATH}"
+		"/lldmap:${KYTY_EMULATOR_MAP_LINK_PATH}"
+	)
 	add_custom_command(TARGET kyty_emulator POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different "${KYTY_THIRD_PARTY_DIR}/winpthread/bin/libwinpthread-1.dll" $<TARGET_FILE_DIR:kyty_emulator>/libwinpthread-1.dll)
 elseif(WIN32 OR LINUX)
 	set_target_properties(kyty_emulator PROPERTIES LINK_FLAGS "${KYTY_LD_OPTIONS} -Wl,-Map=${KYTY_EMULATOR_MAP_LINK_PATH}")

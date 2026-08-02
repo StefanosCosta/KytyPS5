@@ -1058,6 +1058,76 @@ private:
 		    {HOST_SYSTEM_RESERVED_MIN, HOST_SYSTEM_RESERVED_MAX + 1u},
 		    {HOST_USER_MIN, HOST_USER_MAX + 1u},
 		}};
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+		std::vector<std::pair<uint64_t, uint64_t>> occupied;
+		FILE*                                      maps = fopen("/proc/self/maps", "r");
+		EXIT_IF(maps == nullptr);
+
+		char line[512];
+		while (fgets(line, sizeof(line), maps) != nullptr) {
+			unsigned long long mapping_start = 0;
+			unsigned long long mapping_end   = 0;
+			if (sscanf(line, "%llx-%llx", &mapping_start, &mapping_end) == 2) {
+				occupied.emplace_back(static_cast<uint64_t>(mapping_start),
+				                      static_cast<uint64_t>(mapping_end));
+			}
+		}
+		fclose(maps);
+
+		auto reserve_range = [this](uint64_t start, uint64_t end) {
+			start = AlignUp(start, PageSize());
+			end   = AlignDown(end, PageSize());
+			if (start == 0 || end <= start) {
+				return;
+			}
+
+			const auto size = end - start;
+			int        flags = MAP_PRIVATE | MAP_ANON | MAP_NORESERVE;
+#if defined(KYTY_LINKED_GUEST_ADDRESS_SPACE)
+			flags |= MAP_FIXED;
+#elif defined(MAP_FIXED_NOREPLACE)
+			flags |= MAP_FIXED_NOREPLACE;
+#endif
+
+			void* ptr = mmap(reinterpret_cast<void*>(start), size, PROT_NONE, flags, -1, 0);
+			if (ptr == MAP_FAILED || reinterpret_cast<uint64_t>(ptr) != start) {
+				if (ptr != MAP_FAILED) {
+					munmap(ptr, size);
+				}
+				return;
+			}
+
+			AddFreeUnlocked(start, size);
+			m_owned.emplace_back(start, size);
+		};
+
+		for (const auto& [region_start, region_end]: regions) {
+			auto current = region_start;
+
+			for (const auto& [mapping_start, mapping_end]: occupied) {
+				if (mapping_end <= current) {
+					continue;
+				}
+				if (mapping_start >= region_end) {
+					break;
+				}
+
+				if (mapping_start > current) {
+					reserve_range(current, std::min(mapping_start, region_end));
+				}
+
+				current = std::max(current, mapping_end);
+				if (current >= region_end) {
+					break;
+				}
+			}
+
+			if (current < region_end) {
+				reserve_range(current, region_end);
+			}
+		}
+#else
 		for (const auto& [start, end]: regions) {
 			int flags = MAP_PRIVATE | MAP_ANON | MAP_NORESERVE;
 #if defined(KYTY_LINKED_GUEST_ADDRESS_SPACE)
@@ -1070,13 +1140,14 @@ private:
 				if (ptr != MAP_FAILED) {
 					munmap(ptr, end - start);
 				}
-				EXIT("failed to reserve guest address space at 0x%016" PRIx64 ", size 0x%016" PRIx64
-				     "\n",
+				EXIT("failed to reserve guest address space at 0x%016" PRIx64
+				     ", size 0x%016" PRIx64 "\n",
 				     start, end - start);
 			}
 			AddFreeUnlocked(start, end - start);
 			m_owned.emplace_back(start, end - start);
 		}
+#endif
 #endif
 	}
 

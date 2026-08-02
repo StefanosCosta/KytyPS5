@@ -18,8 +18,7 @@ namespace Libs::Graphics {
 
 class MemoryTracker final {
 public:
-	explicit MemoryTracker(PageManager&  page_manager,
-	                       PageWatchMode gpu_watch_mode = PageWatchMode::ReadWrite);
+	explicit MemoryTracker(PageManager& page_manager);
 	~MemoryTracker();
 
 	KYTY_CLASS_NO_COPY(MemoryTracker);
@@ -56,9 +55,8 @@ public:
 			}
 			Iterate<false>(vaddr, size,
 			               [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-				               const auto changed = manager->ChangeState<DirtySource::Cpu, true>(
+				               manager->ChangeState<DirtySource::Cpu, true>(
 				                   manager->GetCpuAddr() + offset, bytes);
-				               manager->ApplyProtection(changed, false);
 			               });
 			return false;
 		};
@@ -71,10 +69,15 @@ public:
 			EXIT("memory invalidation retained GPU-owned pages\n");
 		}
 	}
+#if KYTY_BUILD == KYTY_BUILD_DEBUG
 	void ValidateGpuDirtyPages(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
 	                           const char* operation) const noexcept;
 	void ValidateGpuDirtyOwnership(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
 	                               const char* operation);
+#else
+	void ValidateGpuDirtyPages(const RangeSet&, uint64_t, uint64_t, const char*) const noexcept {}
+	void ValidateGpuDirtyOwnership(const RangeSet&, uint64_t, uint64_t, const char*) {}
+#endif
 
 	template <bool clear, typename Preflight, typename Func>
 	void ForEachDownloadRange(uint64_t vaddr, uint64_t size, Preflight&& preflight, Func&& func) {
@@ -104,10 +107,8 @@ public:
 			Iterate<false>(vaddr, size,
 			               [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 				               const auto address = manager->GetCpuAddr() + offset;
-				               const auto changed =
-				                   manager->template ForEachModifiedRange<DirtySource::Gpu, true>(
-				                       address, bytes, [](uint64_t, uint64_t) noexcept {});
-				               manager->ApplyGpuProtection(changed, false, m_gpu_watch_mode);
+				               manager->template ForEachModifiedRange<DirtySource::Gpu, true>(
+				                   address, bytes, [](uint64_t, uint64_t) noexcept {});
 			               });
 		}
 	}
@@ -137,13 +138,12 @@ public:
 		});
 		upload_func();
 		if (is_written) {
-			Iterate<false>(
-			    vaddr, size, [this](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-				    const auto changed = manager->template ChangeState<DirtySource::Gpu, true>(
-				        manager->GetCpuAddr() + offset, bytes);
-				    manager->ApplyGpuProtection(changed, true, m_gpu_watch_mode);
-				    manager->lock.unlock();
-			    });
+			Iterate<false>(vaddr, size,
+			               [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+				               manager->template ChangeState<DirtySource::Gpu, true>(
+				                   manager->GetCpuAddr() + offset, bytes);
+				               manager->lock.unlock();
+			               });
 		}
 		s_upload_owner = previous_upload_owner;
 	}
@@ -197,7 +197,6 @@ private:
 	std::mutex                                     m_region_mutex;
 	std::mutex                                     m_access_mutex;
 	PageManager&                                   m_page_manager;
-	PageWatchMode                                  m_gpu_watch_mode = PageWatchMode::ReadWrite;
 };
 
 } // namespace Libs::Graphics

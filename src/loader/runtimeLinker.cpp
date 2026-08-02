@@ -39,7 +39,10 @@
 #include <windows.h>
 #else
 #include <dlfcn.h>
-#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 #include <sys/uio.h>
 #include <unistd.h>
 #endif
@@ -146,7 +149,7 @@ static bool PatchGuestMemory64(uint64_t vaddr, uint64_t value) {
 }
 
 static uint64_t AllocateUnresolvedImportThunk(uint64_t record_id) {
-	constexpr uint64_t thunk_size = 165; // +3 for the xmm0 clear on the fall-through path
+	constexpr uint64_t thunk_size = 165;
 
 	if (g_unresolved_stub_thunk_pages.empty() ||
 	    g_unresolved_stub_thunk_offset + thunk_size > UNRESOLVED_STUB_PAGE_SIZE) {
@@ -252,16 +255,10 @@ static uint64_t AllocateUnresolvedImportThunk(uint64_t record_id) {
 	emit(0x41);
 	emit(0xff);
 	emit(0xe3); // jmp r11
-
-	// Fall-through: the import really is unresolved and we return 0. The xmm restore above put the
-	// *caller's* xmm0 back, so without this an unresolved import whose real signature returns
-	// float/double handed the guest whatever it happened to pass in its first FP argument --
-	// arbitrary, and on an audio thread plausibly a NaN that then propagates into DSP state.
-	// Return 0.0 instead, to match the integer return already being zeroed below.
+	// Match the integer fallback for floating-point return values.
 	emit(0x0f);
 	emit(0x57);
 	emit(0xc0); // xorps xmm0, xmm0
-
 	emit(0x31);
 	emit(0xc0); // xor eax, eax
 	emit(0xc3); // ret
@@ -748,7 +745,26 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 		}
 		current = std::min(region_end, end);
 	}
-#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+#elif defined(__APPLE__)
+	// Walk the Mach regions covering the range and require read permission. The fatal
+	// report dumps memory behind raw register values, and a fault inside the reporter
+	// re-enters the signal handler and wedges the reporting thread.
+	uint64_t current = addr;
+	while (current < end) {
+		mach_vm_address_t              region_addr = current;
+		mach_vm_size_t                 region_size = 0;
+		vm_region_basic_info_data_64_t info {};
+		mach_msg_type_number_t         count       = VM_REGION_BASIC_INFO_COUNT_64;
+		mach_port_t                    object_name = MACH_PORT_NULL;
+		if (mach_vm_region(mach_task_self(), &region_addr, &region_size, VM_REGION_BASIC_INFO_64,
+		                   reinterpret_cast<vm_region_info_t>(&info), &count,
+		                   &object_name) != KERN_SUCCESS ||
+		    region_addr > current || (info.protection & VM_PROT_READ) == 0) {
+			return false;
+		}
+		current = region_addr + region_size;
+	}
+#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	const auto page_size = static_cast<uint64_t>(sysconf(_SC_PAGESIZE));
 	if (page_size == 0) {
 		return false;
@@ -778,7 +794,7 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 }
 
 static bool IsDumpableRange(uint64_t addr, uint64_t size) {
-#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	return IsReadableRange(addr, size);
 #else
 	(void)size;
@@ -1006,7 +1022,6 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		dump_guest_qwords("guest r13", info->r13);
 		dump_guest_qwords("guest r14", info->r14);
 		dump_guest_qwords("guest r15", info->r15);
-
 
 		EXIT("Access violation: %s [%016" PRIx64 "] %s\n",
 		     Common::EnumName(info->access_violation_type).c_str(), info->access_violation_vaddr,

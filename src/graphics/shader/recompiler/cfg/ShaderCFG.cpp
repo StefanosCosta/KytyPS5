@@ -871,19 +871,19 @@ std::vector<uint32_t> DominatedBlocks(const Graph& graph, uint32_t header,
 	return blocks;
 }
 
-uint32_t AppendSyntheticMergeBlock(Graph& graph, uint32_t old_merge) {
-	const auto* merge = graph.FindBlock(old_merge);
+uint32_t AppendSyntheticBranchBlock(Graph& graph, uint32_t target) {
+	const auto* target_block = graph.FindBlock(target);
 
 	BasicBlock block;
 	block.id                    = static_cast<uint32_t>(graph.blocks.size());
-	block.start_pc              = merge != nullptr ? merge->start_pc : 0u;
+	block.start_pc              = target_block != nullptr ? target_block->start_pc : 0u;
 	block.end_pc                = block.start_pc;
-	block.inst_begin            = merge != nullptr ? merge->inst_begin : 0u;
+	block.inst_begin            = target_block != nullptr ? target_block->inst_begin : 0u;
 	block.inst_end              = block.inst_begin;
-	block.successors            = {old_merge};
+	block.successors            = {target};
 	block.terminator.kind       = TerminatorKind::Branch;
 	block.terminator.condition  = BranchCondition::Always;
-	block.terminator.true_block = old_merge;
+	block.terminator.true_block = target;
 	graph.blocks.push_back(std::move(block));
 	return graph.blocks.back().id;
 }
@@ -897,19 +897,128 @@ bool IsSyntheticMergeForwarder(const Graph& graph, uint32_t block_id, uint32_t m
 	       block->terminator.true_block == merge;
 }
 
-bool IsInsideLoopConstruct(const Graph& graph, const NaturalLoop& loop, uint32_t block_id) {
-	return block_id != UINT32_MAX && block_id != loop.merge && block_id != loop.continue_block &&
-	       graph.Dominates(loop.header, block_id) &&
-	       (loop.merge == UINT32_MAX || !graph.Dominates(loop.merge, block_id));
+const NaturalLoop* FindInnermostContainingLoop(const Graph& graph, uint32_t block_id) {
+	const NaturalLoop* innermost = nullptr;
+	for (const auto& loop: graph.natural_loops) {
+		if (Contains(loop.body_blocks, block_id) &&
+		    (innermost == nullptr || loop.body_blocks.size() < innermost->body_blocks.size())) {
+			innermost = &loop;
+		}
+	}
+	return innermost;
 }
 
-bool SelectionMergeLeavesContainingLoop(const Graph& graph, uint32_t header, uint32_t merge) {
+bool IsInsideLoopConstruct(const Graph& graph, const NaturalLoop& loop, uint32_t block_id) {
+	return block_id != UINT32_MAX && block_id != loop.merge && block_id != loop.continue_block &&
+	       graph.Dominates(loop.header, block_id) && !graph.Dominates(loop.merge, block_id);
+}
+
+bool IsInnermostLoopControlConditional(const Graph& graph, const BasicBlock& block) {
+	if (block.terminator.kind != TerminatorKind::ConditionalBranch) {
+		return false;
+	}
+	const auto* loop = FindInnermostContainingLoop(graph, block.id);
+	if (loop == nullptr || loop->merge == UINT32_MAX || loop->continue_block == UINT32_MAX) {
+		return false;
+	}
+	const auto true_target  = block.terminator.true_block;
+	const auto false_target = block.terminator.false_block;
+	if (block.id == loop->continue_block) {
+		const auto is_repeat_target = [&](uint32_t target) {
+			return target == loop->header || target == loop->merge;
+		};
+		return is_repeat_target(true_target) && is_repeat_target(false_target);
+	}
+	const auto is_control_target = [&](uint32_t target) {
+		return target == loop->merge || target == loop->continue_block;
+	};
+	return (is_control_target(true_target) &&
+	        (is_control_target(false_target) ||
+	         IsInsideLoopConstruct(graph, *loop, false_target))) ||
+	       (is_control_target(false_target) && IsInsideLoopConstruct(graph, *loop, true_target));
+}
+
+bool MergeLeavesContainingLoop(const Graph& graph, uint32_t header, uint32_t merge) {
 	for (const auto& loop: graph.natural_loops) {
-		if (IsInsideLoopConstruct(graph, loop, header) &&
+		if (loop.header != header && IsInsideLoopConstruct(graph, loop, header) &&
 		    !IsInsideLoopConstruct(graph, loop, merge)) {
 			return true;
 		}
 	}
+	return false;
+}
+
+bool CanonicalizeNaturalLoops(Graph& graph, std::string* error) {
+	const auto rewrite_budget = graph.blocks.size() * 2u + 16u;
+	for (size_t rewrite = 0; rewrite < rewrite_budget; rewrite++) {
+		bool changed = false;
+		for (const auto& loop: graph.natural_loops) {
+			std::vector<uint32_t> latches;
+			for (const auto& edge: graph.back_edges) {
+				if (edge.to == loop.header) {
+					AddUnique(latches, edge.from);
+				}
+			}
+			if (latches.size() <= 1u) {
+				continue;
+			}
+
+			const auto continue_block = AppendSyntheticBranchBlock(graph, loop.header);
+			for (auto latch: latches) {
+				auto* block = graph.FindBlock(latch);
+				if (block != nullptr) {
+					ReplaceValue(block->successors, loop.header, continue_block);
+					ReplaceTerminatorTarget(block->terminator, loop.header, continue_block);
+				}
+			}
+			RebuildPredecessors(graph);
+			RecomputeAnalyses(graph);
+			changed = true;
+			break;
+		}
+		if (changed) {
+			continue;
+		}
+
+		for (const auto& loop: graph.natural_loops) {
+			const auto* header                 = graph.FindBlock(loop.header);
+			const auto  is_loop_control_target = [&](uint32_t target) {
+				return target == loop.merge || target == loop.continue_block;
+			};
+			if (header == nullptr || header->terminator.kind != TerminatorKind::ConditionalBranch ||
+			    is_loop_control_target(header->terminator.true_block) ||
+			    is_loop_control_target(header->terminator.false_block) ||
+			    !Contains(loop.body_blocks, header->terminator.true_block) ||
+			    !Contains(loop.body_blocks, header->terminator.false_block)) {
+				continue;
+			}
+
+			const auto old_header   = loop.header;
+			const auto predecessors = header->predecessors;
+			const auto new_header   = AppendSyntheticBranchBlock(graph, old_header);
+			for (auto pred: predecessors) {
+				auto* block = graph.FindBlock(pred);
+				if (block != nullptr) {
+					ReplaceValue(block->successors, old_header, new_header);
+					ReplaceTerminatorTarget(block->terminator, old_header, new_header);
+				}
+			}
+			if (graph.entry_block == old_header) {
+				graph.entry_block = new_header;
+			}
+			MoveBlockBefore(graph, new_header, old_header);
+			RebuildPredecessors(graph);
+			RecomputeAnalyses(graph);
+			changed = true;
+			break;
+		}
+		if (!changed) {
+			return true;
+		}
+	}
+
+	SetFailure(graph, FailureKind::StructuredControlFlow, graph.entry_block,
+	           "CFG loop canonicalization exceeded rewrite budget", error);
 	return false;
 }
 
@@ -948,7 +1057,7 @@ bool SplitSharedMergeBlock(Graph& graph, uint32_t merge,
 		return false;
 	}
 
-	const auto synthetic_merge = AppendSyntheticMergeBlock(graph, merge);
+	const auto synthetic_merge = AppendSyntheticBranchBlock(graph, merge);
 	auto*      synthetic_block = graph.FindBlock(synthetic_merge);
 	if (synthetic_block != nullptr) {
 		synthetic_block->predecessors = predecessors_to_split;
@@ -980,14 +1089,111 @@ bool SplitSharedMergeBlock(Graph& graph, uint32_t merge,
 bool SplitOneLoopMerge(Graph& graph) {
 	const auto& loops = graph.natural_loops;
 	for (const auto& loop: loops) {
-		if (SplitSharedMergeBlock(graph, loop.merge, loop.body_blocks)) {
+		const auto construct_blocks = DominatedBlocks(graph, loop.header, loop.merge);
+		const auto force_split      = MergeLeavesContainingLoop(graph, loop.header, loop.merge);
+		if (SplitSharedMergeBlock(graph, loop.merge, construct_blocks, force_split)) {
 			return true;
 		}
 	}
 	return false;
 }
 
-bool SplitOneSelectionMerge(Graph& graph) {
+std::vector<uint32_t> SelectionRegion(const Graph& graph, const BasicBlock& header,
+                                      uint32_t merge) {
+	std::vector<uint32_t> region;
+	std::vector<uint32_t> pending = {header.terminator.true_block,
+	                                 header.terminator.false_block};
+	while (!pending.empty()) {
+		const auto block_id = pending.back();
+		pending.pop_back();
+		if (block_id == merge || Contains(region, block_id)) {
+			continue;
+		}
+		const auto* block = graph.FindBlock(block_id);
+		if (block == nullptr) {
+			continue;
+		}
+		AddUnique(region, block_id);
+		pending.insert(pending.end(), block->successors.begin(), block->successors.end());
+	}
+	SortUnique(region);
+	return region;
+}
+
+bool DuplicateSelectionRegion(Graph& graph, uint32_t header_id, uint32_t merge,
+                              const std::vector<uint32_t>& region, uint32_t block_budget) {
+	std::vector<uint32_t> cloned_blocks;
+	for (auto block_id: region) {
+		if (!graph.Dominates(header_id, block_id)) {
+			cloned_blocks.push_back(block_id);
+		}
+	}
+	if (cloned_blocks.empty() || graph.FindBlock(header_id) == nullptr || header_id >= merge ||
+	    graph.blocks.size() + cloned_blocks.size() + 1u > block_budget) {
+		return false;
+	}
+
+	const auto first_clone = static_cast<uint32_t>(graph.blocks.size());
+	std::map<uint32_t, uint32_t> clones;
+	for (uint32_t i = 0; i < cloned_blocks.size(); i++) {
+		clones.emplace(cloned_blocks[i], first_clone + i);
+	}
+
+	for (auto block_id: cloned_blocks) {
+		BasicBlock clone = *graph.FindBlock(block_id);
+		clone.id         = clones.at(block_id);
+		clone.predecessors.clear();
+		clone.dominators.clear();
+		clone.post_dominators.clear();
+		graph.blocks.push_back(std::move(clone));
+	}
+
+	const auto remap_block = [&](BasicBlock& block) {
+		const auto remap_target = [&](uint32_t& target) {
+			if (const auto it = clones.find(target); it != clones.end()) {
+				target = it->second;
+			}
+		};
+		for (auto& successor: block.successors) {
+			remap_target(successor);
+		}
+		remap_target(block.terminator.true_block);
+		remap_target(block.terminator.false_block);
+		remap_target(block.terminator.merge_block);
+		remap_target(block.terminator.continue_block);
+		for (auto& target: block.terminator.indirect_targets) {
+			remap_target(target);
+		}
+	};
+	for (auto block_id: region) {
+		const auto owned_id = clones.contains(block_id) ? clones.at(block_id) : block_id;
+		remap_block(*graph.FindBlock(owned_id));
+	}
+
+	const auto private_merge = AppendSyntheticBranchBlock(graph, merge);
+	auto&      header        = *graph.FindBlock(header_id);
+	remap_block(header);
+
+	for (auto block_id: region) {
+		const auto owned_id = clones.contains(block_id) ? clones.at(block_id) : block_id;
+		auto*      block    = graph.FindBlock(owned_id);
+		if (block != nullptr) {
+			ReplaceValue(block->successors, merge, private_merge);
+			ReplaceTerminatorTarget(block->terminator, merge, private_merge);
+		}
+	}
+	ReplaceValue(header.successors, merge, private_merge);
+	ReplaceTerminatorTarget(header.terminator, merge, private_merge);
+
+	for (uint32_t i = 0; i <= cloned_blocks.size(); i++) {
+		MoveBlockBefore(graph, first_clone + i, merge + i);
+	}
+	RebuildPredecessors(graph);
+	RecomputeAnalyses(graph);
+	return true;
+}
+
+bool SplitOneSelectionMerge(Graph& graph, uint32_t block_budget) {
 	std::vector<uint32_t> loop_headers;
 	loop_headers.reserve(graph.natural_loops.size());
 	for (const auto& loop: graph.natural_loops) {
@@ -1001,11 +1207,26 @@ bool SplitOneSelectionMerge(Graph& graph) {
 		    Contains(loop_headers, block_id)) {
 			continue;
 		}
+		if (IsInnermostLoopControlConditional(graph, *block)) {
+			continue;
+		}
 
 		const auto merge = graph.FindNearestCommonPostDominator(block->terminator.true_block,
 		                                                        block->terminator.false_block);
+		if (merge == UINT32_MAX || graph.FindBlock(merge) == nullptr) {
+			continue;
+		}
+		const auto region = SelectionRegion(graph, *block, merge);
+		if (std::any_of(region.begin(), region.end(),
+		                [&](uint32_t member) { return !graph.Dominates(block_id, member); })) {
+			if (graph.natural_loops.empty() &&
+			    DuplicateSelectionRegion(graph, block_id, merge, region, block_budget)) {
+				return true;
+			}
+			continue;
+		}
 		const auto construct_blocks = DominatedBlocks(graph, block_id, merge);
-		const auto force_split      = SelectionMergeLeavesContainingLoop(graph, block_id, merge);
+		const auto force_split      = MergeLeavesContainingLoop(graph, block_id, merge);
 		if (SplitSharedMergeBlock(graph, merge, construct_blocks, force_split)) {
 			return true;
 		}
@@ -1015,10 +1236,12 @@ bool SplitOneSelectionMerge(Graph& graph) {
 
 bool SplitSharedMergeBlocks(Graph& graph, std::string* error) {
 	const auto original_block_count = static_cast<uint32_t>(graph.blocks.size());
-	const auto split_budget =
-	    std::max<uint32_t>(16u, std::min<uint32_t>(128u, original_block_count));
+	const auto split_budget = std::max<uint32_t>(
+	    16u, std::min<uint32_t>(128u, original_block_count * 4u));
+	const auto block_budget = std::max<uint32_t>(
+	    32u, std::min<uint32_t>(512u, original_block_count * 8u));
 	for (uint32_t splits = 0; splits < split_budget; splits++) {
-		if (!SplitOneLoopMerge(graph) && !SplitOneSelectionMerge(graph)) {
+		if (!SplitOneLoopMerge(graph) && !SplitOneSelectionMerge(graph, block_budget)) {
 			return true;
 		}
 		RebuildPredecessors(graph);
@@ -1353,6 +1576,9 @@ bool Structurize(Graph& graph, std::string* error) {
 		return false;
 	}
 
+	if (!CanonicalizeNaturalLoops(graph, error)) {
+		return false;
+	}
 	if (!SplitSharedMergeBlocks(graph, error)) {
 		return false;
 	}
@@ -1393,6 +1619,9 @@ bool Structurize(Graph& graph, std::string* error) {
 	for (auto& block: graph.blocks) {
 		if (block.terminator.kind != TerminatorKind::ConditionalBranch ||
 		    block.terminator.loop_header) {
+			continue;
+		}
+		if (IsInnermostLoopControlConditional(graph, block)) {
 			continue;
 		}
 

@@ -66,6 +66,10 @@
 
 namespace Libs {
 
+namespace LibcInternalExt {
+void RunThreadAtexitDestructors();
+} // namespace LibcInternalExt
+
 namespace LibKernel {
 
 LIB_NAME("libkernel", "libkernel");
@@ -3386,6 +3390,8 @@ int PthreadGetCurrentPriorityForKernel() {
 static void CleanupThread(void* arg) {
 	auto* thread = static_cast<Pthread>(arg);
 
+	LibcInternalExt::RunThreadAtexitDestructors();
+
 	auto thread_dtors = g_pthread_context->GetThreadDtors();
 
 	if (thread_dtors != nullptr) {
@@ -3940,12 +3946,6 @@ int KYTY_SYSV_ABI KernelGettimeofday(KernelTimeval* tp) {
 	tp->tv_sec  = static_cast<int64_t>(ticks / 1000000);
 	tp->tv_usec = static_cast<int64_t>(ticks % 1000000);
 #else
-	// Real sceKernelGettimeofday is microsecond-resolution. Going through DateTime::FromSystemUTC
-	// truncated it to *milliseconds* (SysGetSystemTimeUtc keeps only whole Msec) and then
-	// round-tripped it through a double of ~1.75e9 seconds. This is the guest's dominant in-game
-	// clock -- Subnautica calls it ~28000 times a second -- so a guest computing a delta from two
-	// calls inside the same millisecond got exactly zero, and any velocity of the form
-	// (delta position / dt) became infinite. Read the host clock directly instead.
 	struct timespec ts {};
 	result = ::clock_gettime(CLOCK_REALTIME, &ts);
 	if (result == 0) {

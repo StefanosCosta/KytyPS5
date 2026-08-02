@@ -1,6 +1,6 @@
 #include "common/assert.h"
-#include "common/hleTrace.h"
 #include "common/common.h"
+#include "common/hleTrace.h"
 #include "common/logging/log.h"
 #include "common/threads.h"
 #include "kernel/pthread.h"
@@ -395,43 +395,6 @@ static AudioOut2PortStateEntry* audioout2_find_port_locked(AudioOut2PortHandle p
 	return nullptr;
 }
 
-static uint32_t audioout2_context_channels(AudioOut2ContextHandle ctx) {
-	uint32_t channels = AUDIO_OUT2_DEFAULT_CHANNELS;
-
-	g_audioout2_context_mutex.Lock();
-	if (auto* state = audioout2_find_context_locked(ctx); state != nullptr && state->channels != 0) {
-		channels = state->channels;
-	}
-	g_audioout2_context_mutex.Unlock();
-
-	return channels;
-}
-
-static uint32_t audioout2_context_frequency(AudioOut2ContextHandle ctx) {
-	uint32_t frequency = AUDIO_OUT2_DEFAULT_FREQUENCY;
-
-	g_audioout2_context_mutex.Lock();
-	if (auto* state = audioout2_find_context_locked(ctx);
-	    state != nullptr && state->frequency != 0) {
-		frequency = state->frequency;
-	}
-	g_audioout2_context_mutex.Unlock();
-
-	return frequency;
-}
-
-static uint32_t audioout2_context_grains(AudioOut2ContextHandle ctx) {
-	uint32_t samples_num = 512;
-
-	g_audioout2_context_mutex.Lock();
-	if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
-		samples_num = (state->num_grains == 0 ? 512u : state->num_grains);
-	}
-	g_audioout2_context_mutex.Unlock();
-
-	return samples_num;
-}
-
 static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool blocking) {
 	std::vector<AudioInternal::OutputParam> params;
 	params.reserve(AudioInternal::OUT_PORTS_MAX);
@@ -559,6 +522,12 @@ int KYTY_SYSV_ABI AudioOut2ContextDestroy(AudioOut2ContextHandle ctx) {
 	PRINT_NAME();
 	LOGF("\t ctx = 0x%016" PRIx64 "\n", ctx);
 
+	g_audioout2_context_mutex.Lock();
+	if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
+		*state = AudioOut2ContextState {};
+	}
+	g_audioout2_context_mutex.Unlock();
+
 	std::array<int, 256> audio_handles {};
 	size_t               audio_handles_num = 0;
 
@@ -576,12 +545,6 @@ int KYTY_SYSV_ABI AudioOut2ContextDestroy(AudioOut2ContextHandle ctx) {
 	for (size_t i = 0; i < audio_handles_num; i++) {
 		audioout2_close_audio_handle(audio_handles[i]);
 	}
-
-	g_audioout2_context_mutex.Lock();
-	if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
-		*state = AudioOut2ContextState {};
-	}
-	g_audioout2_context_mutex.Unlock();
 
 	return OK;
 }
@@ -693,17 +656,32 @@ int KYTY_SYSV_ABI AudioOut2PortCreate(AudioOut2ContextHandle ctx, const AudioOut
 	EXIT_NOT_IMPLEMENTED(params == nullptr);
 	EXIT_NOT_IMPLEMENTED(port == nullptr);
 
-	// next_port is a handle generator, not a capacity counter. It has to keep increasing so handles
-	// stay unique, and PortDestroy deliberately cannot decrement it -- so testing it against the
-	// table size confused "ports ever created" with "ports currently open" and made the 257th
-	// PortCreate of the session fail permanently with all 256 slots free. A title that opens and
-	// closes ports as sounds come and go would simply lose audio partway through, silently.
-	// Capacity is decided solely by whether a slot is free.
 	const auto next_port = g_audioout2_next_port.fetch_add(1, std::memory_order_relaxed);
+	auto       format_match  = AudioOut2FormatMatch::Exact;
+	const auto port_channels = audioout2_data_format_channels(params->data_format);
+	const auto audio_format =
+	    audioout2_resolve_audio_format(params->data_format, port_channels, &format_match);
+	const auto audio_type = audioout2_port_type_to_audio_out_type(params->port_type);
 
-	// Reserve the slot while the lock is held. Selecting it, dropping the lock to open the device,
-	// then writing it back let two concurrent creates pick the same slot -- leaking one SDL device
-	// and overwriting one entry.
+	g_audioout2_context_mutex.Lock();
+	const auto* context_state = audioout2_find_context_locked(ctx);
+	if (context_state == nullptr) {
+		g_audioout2_context_mutex.Unlock();
+		return AUDIO_OUT2_ERROR_INVALID_PARAM;
+	}
+	const auto samples_num = context_state->num_grains == 0 ? 512u : context_state->num_grains;
+	const auto context_channels =
+	    context_state->channels == 0 ? AUDIO_OUT2_DEFAULT_CHANNELS : context_state->channels;
+	const auto context_frequency =
+	    context_state->frequency == 0 ? AUDIO_OUT2_DEFAULT_FREQUENCY : context_state->frequency;
+
+	auto sampling_freq = params->sampling_freq;
+	if (sampling_freq < 8000 || sampling_freq > 192000) {
+		sampling_freq = context_frequency >= 8000 && context_frequency <= 192000
+		                    ? context_frequency
+		                    : AUDIO_OUT2_DEFAULT_FREQUENCY;
+	}
+
 	g_audioout2_port_mutex.Lock();
 	AudioOut2PortStateEntry* port_state = nullptr;
 	for (auto& candidate: g_audioout2_ports) {
@@ -713,34 +691,22 @@ int KYTY_SYSV_ABI AudioOut2PortCreate(AudioOut2ContextHandle ctx, const AudioOut
 		}
 	}
 	if (port_state != nullptr) {
-		*port_state        = AudioOut2PortStateEntry {};
-		port_state->used   = true;
-		port_state->handle = next_port;
+		*port_state               = AudioOut2PortStateEntry {};
+		port_state->used          = true;
+		port_state->handle        = next_port;
+		port_state->context       = ctx;
+		port_state->port_type     = params->port_type;
+		port_state->data_format   = params->data_format;
+		port_state->sampling_freq = sampling_freq;
+		port_state->channels_num  = port_channels;
+		port_state->samples_num   = samples_num;
+		port_state->audio_format  = audio_format;
 	}
 	g_audioout2_port_mutex.Unlock();
+	g_audioout2_context_mutex.Unlock();
 
 	if (port_state == nullptr) {
 		return AUDIO_OUT2_ERROR_PORT_FULL;
-	}
-
-	*port = next_port;
-
-	const auto samples_num      = audioout2_context_grains(ctx);
-	const auto context_channels = audioout2_context_channels(ctx);
-
-	auto       format_match = AudioOut2FormatMatch::Exact;
-	const auto port_channels = audioout2_data_format_channels(params->data_format);
-	const auto audio_format =
-	    audioout2_resolve_audio_format(params->data_format, port_channels, &format_match);
-	const auto audio_type = audioout2_port_type_to_audio_out_type(params->port_type);
-
-	// A guest-supplied rate of 0 divides by zero downstream (audio.cpp block_time), so fall back to
-	// the context's rate and then to the default rather than trusting it.
-	auto sampling_freq = params->sampling_freq;
-	if (sampling_freq < 8000 || sampling_freq > 192000) {
-		const auto fallback = audioout2_context_frequency(ctx);
-		sampling_freq = (fallback >= 8000 && fallback <= 192000 ? fallback
-		                                                       : AUDIO_OUT2_DEFAULT_FREQUENCY);
 	}
 
 	// Report anything we had to approximate. This used to collapse into Format::Unknown and skip the
@@ -777,20 +743,18 @@ int KYTY_SYSV_ABI AudioOut2PortCreate(AudioOut2ContextHandle ctx, const AudioOut
 		    AudioInternal::AudioOutOpen(audio_type, samples_num, sampling_freq, audio_format);
 	}
 
-	// Fill in the slot reserved above. Do not reset it first -- `used` and `handle` were stamped
-	// under the lock at reservation time and are what keeps a concurrent create off this slot.
 	g_audioout2_port_mutex.Lock();
-	port_state->used          = true;
-	port_state->handle        = *port;
-	port_state->context       = ctx;
-	port_state->port_type     = params->port_type;
-	port_state->data_format   = params->data_format;
-	port_state->sampling_freq = sampling_freq;
-	port_state->channels_num  = port_channels;
-	port_state->samples_num   = samples_num;
-	port_state->audio_format  = audio_format;
-	port_state->audio_handle  = audio_handle;
+	const bool reserved = port_state->used && port_state->handle == next_port;
+	if (reserved) {
+		port_state->audio_handle = audio_handle;
+	}
 	g_audioout2_port_mutex.Unlock();
+	if (!reserved) {
+		audioout2_close_audio_handle(audio_handle);
+		return AUDIO_OUT2_ERROR_INVALID_PARAM;
+	}
+
+	*port = next_port;
 
 	// The breadcrumb has to be unconditional: gating it on the log budget made this export invisible
 	// to the HLE trace, and an absent call in that trace was read as "the guest never called it".
