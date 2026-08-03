@@ -30,6 +30,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <fmt/format.h>
 #include <limits>
 #include <span>
@@ -491,6 +492,36 @@ static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::Image
 	return desc;
 }
 
+// Stand-in for a texture the shader depth-compares but whose bound surface cannot be sampled
+// with depth comparison. Keeps the view shape of the texture it replaces so the descriptor still
+// matches what the shader declared, and carries no guest range, so TextureCache::FindImage routes
+// it to the shared null image for that shape.
+static TextureCache::ImageDesc DepthCompareFallbackDesc(const TextureCache::ImageDesc& original) {
+	TextureCache::ImageDesc desc {};
+	desc.info.pixel_format    = vk::Format::eD32Sfloat;
+	desc.info.guest_format    = Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float);
+	desc.info.type            = original.info.type;
+	desc.info.extent          = {1, 1, 1};
+	desc.info.resources       = {1, std::max(original.info.resources.layers, 1u)};
+	desc.info.pitch           = 1;
+	desc.info.bytes_per_block = 4;
+	desc.info.samples         = 1;
+	desc.info.tile_mode       = Prospero::GpuEnumValue(Prospero::TileMode::kLinear);
+	desc.info.mip_layout[0]   = {0, 4, 1, 1};
+	desc.view_info            = original.view_info;
+	desc.view_info.format     = desc.info.pixel_format;
+	desc.view_info.aspect     = vk::ImageAspectFlagBits::eDepth;
+	desc.view_info.usage       = vk::ImageUsageFlagBits::eSampled;
+	desc.view_info.base_level  = 0;
+	desc.view_info.level_count = 1;
+	desc.view_info.base_layer  = 0;
+	desc.view_info.layer_count = desc.info.resources.layers;
+	// A depth view has no channel remapping; the compare result is scalar.
+	desc.view_info.mapping = {};
+	desc.type              = TextureCache::BindingType::Texture;
+	return desc;
+}
+
 static void PopulateTextureMipLayout(ImageInfo& info) {
 	if (info.IsVolume() && info.tile_mode != Prospero::GpuEnumValue(Prospero::TileMode::kLinear)) {
 		TileVolumeLayout volume {};
@@ -728,6 +759,50 @@ RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   reso
 	} else {
 		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
 		                             descriptor.DstSelXYZW());
+	}
+	if (resource.depth_compare && !image->info.IsDepth()) {
+		// The shader depth-compares this texture (image_sample_c), but the guest bound a colour
+		// surface. RDNA 2 allows that -- the hardware compares against the first component of
+		// whatever format is bound -- while Vulkan requires the sampled format to advertise
+		// VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT, so the draw is invalid and
+		// the driver may fault on it. Observed in Unity titles, which bind their 4x4 and 1x1
+		// placeholder textures wherever a shadow map is absent.
+		//
+		// Substitute a depth-comparable stand-in of the same view shape. A genuine shadow map
+		// resolves to a depth image and is not affected, so the hardware comparison path is
+		// untouched for every real depth texture.
+		//
+		// Report it: the stand-in carries no guest data, so a title that depth-compares a
+		// colour surface for its actual contents -- which RDNA 2 permits -- samples nothing
+		// here and renders wrong rather than faulting. That is the right trade against an
+		// invalid draw, but it has to be visible, or the next such title looks like an
+		// unexplained rendering bug. Once per distinct surface shape, and through WriteFatal
+		// because LOGF is suppressed under --printf-direction Silent, which is how regression
+		// runs are made.
+		{
+			static Common::Mutex        report_mutex;
+			static std::vector<uint64_t> reported;
+			const uint64_t              key =
+			    (static_cast<uint64_t>(image->info.pixel_format) << 32u) |
+			    static_cast<uint64_t>(image->info.type);
+
+			Common::LockGuard lock(report_mutex);
+			if (std::find(reported.begin(), reported.end(), key) == reported.end()) {
+				reported.push_back(key);
+				char text[256] = {};
+				std::snprintf(text, sizeof(text),
+				              "Renderer: depth-compare sampling of a non-depth surface "
+				              "(vk_format=%u image_type=%u); binding a depth-comparable "
+				              "stand-in, which samples no guest data\n",
+				              static_cast<uint32_t>(image->info.pixel_format),
+				              static_cast<uint32_t>(image->info.type));
+				Log::WriteFatal(text);
+			}
+		}
+
+		auto fallback = DepthCompareFallbackDesc(desc);
+		auto id       = texture_cache.FindImage(fallback);
+		return {id, nullptr, std::move(fallback)};
 	}
 	return {id, nullptr, std::move(desc)};
 }
