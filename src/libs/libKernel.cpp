@@ -988,16 +988,36 @@ static void HostSignalDispatchHandler(int /*host_signal*/, siginfo_t* /*info*/,
 
 		auto* handler = reinterpret_cast<exception_handler_func_t>(g_exception_handlers[signum]);
 		if (handler != nullptr) {
-			SignalDispatchScope scope;
-			auto                ctx = CreateSignalUcontextFromHost(host_ctx);
-			if (IsGuestCodeAddress(ctx.uc_mcontext.mc_rip)) {
-				handler(signum, &ctx);
-				ApplySignalUcontextToHost(host_ctx, ctx);
-			} else {
-				// Do not expose or restore a host frame.
-				SanitizeNonGuestSignalUcontext(&ctx, current);
-				handler(signum, &ctx);
+			auto ctx = CreateSignalUcontextFromHost(host_ctx);
+			if (Common::ShouldDeferGuestSignal()) {
+				// Parked in a host condition-variable wait, or holding an emulator-global
+				// lock. Running the guest handler here would run it nested inside that
+				// frame, and a handler that blocks (IL2CPP's GC suspend handler waits on an
+				// event flag until the collection ends) then never lets the frame unwind.
+				// For a condvar wait that strands the state the wait holds: glibc keeps a
+				// group reference for the whole of pthread_cond_wait, and a stranded one
+				// makes every later broadcast on that variable block forever, deadlocking
+				// every thread using it.
+				//
+				// Leave the signal pending instead. Both frames have a guaranteed delivery
+				// point on the way out -- the wait reaches its poll callback, and the
+				// critical section dispatches as it unwinds -- so the signal is delivered
+				// as soon as it is safe to run. Nothing depends on delivery being
+				// synchronous: the sender's WaitForSignalDispatch already gives up after
+				// DISPATCH_WAIT_MAX.
+				//
+				// Scoped to those two frames deliberately. Deferring for any non-guest
+				// instruction pointer looks equivalent but is not: a thread merely passing
+				// through an HLE call has no such delivery point, so its signal sits queued
+				// until some unrelated wait happens to occur. Cat Quest 3 never reaches one
+				// and hangs before its first flip.
+				QueuePendingSignal(current, signum);
+				return;
 			}
+
+			SignalDispatchScope scope;
+			handler(signum, &ctx);
+			ApplySignalUcontextToHost(host_ctx, ctx);
 		}
 		return;
 	}
@@ -1128,6 +1148,19 @@ static bool DispatchSignalWithSuspendedThreadContext(HANDLE target_thread, Pthre
 void KernelDispatchPendingSignalForCurrentThread() {
 	Pthread current = PthreadSelfOrNull();
 	if (current == nullptr) {
+		return;
+	}
+
+	// Called from every wait and sleep exit, so keep the common no-signal case to one load.
+	if (!PthreadHasAnyPendingSignal(current)) {
+		return;
+	}
+
+	// A handler may block for an unbounded time. Running one while this thread holds an
+	// emulator-global lock -- the memory-operation mutex, the GPU submission mutex -- deadlocks
+	// every guest thread that needs it, which is exactly what a stop-the-world collection does.
+	// Leave the signal queued; the next dispatch after the scope unwinds will deliver it.
+	if (Common::InHleCriticalSection()) {
 		return;
 	}
 
