@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "common/dateTime.h"
 #include "common/emulatorConfig.h"
+#include "common/hleTrace.h"
 #include "common/logging/log.h"
 #include "common/singleton.h"
 #include "common/stringUtils.h"
@@ -3373,6 +3374,8 @@ static void* RunThread(void* arg) {
 
 	thread->unique_id = Common::Thread::GetThreadIdUnique();
 
+	Common::HleTrace::NameCurrentThread(thread->name.c_str());
+
 	g_pthread_self = thread;
 
 	uint64_t os_thread_id = 0;
@@ -3778,6 +3781,8 @@ int KYTY_SYSV_ABI PthreadRename(Pthread thread, const char* name) {
 
 	thread->name = std::string(name);
 
+	Common::HleTrace::SetThreadName(thread->unique_id, name);
+
 	return OK;
 }
 
@@ -3829,6 +3834,7 @@ int KYTY_SYSV_ABI KernelClockGetres(KernelClockid clock_id, KernelTimespec* tp) 
 
 int KYTY_SYSV_ABI KernelClockGettime(KernelClockid clock_id, KernelTimespec* tp) {
 	// Called constantly by Python frame/timer code.
+	TRACE_NAME();
 
 	if (tp == nullptr) {
 		return KERNEL_ERROR_EFAULT;
@@ -3860,6 +3866,7 @@ int KYTY_SYSV_ABI KernelClockGettime(KernelClockid clock_id, KernelTimespec* tp)
 
 int KYTY_SYSV_ABI KernelGettimeofday(KernelTimeval* tp) {
 	// PRINT_NAME();
+	TRACE_NAME();
 
 	if (tp == nullptr) {
 		return KERNEL_ERROR_EFAULT;
@@ -3893,6 +3900,7 @@ int KYTY_SYSV_ABI KernelGettimeofday(KernelTimeval* tp) {
 
 int KYTY_SYSV_ABI KernelGettimezone(KernelTimezone* tz) {
 	// Hot path in Unity's time/date code.
+	TRACE_NAME();
 
 	if (tz == nullptr) {
 		return KERNEL_ERROR_EFAULT;
@@ -3980,10 +3988,12 @@ uint64_t KYTY_SYSV_ABI KernelGetTscFrequency() {
 }
 
 uint64_t KYTY_SYSV_ABI KernelReadTsc() {
+	TRACE_NAME();
 	return KernelReadTscNative();
 }
 
 uint64_t KYTY_SYSV_ABI KernelGetProcessTime() {
+	TRACE_NAME();
 	const auto frequency = KernelGetTscFrequencyNative();
 	if (frequency == 0) {
 		return static_cast<uint64_t>(Loader::Timer::GetTimeMs() * 1000.0);
@@ -3995,6 +4005,7 @@ uint64_t KYTY_SYSV_ABI KernelGetProcessTime() {
 }
 
 uint64_t KYTY_SYSV_ABI KernelGetProcessTimeCounter() {
+	TRACE_NAME();
 	return KernelGetElapsedTsc();
 }
 
@@ -4013,6 +4024,7 @@ void KYTY_SYSV_ABI KernelSetThreadDtors(thread_dtors_func_t dtors) {
 }
 
 int KYTY_SYSV_ABI KernelUsleep(KernelUseconds microseconds) {
+	TRACE_NAME();
 	Common::Timer t;
 	t.Start();
 	SleepMicroWithSignalPoll(microseconds);

@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "common/hleTrace.h"
 #include "common/common.h"
 #include "common/logging/log.h"
 #include "common/threads.h"
@@ -480,6 +481,7 @@ int KYTY_SYSV_ABI AudioOut2ContextSetAttributes(AudioOut2ContextHandle    ctx,
 }
 
 int KYTY_SYSV_ABI AudioOut2ContextAdvance(AudioOut2ContextHandle ctx) {
+	TRACE_NAME();
 	g_audioout2_context_mutex.Lock();
 	if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
 		audioout2_update_context_locked(state);
@@ -490,6 +492,7 @@ int KYTY_SYSV_ABI AudioOut2ContextAdvance(AudioOut2ContextHandle ctx) {
 }
 
 int KYTY_SYSV_ABI AudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t blocking) {
+	TRACE_NAME();
 	uint32_t sleep_micros = audioout2_grain_micros(512);
 
 	for (;;) {
@@ -519,6 +522,7 @@ int KYTY_SYSV_ABI AudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t bloc
 
 int KYTY_SYSV_ABI AudioOut2ContextGetQueueLevel(AudioOut2ContextHandle ctx, uint32_t* queue_level,
                                                 uint32_t* available_queues) {
+	TRACE_NAME();
 	if (queue_level != nullptr) {
 		*queue_level = 0;
 	}
@@ -606,6 +610,10 @@ int KYTY_SYSV_ABI AudioOut2PortCreate(AudioOut2ContextHandle ctx, const AudioOut
 
 	*port = next_port;
 
+	// The breadcrumb has to be unconditional: gating it on the log budget made this export invisible
+	// to the HLE trace, and an absent call in that trace was read as "the guest never called it".
+	TRACE_NAME();
+
 	if (next_port <= 16 || (next_port % 600) == 0) {
 		PRINT_NAME();
 		LOGF("\t ctx           = 0x%016" PRIx64 "\n"
@@ -638,6 +646,7 @@ int KYTY_SYSV_ABI AudioOut2PortDestroy(AudioOut2PortHandle port) {
 
 int KYTY_SYSV_ABI AudioOut2PortSetAttributes(AudioOut2PortHandle       port,
                                              const AudioOut2Attribute* attributes, uint32_t num) {
+	PRINT_NAME();
 	EXIT_NOT_IMPLEMENTED(num != 0 && attributes == nullptr);
 
 	const void* pcm_data = nullptr;
@@ -819,6 +828,7 @@ int KYTY_SYSV_ABI AudioOut2GetSpeakerArrayAmbisonicsCoefficients(AudioOut2Speake
 }
 
 int KYTY_SYSV_ABI AudioOut2GetSpeakerInfo(AudioOut2SpeakerInfo* info, uint32_t flags) {
+	PRINT_NAME();
 	EXIT_NOT_IMPLEMENTED(info == nullptr);
 	std::memset(info, 0, sizeof(AudioOut2SpeakerInfo));
 	info->type             = 0;
