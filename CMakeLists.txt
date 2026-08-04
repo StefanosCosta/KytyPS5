@@ -33,6 +33,7 @@ include("${KYTY_SOURCE_DIR}/utils.cmake")
 include(CTest)
 
 option(KYTY_ENABLE_CLANG_TIDY "Run clang-tidy checks during builds" OFF)
+option(KYTY_ENABLE_HLE_TRACE "Instrument HLE calls with a guest-stall watchdog (diagnostic)" OFF)
 
 set(KYTY_BUILD_ORIGIN "Source" CACHE STRING "Build provenance shown in diagnostics")
 set_property(CACHE KYTY_BUILD_ORIGIN PROPERTY STRINGS Source Official Fork)
