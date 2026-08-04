@@ -429,6 +429,15 @@ bool CondVar::WaitFor(Mutex* mutex, uint32_t micros) {
 #else
 	ok = (m_cond_var->m_cv.wait_for(cpp_lock, std::chrono::microseconds(micros)) ==
 	      std::cv_status::no_timeout);
+	// Wait() polls through its 10 ms timeout and dispatches on each round, but this one can be
+	// given an arbitrarily long timeout, so a guest signal left pending by the host signal handler
+	// would sit here undelivered for all of it. Dispatch with the guest mutex released, as Wait()
+	// does: a handler that blocks must not do so holding a lock the guest also uses.
+	if (auto* callback = g_cond_wait_poll_callback; callback != nullptr) {
+		cpp_lock.unlock();
+		callback();
+		cpp_lock.lock();
+	}
 	cpp_lock.release();
 #endif
 	UnregisterCondWaiter(m_cond_var.get());
