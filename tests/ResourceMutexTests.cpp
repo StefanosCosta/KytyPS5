@@ -45,6 +45,53 @@ void TestOwnership() {
 	Check(!mutex.IsOwnedByCurrentThread(), "owner tracking survived unlock");
 }
 
+// Ownership is recorded as a bare thread id, so the risk is a thread mistaking someone else's
+// ownership for its own -- which would let a recursive-acquisition check pass when it should abort,
+// or a release-without-ownership check miss. Assert from a second thread, both while the lock is
+// held elsewhere and while it is free.
+void TestOwnershipIsPerThread() {
+	ResourceMutex    mutex;
+	std::atomic_bool observed_while_held {true};
+	std::atomic_bool observed_while_free {true};
+
+	{
+		std::lock_guard lock(mutex);
+		Check(mutex.IsOwnedByCurrentThread(), "holder did not see itself as owner");
+		std::thread observer(
+		    [&] { observed_while_held.store(mutex.IsOwnedByCurrentThread(), std::memory_order_release); });
+		observer.join();
+	}
+	std::thread observer([&] {
+		observed_while_free.store(mutex.IsOwnedByCurrentThread(), std::memory_order_release);
+	});
+	observer.join();
+
+	Check(!observed_while_held.load(std::memory_order_acquire),
+	      "a non-owning thread claimed ownership of a held transaction");
+	Check(!observed_while_free.load(std::memory_order_acquire),
+	      "a thread claimed ownership of a free transaction");
+}
+
+// A thread id must not be mistaken for another's after threads come and go. Repeated acquire/release
+// across many short-lived threads is where a stale or recycled owner would surface.
+void TestOwnershipAcrossThreadChurn() {
+	ResourceMutex mutex;
+	for (int i = 0; i < 200; i++) {
+		std::atomic_bool ok {false};
+		std::thread      worker([&] {
+			Check(!mutex.IsOwnedByCurrentThread(), "fresh thread inherited ownership");
+			{
+				std::lock_guard lock(mutex);
+				ok.store(mutex.IsOwnedByCurrentThread(), std::memory_order_release);
+			}
+			Check(!mutex.IsOwnedByCurrentThread(), "ownership survived unlock on a worker");
+		});
+		worker.join();
+		Check(ok.load(std::memory_order_acquire), "worker did not take ownership");
+		Check(!mutex.IsOwnedByCurrentThread(), "main thread inherited a retired thread's ownership");
+	}
+}
+
 void TestSerializesTransactions() {
 	ResourceMutex    mutex;
 	std::unique_lock owner(mutex);
@@ -111,6 +158,8 @@ int main(int argc, char** argv) {
 	(void)argv;
 #endif
 	TestOwnership();
+	TestOwnershipIsPerThread();
+	TestOwnershipAcrossThreadChurn();
 	TestSerializesTransactions();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	CheckDeathCase();
