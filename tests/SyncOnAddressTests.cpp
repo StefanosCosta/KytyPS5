@@ -63,8 +63,11 @@ void TestMismatchReturnsImmediately() {
   const auto start = std::chrono::steady_clock::now();
   Check(Wait32(&word, 6, &timeout, CountSignalPoll) == OK,
         "mismatch succeeds without parking");
+  // Only proves the *pre-park* compare is full width: 0x100000000 != 0 is seen before the loop
+  // ever reaches the futex. It says nothing about the kernel's own compare, which is 32-bit --
+  // TestWait64HighWordChange covers that.
   Check(Wait64(&word64, 0, &timeout, CountSignalPoll) == OK,
-        "wait64 compares all 64 bits");
+        "wait64 pre-park compare is full width");
   Check(std::chrono::steady_clock::now() - start <
             std::chrono::milliseconds(100),
         "mismatched value is a fast path");
@@ -255,6 +258,77 @@ void TestWakeZeroIsNoOp() {
 
 } // namespace
 
+// Linux FUTEX_WAIT compares 32 bits, so a 64-bit waiter parked with a matching low half does not
+// see a store that touches only the high half; the emulator's own full-width re-check has to catch
+// it. This is the only test that gets a Wait64 genuinely parked in the kernel and then changes the
+// half the kernel cannot see -- and it deliberately issues no Wake, because a Wake would release the
+// waiter regardless and hide the defect. It asserts on *latency*: the unfixed code still returns OK,
+// just a poll period late.
+void TestWait64HighWordChange() {
+  constexpr int TRIALS = 5;
+  // Comfortably above the 1 ms backstop, comfortably below the 10 ms signal-poll period, so this
+  // discriminates the two rather than measuring scheduler noise.
+  constexpr auto BUDGET = std::chrono::milliseconds(4);
+
+  for (int trial = 0; trial < TRIALS; trial++) {
+    uint64_t word = 0; // low half matches `expected`, so the kernel will park us
+    uint32_t timeout = 1000000;
+    std::atomic<bool> ready{false};
+    int result = Libs::LibKernel::KERNEL_ERROR_ETIMEDOUT;
+    std::chrono::steady_clock::time_point returned{};
+
+    std::thread waiter([&] {
+      ready.store(true, std::memory_order_release);
+      result = Wait64(&word, 0, &timeout);
+      returned = std::chrono::steady_clock::now();
+    });
+    while (!ready.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    // Long enough that the waiter is definitely inside FUTEX_WAIT, not still spinning up.
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+    const auto stored = std::chrono::steady_clock::now();
+    Store(&word, UINT64_C(0x100000000)); // high half only; low half stays 0
+    waiter.join();
+
+    Check(result == OK, "wait64 returns OK after a high-word-only change");
+    Check(returned - stored < BUDGET,
+          "wait64 notices a high-word-only change promptly");
+  }
+}
+
+// A parked futex waiter is released only by FUTEX_WAKE, never by a store, so an explicit Wake must
+// still cut the wait short rather than leaving it to the backstop period. Guards the interaction
+// between the shortened 64-bit poll and the wake path: TestValueChangeAndWake proves a Wake
+// eventually releases the waiter, but would pass even if it took a full poll period to do so.
+void TestWait64WakeIsPrompterThanThePoll() {
+  uint64_t word = 0;
+  uint32_t timeout = 1000000;
+  std::atomic<bool> ready{false};
+  int result = Libs::LibKernel::KERNEL_ERROR_ETIMEDOUT;
+  std::chrono::steady_clock::time_point returned{};
+
+  std::thread waiter([&] {
+    ready.store(true, std::memory_order_release);
+    result = Wait64(&word, 0, &timeout);
+    returned = std::chrono::steady_clock::now();
+  });
+  while (!ready.load(std::memory_order_acquire)) {
+    std::this_thread::yield();
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+  const auto woke = std::chrono::steady_clock::now();
+  Store(&word, UINT64_C(0x100000000));
+  Check(Wake(&word, 1) == OK, "wake-one succeeds for a 64-bit waiter");
+  waiter.join();
+
+  Check(result == OK, "wait64 returns OK after a wake");
+  Check(returned - woke < std::chrono::milliseconds(2),
+        "an explicit wake releases a 64-bit waiter without waiting for the poll");
+}
+
 int main() {
   TestInvalidAddress();
   TestMismatchReturnsImmediately();
@@ -264,6 +338,8 @@ int main() {
   TestAddressesAreIsolated();
   TestCompareRegisterWakeRace();
   TestWakeZeroIsNoOp();
+  TestWait64HighWordChange();
+  TestWait64WakeIsPrompterThanThePoll();
   std::printf("SyncOnAddressTests: all passed\n");
   return 0;
 }

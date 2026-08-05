@@ -23,7 +23,17 @@ namespace Libs::LibKernel::SyncOnAddress {
 
 namespace {
 
+// How long a waiter may sleep before it must surface to run PollSignals. This is an emulator
+// device, not a PS5 one -- a real kernel futex blocks until woken -- so it only bounds deferred
+// guest-signal delivery, and it matches the budget semaphore.cpp and pthread.cpp use.
 constexpr uint32_t SIGNAL_POLL_MICROS = 10000;
+
+// Linux FUTEX_WAIT always compares 32 bits, so for a 64-bit wait the kernel filters on the low half
+// only: a store touching just the high half can park a waiter that should have returned. Every exit
+// re-checks the full width, so this is a latency question and never a wrong answer -- but here the
+// poll is the *correctness backstop* for that case, not merely signal delivery, so it has to be
+// shorter. 32-bit waits keep SIGNAL_POLL_MICROS: their kernel compare is exact and needs no backstop.
+constexpr uint32_t PARTIAL_COMPARE_POLL_MICROS = 1000;
 
 using Clock = std::chrono::steady_clock;
 
@@ -54,9 +64,10 @@ struct WaitDeadline {
 	return {true, Clock::now() + std::chrono::microseconds(*timeout_micros)};
 }
 
-[[nodiscard]] uint32_t GetWaitSliceMicros(const WaitDeadline& deadline, bool first_wait) {
+[[nodiscard]] uint32_t GetWaitSliceMicros(const WaitDeadline& deadline, bool first_wait,
+                                          uint32_t poll_micros) {
 	if (!deadline.finite) {
-		return SIGNAL_POLL_MICROS;
+		return poll_micros;
 	}
 
 	const auto now = Clock::now();
@@ -66,7 +77,7 @@ struct WaitDeadline {
 
 	const auto remaining =
 	    std::chrono::duration_cast<std::chrono::microseconds>(deadline.end - now).count();
-	return static_cast<uint32_t>(std::min<int64_t>(remaining, SIGNAL_POLL_MICROS));
+	return static_cast<uint32_t>(std::min<int64_t>(remaining, static_cast<int64_t>(poll_micros)));
 }
 
 void PollSignals(signal_poll_func_t signal_poll) {
@@ -80,14 +91,15 @@ void PollSignals(signal_poll_func_t signal_poll) {
 template <typename T>
 int WaitLinux(volatile T* address, T expected, const uint32_t* timeout_micros,
               signal_poll_func_t signal_poll) {
+	// See PARTIAL_COMPARE_POLL_MICROS: the kernel's compare is exact at 32 bits and partial at 64.
+	constexpr uint32_t poll_micros =
+	    sizeof(T) > sizeof(uint32_t) ? PARTIAL_COMPARE_POLL_MICROS : SIGNAL_POLL_MICROS;
+
 	const auto deadline   = MakeDeadline(timeout_micros);
 	bool       first_wait = true;
 
 	for (;;) {
-		if (ReadWord(address) != expected) {
-			return OK;
-		}
-		const auto slice_micros = GetWaitSliceMicros(deadline, first_wait);
+		const auto slice_micros = GetWaitSliceMicros(deadline, first_wait, poll_micros);
 		if (slice_micros == UINT32_MAX) {
 			return ReadWord(address) == expected ? KERNEL_ERROR_ETIMEDOUT : OK;
 		}
@@ -95,6 +107,14 @@ int WaitLinux(volatile T* address, T expected, const uint32_t* timeout_micros,
 		    .tv_sec  = static_cast<time_t>(slice_micros / 1000000u),
 		    .tv_nsec = static_cast<long>(slice_micros % 1000000u) * 1000L,
 		};
+
+		// Full-width, and deliberately the last thing before the syscall: the kernel's own compare
+		// may be narrower than T, so this is what actually decides whether parking is correct.
+		// Keeping it adjacent to the syscall makes the window a store can slip through as small as
+		// it can be made.
+		if (ReadWord(address) != expected) {
+			return OK;
+		}
 
 		long result     = 0;
 		int  wait_error = 0;
@@ -194,7 +214,7 @@ int WaitPortable(volatile T* address, T expected, const uint32_t* timeout_micros
 	int            result     = OK;
 
 	while (ReadWord(address) == expected && !waiter.wake_requested) {
-		const auto slice_micros = GetWaitSliceMicros(deadline, first_wait);
+		const auto slice_micros = GetWaitSliceMicros(deadline, first_wait, SIGNAL_POLL_MICROS);
 		if (slice_micros == UINT32_MAX) {
 			result = KERNEL_ERROR_ETIMEDOUT;
 			break;
