@@ -23,7 +23,35 @@
 #include <unistd.h>
 #endif
 
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+#include <sched.h>
+#endif
+
 namespace Libs::Graphics {
+
+// Hint to the core that this is a spin-wait: on x86 it drops the pipeline out of the
+// memory-order-violation penalty and frees the SMT sibling; on ARM it is the WFE-style yield.
+inline void CpuRelax() noexcept {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+	__builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(__arm__)
+	__asm__ __volatile__("yield" ::: "memory");
+#endif
+}
+
+inline void YieldToScheduler() noexcept {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	SwitchToThread();
+#else
+	// sched_yield is async-signal-safe, which matters: this lock is taken from the guest
+	// page-fault handler.
+	::sched_yield();
+#endif
+}
+
+// Long enough that an uncontended handoff never reaches the syscall, short enough that a convoy
+// of faulting threads stops burning cores almost immediately.
+constexpr uint32_t SPIN_BEFORE_YIELD = 64;
 
 class TrackingSpinLock final {
 public:
@@ -32,9 +60,23 @@ public:
 		if (m_owner.load(std::memory_order_relaxed) == thread) {
 			EXIT("recursive region tracking lock\n");
 		}
+		// Spin politely. Guest page faults are serviced inline on the faulting thread, so a title
+		// with many concurrently-faulting worker threads (Cat Quest III: ~10) piles them all onto
+		// this lock. A bare test_and_set loop then burns every core at full speed on cacheline
+		// ping-pong. Pause first, then relax to the scheduler so the owner can actually finish.
+		uint32_t spins = 0;
 		while (m_lock.test_and_set(std::memory_order_acquire)) {
 			if (m_owner.load(std::memory_order_relaxed) == thread) {
 				EXIT("recursive region tracking lock while contended\n");
+			}
+			// Read-only until it looks free: avoids an exclusive-state request per iteration.
+			while (m_lock.test(std::memory_order_relaxed)) {
+				if (++spins < SPIN_BEFORE_YIELD) {
+					CpuRelax();
+				} else {
+					spins = 0;
+					YieldToScheduler();
+				}
 			}
 			std::atomic_signal_fence(std::memory_order_seq_cst);
 		}
