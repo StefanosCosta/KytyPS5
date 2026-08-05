@@ -310,7 +310,13 @@ CommandProcessor& GpuState::GetProcessor(uint32_t queue_id) {
 }
 
 void CommandProcessor::Reset() {
-	BufferWait();
+	// Rebind the register state, but do not drain the GPU. Reset() overwrites m_ctx / m_ucfg /
+	// m_sh_ctx / m_const_ram, which the scheduler binds by reference into command buffers -- but
+	// those are only ever *read* while recording, and recording happens synchronously on this thread
+	// and has already finished by the time Reset() runs. Command-buffer recycling self-throttles:
+	// Begin()/BeginNext() waits on the fence of the buffer it reuses. So the Finish() that
+	// BufferWait() performed protected nothing.
+	BufferInit();
 
 	m_sh_ctx.Reset();
 	m_ucfg.Reset();
@@ -1242,7 +1248,12 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 	const uint64_t invocations =
 	    static_cast<uint64_t>(groups_x) * groups_y * groups_z * local_x * local_y * local_z;
 	if (invocations != 0) {
-		BufferFlushAndWait();
+		// Submit the dispatch, but do not wait for it to retire. Nothing reads the result on the CPU
+		// here: GPU-side hazards against later work are covered by the ShaderWriteBarrier that
+		// RenderExecutor::DispatchDirect emits for storage writes and by CS/PS_PARTIAL_FLUSH ->
+		// EmitGlobalBarrier, and CPU-side reads of the output fault through the write-protection path
+		// into BufferCache::ReadMemory, which synchronizes itself.
+		BufferFlush();
 	}
 }
 
