@@ -77,6 +77,16 @@ std::string FormatBinary(const Instruction& inst) {
 	return text;
 }
 
+std::string FormatSources(const Instruction& inst) {
+	std::string    text      = fmt::format("0x{:08x}: {}", inst.pc, OpcodeToString(inst.opcode));
+	const Operand* sources[] = {&inst.src0, &inst.src1, &inst.src2, &inst.src3};
+	for (uint32_t i = 0; i < inst.src_count && i < 4u; i++) {
+		text += i == 0 ? " " : ", ";
+		text += OperandToString(*sources[i]);
+	}
+	return text;
+}
+
 std::string FormatMemory(const Instruction& inst) {
 	std::string text = fmt::format("0x{:08x}: {} {}", inst.pc, OpcodeToString(inst.opcode).c_str(),
 	                               OperandToString(inst.dst).c_str());
@@ -511,6 +521,7 @@ std::string OpcodeToString(Opcode opcode) {
 		case Opcode::SCmpGeU32: return "s_cmp_ge_u32";
 		case Opcode::SCmpLtU32: return "s_cmp_lt_u32";
 		case Opcode::SCmpLeU32: return "s_cmp_le_u32";
+		case Opcode::SCmpEqU64: return "s_cmp_eq_u64";
 		case Opcode::SCmpLgU64: return "s_cmp_lg_u64";
 		case Opcode::VNop: return "v_nop";
 		case Opcode::VMovB32: return "v_mov_b32";
@@ -766,6 +777,7 @@ std::string OpcodeToString(Opcode opcode) {
 		case Opcode::VCmpNeU32: return "v_cmp_ne_u32";
 		case Opcode::VCmpGeU32: return "v_cmp_ge_u32";
 		case Opcode::VCmpTU32: return "v_cmp_t_u32";
+		case Opcode::VCmpEqI64: return "v_cmp_eq_i64";
 		case Opcode::VCmpNeU64: return "v_cmp_ne_u64";
 		case Opcode::VCmpxLtU32: return "v_cmpx_lt_u32";
 		case Opcode::VCmpxEqU32: return "v_cmpx_eq_u32";
@@ -823,6 +835,8 @@ std::string OpcodeToString(Opcode opcode) {
 		case Opcode::BufferAtomicAnd: return "buffer_atomic_and";
 		case Opcode::BufferAtomicOr: return "buffer_atomic_or";
 		case Opcode::BufferAtomicXor: return "buffer_atomic_xor";
+		case Opcode::BufferAtomicFMin: return "buffer_atomic_fmin";
+		case Opcode::BufferAtomicFMax: return "buffer_atomic_fmax";
 		case Opcode::FlatLoadUbyte: return "flat_load_ubyte";
 		case Opcode::FlatLoadSbyte: return "flat_load_sbyte";
 		case Opcode::FlatLoadUshort: return "flat_load_ushort";
@@ -983,6 +997,9 @@ std::string InstructionToString(const Instruction& inst) {
 		                   inst.pc, FamilyToString(inst.family).c_str(), inst.opcode_id,
 		                   RawWordsToString(inst).c_str(), inst.unsupported_reason.c_str());
 	}
+	if (inst.family == Family::SOPC) {
+		return WithUnsupportedReason(inst, FormatSources(inst));
+	}
 
 	switch (inst.opcode) {
 		case Opcode::SMovB32:
@@ -1110,6 +1127,8 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::BufferAtomicAnd:
 		case Opcode::BufferAtomicOr:
 		case Opcode::BufferAtomicXor:
+		case Opcode::BufferAtomicFMin:
+		case Opcode::BufferAtomicFMax:
 		case Opcode::BufferLoadSbyte:
 		case Opcode::BufferLoadSshort:
 		case Opcode::FlatLoadUbyte:
@@ -1171,25 +1190,6 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::DsWriteB128:
 		case Opcode::DsWriteAddtidB32:
 		case Opcode::DsReadAddtidB32: return WithUnsupportedReason(inst, FormatMemory(inst));
-		case Opcode::SCmpEqU32:
-		case Opcode::SCmpEqI32:
-		case Opcode::SCmpLgU32:
-		case Opcode::SCmpLgI32:
-		case Opcode::SCmpGtU32:
-		case Opcode::SCmpGtI32:
-		case Opcode::SCmpGeU32:
-		case Opcode::SCmpGeI32:
-		case Opcode::SCmpLtU32:
-		case Opcode::SCmpLtI32:
-		case Opcode::SCmpLeU32:
-		case Opcode::SCmpLeI32:
-		case Opcode::SBitcmp0B32:
-		case Opcode::SBitcmp1B32:
-		case Opcode::SCmpLgU64:
-			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: {} {}, {}", inst.pc,
-			                                               OpcodeToString(inst.opcode).c_str(),
-			                                               OperandToString(inst.src0).c_str(),
-			                                               OperandToString(inst.src1).c_str()));
 		default: return WithUnsupportedReason(inst, FormatBinary(inst));
 	}
 }

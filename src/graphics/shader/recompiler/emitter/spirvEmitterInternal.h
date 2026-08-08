@@ -414,6 +414,9 @@ struct EmitterState {
 	bool                                             needs_image_gather_extended           = false;
 	bool                                             needs_function_lds                    = false;
 	bool                                             needs_pixel_valid_mask                = false;
+	bool                                             unsupported_ir_instruction            = false;
+	IR::Opcode                                       unsupported_ir_opcode = IR::Opcode::Count;
+	uint32_t                                         unsupported_ir_pc     = 0;
 	std::vector<RegisterBinding>                     registers;
 	std::vector<InputBinding>                        inputs;
 	std::vector<OutputBinding>                       outputs;
@@ -611,8 +614,6 @@ bool IsMaskRegisterFile(IR::RegisterFile file);
 
 bool IsSccOperand(const IR::Operand& operand);
 
-bool IsCompareOpcode(IR::Opcode op);
-
 void CollectMaskStateRegisters(std::vector<RegisterBinding>& registers);
 
 void CollectSequentialRegisters(std::vector<RegisterBinding>& registers, const IR::Operand& base,
@@ -650,8 +651,6 @@ bool InstructionHasDppSource(const IR::Instruction& inst);
 bool ProgramNeedsSubgroupBallot(const IR::Program& program);
 
 bool ProgramNeedsSubgroupShuffle(const IR::Program& program);
-
-bool IsCompareOpcode(IR::Opcode op);
 
 bool ProgramNeedsSubgroupLocalInvocationId(const IR::Program& program);
 
@@ -1015,6 +1014,9 @@ void EmitDeviceAtomicMemoryBarrier(EmitterState& state);
 
 void EmitAtomicU32(EmitterState& state, const IR::Instruction& inst, uint32_t opcode);
 
+void EmitAtomicFMinF32(EmitterState& state, const IR::Instruction& inst);
+void EmitAtomicFMaxF32(EmitterState& state, const IR::Instruction& inst);
+
 void EmitSLoadDword(EmitterState& state, const IR::Instruction& inst);
 
 void EmitLoadSrtDword(EmitterState& state, const IR::Instruction& inst);
@@ -1345,7 +1347,7 @@ void EmitCompareI16(EmitterState& state, const IR::Instruction& inst, uint32_t o
 
 void EmitBitCompareB32(EmitterState& state, const IR::Instruction& inst, bool bit_set);
 
-void EmitCompareNeU64(EmitterState& state, const IR::Instruction& inst);
+void EmitCompareU64(EmitterState& state, const IR::Instruction& inst);
 
 void EmitCompareConstant(EmitterState& state, const IR::Instruction& inst, bool value);
 
@@ -1577,19 +1579,22 @@ uint32_t EmitValueOrZeroIfCondition(EmitterState& state, uint32_t condition, Fn&
 	}
 
 	const auto then_label  = state.builder.AllocateId();
+	const auto then_exit   = state.builder.AllocateId();
 	const auto else_label  = state.builder.AllocateId();
 	const auto merge_label = state.builder.AllocateId();
 	state.builder.AddFunction({OpSelectionMerge, merge_label, SelectionControlNone});
 	state.builder.AddFunction({OpBranchConditional, condition, then_label, else_label});
 	state.builder.AddFunction({OpLabel, then_label});
 	const auto then_value = fn();
+	state.builder.AddFunction({OpBranch, then_exit});
+	state.builder.AddFunction({OpLabel, then_exit});
 	state.builder.AddFunction({OpBranch, merge_label});
 	state.builder.AddFunction({OpLabel, else_label});
 	state.builder.AddFunction({OpBranch, merge_label});
 	state.builder.AddFunction({OpLabel, merge_label});
 	const auto value = state.builder.AllocateId();
 	state.builder.AddFunction(
-	    {OpPhi, state.uint_type, value, then_value, then_label, ConstantU32(state, 0), else_label});
+	    {OpPhi, state.uint_type, value, then_value, then_exit, ConstantU32(state, 0), else_label});
 	return value;
 }
 

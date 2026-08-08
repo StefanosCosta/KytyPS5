@@ -516,7 +516,8 @@ void EmitInstruction(EmitterState& state, const IR::Instruction& inst) {
 		case IR::Opcode::CompareGeU32: EmitCompareU32(state, inst, OpUGreaterThanEqual); break;
 		case IR::Opcode::CompareLtU32: EmitCompareU32(state, inst, OpULessThan); break;
 		case IR::Opcode::CompareLeU32: EmitCompareU32(state, inst, OpULessThanEqual); break;
-		case IR::Opcode::CompareNeU64: EmitCompareNeU64(state, inst); break;
+		case IR::Opcode::CompareEqU64:
+		case IR::Opcode::CompareNeU64: EmitCompareU64(state, inst); break;
 		case IR::Opcode::CompareMaskEqU32: EmitCompareMaskU32(state, inst, OpIEqual); break;
 		case IR::Opcode::CompareMaskNeU32: EmitCompareMaskU32(state, inst, OpINotEqual); break;
 		case IR::Opcode::CompareMaskGtU32: EmitCompareMaskU32(state, inst, OpUGreaterThan); break;
@@ -774,6 +775,12 @@ void EmitInstruction(EmitterState& state, const IR::Instruction& inst) {
 		case IR::Opcode::AtomicXorU32:
 			EmitGuardedByExec(state, [&]() { EmitAtomicU32(state, inst, OpAtomicXor); });
 			break;
+		case IR::Opcode::AtomicFMinF32:
+			EmitGuardedByExec(state, [&]() { EmitAtomicFMinF32(state, inst); });
+			break;
+		case IR::Opcode::AtomicFMaxF32:
+			EmitGuardedByExec(state, [&]() { EmitAtomicFMaxF32(state, inst); });
+			break;
 		case IR::Opcode::FlatLoadUbyte: EmitFlatLoadUbyte(state, inst); break;
 		case IR::Opcode::FlatLoadSbyte: EmitFlatLoadSbyte(state, inst); break;
 		case IR::Opcode::FlatLoadUshort: EmitFlatLoadUshort(state, inst); break;
@@ -850,7 +857,13 @@ void EmitInstruction(EmitterState& state, const IR::Instruction& inst) {
 			}
 			EmitGuardedByExec(state, [&]() { EmitExport(state, inst); });
 			break;
-		default: break;
+		default:
+			if (!state.unsupported_ir_instruction) {
+				state.unsupported_ir_instruction = true;
+				state.unsupported_ir_opcode      = inst.op;
+				state.unsupported_ir_pc          = inst.pc;
+			}
+			break;
 	}
 }
 

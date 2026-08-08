@@ -2,6 +2,32 @@ set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
 add_subdirectory(cpuinfo)
 
+# The Windows guest red-zone patcher needs a decoder/encoder and a small
+# trampoline assembler. Pin the same revisions used by shadPS4's implementation.
+include(FetchContent)
+
+set(XBYAK_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+	xbyak
+	GIT_REPOSITORY https://github.com/herumi/xbyak.git
+	GIT_TAG 44a72f369268f7d552650891b296693e91db86bb
+	GIT_SHALLOW FALSE
+)
+
+set(ZYDIS_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(ZYDIS_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+set(ZYDIS_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(ZYDIS_BUILD_DOXYGEN OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+	zydis
+	GIT_REPOSITORY https://github.com/zyantific/zydis.git
+	GIT_TAG 120e0e705f8e3b507dc49377ac2879979f0d545c
+	GIT_SUBMODULES_RECURSE TRUE
+	GIT_SHALLOW FALSE
+)
+
+FetchContent_MakeAvailable(xbyak zydis)
+
 set(SDL_SHARED OFF CACHE BOOL "" FORCE)
 add_subdirectory(SDL2)
 
@@ -10,6 +36,25 @@ add_library(Vulkan::Headers ALIAS Vulkan-Headers)
 target_include_directories(Vulkan-Headers INTERFACE
 	"${CMAKE_CURRENT_SOURCE_DIR}/Vulkan-Headers/include"
 )
+
+add_library(imgui STATIC
+	imgui/imgui.cpp
+	imgui/imgui_draw.cpp
+	imgui/imgui_tables.cpp
+	imgui/imgui_widgets.cpp
+	imgui/backends/imgui_impl_vulkan.cpp
+)
+target_include_directories(imgui PUBLIC
+	"${CMAKE_CURRENT_SOURCE_DIR}/imgui"
+	"${CMAKE_CURRENT_SOURCE_DIR}/imgui/backends"
+)
+target_compile_definitions(imgui PRIVATE IMGUI_IMPL_VULKAN_NO_PROTOTYPES)
+target_link_libraries(imgui PUBLIC Vulkan::Headers)
+if(MSVC)
+	target_compile_options(imgui PRIVATE /W0)
+else()
+	target_compile_options(imgui PRIVATE -w)
+endif()
 
 set(SPIRV_SKIP_TESTS ON CACHE BOOL "" FORCE)
 set(SPIRV_SKIP_EXECUTABLES ON CACHE BOOL "" FORCE)

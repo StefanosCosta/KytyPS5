@@ -82,6 +82,7 @@ constexpr LowerMap LOWER_OPS[] = {
     {Decoder::Opcode::SCmpGeU32, Opcode::CompareGeU32},
     {Decoder::Opcode::SCmpLtU32, Opcode::CompareLtU32},
     {Decoder::Opcode::SCmpLeU32, Opcode::CompareLeU32},
+    {Decoder::Opcode::SCmpEqU64, Opcode::CompareEqU64},
     {Decoder::Opcode::SCmpLgU64, Opcode::CompareNeU64},
     {Decoder::Opcode::VReadfirstlaneB32, Opcode::ReadFirstLaneU32},
     {Decoder::Opcode::VReadlaneB32, Opcode::ReadLaneU32},
@@ -325,6 +326,7 @@ constexpr LowerMap LOWER_OPS[] = {
     {Decoder::Opcode::VCmpNeU32, Opcode::CompareNeU32},
     {Decoder::Opcode::VCmpGeU32, Opcode::CompareGeU32},
     {Decoder::Opcode::VCmpTU32, Opcode::CompareTrue},
+    {Decoder::Opcode::VCmpEqI64, Opcode::CompareEqU64},
     {Decoder::Opcode::VCmpNeU64, Opcode::CompareNeU64},
     {Decoder::Opcode::VCmpxLtU32, Opcode::CompareMaskLtU32},
     {Decoder::Opcode::VCmpxEqU32, Opcode::CompareMaskEqU32},
@@ -350,6 +352,8 @@ constexpr LowerMap LOWER_OPS[] = {
     {Decoder::Opcode::BufferAtomicAnd, Opcode::AtomicAndU32},
     {Decoder::Opcode::BufferAtomicOr, Opcode::AtomicOrU32},
     {Decoder::Opcode::BufferAtomicXor, Opcode::AtomicXorU32},
+    {Decoder::Opcode::BufferAtomicFMin, Opcode::AtomicFMinF32},
+    {Decoder::Opcode::BufferAtomicFMax, Opcode::AtomicFMaxF32},
     {Decoder::Opcode::FlatLoadUbyte, Opcode::FlatLoadUbyte},
     {Decoder::Opcode::FlatLoadSbyte, Opcode::FlatLoadSbyte},
     {Decoder::Opcode::FlatLoadSshort, Opcode::FlatLoadSshort},
@@ -432,22 +436,13 @@ void SetError(std::string* error, const char* message) {
 	}
 }
 
-Opcode LookupIrOpcode(Decoder::Opcode opcode) {
+std::optional<Opcode> LookupIrOpcode(Decoder::Opcode opcode) {
 	for (const auto& op: LOWER_OPS) {
 		if (op.decoded == opcode) {
 			return op.ir;
 		}
 	}
-	return Opcode::MoveU32;
-}
-
-bool IsImplemented(Decoder::Opcode opcode) {
-	for (const auto& op: LOWER_OPS) {
-		if (op.decoded == opcode) {
-			return true;
-		}
-	}
-	return false;
+	return std::nullopt;
 }
 
 bool IsReversedBinary(Decoder::Opcode opcode) {

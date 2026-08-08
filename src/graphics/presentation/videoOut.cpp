@@ -537,10 +537,10 @@ Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer
 	const auto tile_mode =
 	    Graphics::Prospero::GpuEnumValue(Graphics::Prospero::TileMode::kRenderTarget);
 	const auto pitch =
-	    Graphics::TileGetTexturePitch(pixel_format.guest_format, attribute.width, 1, tile_mode);
+	    Graphics::TileGetTexturePitch(pixel_format.guest_format, attribute.width, tile_mode);
 	Graphics::TileSizeAlign total {};
 	Graphics::TileGetTextureTotalSize(pixel_format.guest_format, attribute.width, attribute.height,
-	                                  1, pitch, 1, tile_mode, false, total);
+	                                  1, 1, tile_mode, false, total);
 	if (total.size == 0 || total.align != 65536 ||
 	    (buffer.data_address & (total.align - 1u)) != 0) {
 		EXIT("invalid video-out surface footprint or alignment\n");
@@ -788,14 +788,10 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 	while (!token.stop_requested()) {
 		const auto sleep_begin = Common::Timer::QueryPerformanceCounter();
 		if (total_wait > 0) {
-			const auto sleep_end = sleep_begin + static_cast<uint64_t>(total_wait);
-			auto       now       = sleep_begin;
-			while (!token.stop_requested() && now < sleep_end) {
-				const auto remaining_us = (sleep_end - now) * 1000000u / frequency;
-				Common::Thread::SleepMicro(
-				    static_cast<uint32_t>(std::clamp<uint64_t>(remaining_us, 1, 1000)));
-				now = Common::Timer::QueryPerformanceCounter();
-			}
+			const auto remaining_us =
+			    (static_cast<uint64_t>(total_wait) * 1000000u + frequency - 1) / frequency;
+			Common::Thread::SleepMicro(static_cast<uint32_t>(
+			    std::clamp<uint64_t>(remaining_us, 1, std::numeric_limits<uint32_t>::max())));
 		}
 		if (token.stop_requested()) {
 			break;
@@ -817,7 +813,24 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 		}
 
 		VblankBegin();
-		const bool presented = m_flip_queue.Flip(0);
+		bool presented = m_flip_queue.Flip(0);
+		if (!presented && m_presenter.NeedsImeRefresh()) {
+			if (auto* frame = m_presenter.PrepareLastFrame(); frame != nullptr) {
+				m_presenter.Present(*frame, true);
+				presented = true;
+			} else {
+				uint32_t width  = 0;
+				uint32_t height = 0;
+				{
+					Common::LockGuard lock(m_mutex);
+					width  = m_video_out_ctx[0].width;
+					height = m_video_out_ctx[0].height;
+				}
+				auto& blank = m_presenter.PrepareBlankFrame(width, height, true);
+				m_presenter.Present(blank);
+				presented = true;
+			}
+		}
 		if (!presented && total_wait < 0) {
 			bool     any_open = false;
 			uint32_t width    = 0;

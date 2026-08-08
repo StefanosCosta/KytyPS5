@@ -16,7 +16,6 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/cache/gpuResourceManager.h"
-#include "graphics/host_gpu/renderer/cache/resourceMutex.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
@@ -71,6 +70,7 @@
 #include <initializer_list>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <optional>
 #include <semaphore>
@@ -169,6 +169,10 @@ struct TextureCacheTestAccess {
 	static_assert(TextureCache::ImagePageTable::kAddressSpaceBits == 40);
 	static_assert(TextureCache::ImagePageTable::kFirstLevelBits == 10);
 
+	static std::unique_lock<TrackingSpinLock> Lock(TextureCache& cache) {
+		return std::unique_lock(cache.m_lock);
+	}
+
 	static void ConfigureGarbageCollection(TextureCache& cache, std::span<const ImageId> oldest,
 	                                       uint64_t tick, uint64_t pressure) {
 		cache.m_trigger_gc_memory  = 0;
@@ -261,13 +265,11 @@ struct TextureCacheTestAccess {
 	}
 
 	static ImageId InsertImage(TextureCache& cache, const ImageInfo& info) {
-		std::lock_guard transaction(cache.m_resource_mutex);
 		std::lock_guard lock(cache.m_lock);
 		return cache.InsertImage(info);
 	}
 
 	static void DeleteImage(TextureCache& cache, ImageId id) {
-		std::lock_guard transaction(cache.m_resource_mutex);
 		std::lock_guard lock(cache.m_lock);
 		cache.DeleteImage(id);
 	}
@@ -1321,10 +1323,28 @@ public:
 		const auto         external_wait_tick  = scheduler.CurrentTick();
 		SubmitInfo         external_wait;
 		external_wait.AddWait(external_timeline, external_wait_value);
-		scheduler.Flush(external_wait);
-		Require("SchedulerTimeline", "external timeline blocked",
-		        !scheduler.IsFree(external_wait_tick),
-		        "submission ignored the external timeline wait value");
+		constexpr size_t blocked_submission_count = 6;
+		std::array<vk::CommandBuffer, blocked_submission_count> blocked_handles {};
+		for (size_t i = 0; i < blocked_submission_count; ++i) {
+			blocked_handles[i] = scheduler.Current().Handle();
+			if (i == 0) {
+				scheduler.Flush(external_wait);
+			} else {
+				scheduler.Flush();
+			}
+		}
+		bool distinct_handles = true;
+		for (size_t i = 0; i < blocked_handles.size(); ++i) {
+			for (size_t j = i + 1; j < blocked_handles.size(); ++j) {
+				distinct_handles &= blocked_handles[i] != blocked_handles[j];
+			}
+		}
+		const auto last_blocked_tick = scheduler.CurrentTick() - 1;
+		Require("SchedulerTimeline", "external timeline overflow",
+		        distinct_handles && last_blocked_tick ==
+		                                external_wait_tick + blocked_submission_count - 1 &&
+		            !scheduler.IsFree(last_blocked_tick),
+		        "blocked submissions did not grow the command-buffer pool");
 		vk::SemaphoreSignalInfo signal_info {};
 		signal_info.sType     = vk::StructureType::eSemaphoreSignalInfo;
 		signal_info.semaphore = external_timeline;
@@ -1332,8 +1352,14 @@ public:
 		Require("SchedulerTimeline", "external timeline signal",
 		        m_runtime_context.device.signalSemaphore(&signal_info) == vk::Result::eSuccess,
 		        "failed to signal the external timeline semaphore");
-		scheduler.Wait(external_wait_tick);
+		scheduler.Wait(last_blocked_tick);
 		m_runtime_context.device.destroySemaphore(external_timeline, nullptr);
+		scheduler.Flush();
+		scheduler.Flush();
+		Require("SchedulerTimeline", "timeline pool reuse",
+		        std::ranges::find(blocked_handles, scheduler.Current().Handle()) !=
+		            blocked_handles.end(),
+		        "completed command buffers were not reused after timeline progress");
 		scheduler.Shutdown();
 
 		CommandScheduler draining(Renderer(), m_runtime_context);
@@ -1581,6 +1607,146 @@ public:
 		        order == 2 && gpu_thread != caller_thread && nested_thread == gpu_thread,
 		        "host command did not run on the GPU thread or nested sync deadlocked");
 
+		{
+			const auto make_release_mem = [](uint32_t data_sel, uint32_t interrupt_selector,
+			                                 void* destination, uint64_t value) {
+				std::array<uint32_t, 8> packet {};
+				const auto              address = reinterpret_cast<uint64_t>(destination);
+				constexpr uint32_t       eop_none = 0x28u;
+				constexpr uint32_t       gcr_gl2_writeback = 1u << 9u;
+				packet[0] = KYTY_PM4(8, Pm4::IT_NOP, Pm4::R_RELEASE_MEM);
+				packet[1] = eop_none | (gcr_gl2_writeback << 12u);
+				packet[2] = (interrupt_selector << 24u) | (data_sel << 29u);
+				packet[3] = static_cast<uint32_t>(address);
+				packet[4] = static_cast<uint32_t>(address >> 32u);
+				packet[5] = static_cast<uint32_t>(value);
+				packet[6] = static_cast<uint32_t>(value >> 32u);
+				packet[7] = 0x123u;
+				return packet;
+			};
+
+			vk::SemaphoreTypeCreateInfo timeline_type {};
+			timeline_type.sType         = vk::StructureType::eSemaphoreTypeCreateInfo;
+			timeline_type.semaphoreType = vk::SemaphoreType::eTimeline;
+			vk::SemaphoreCreateInfo timeline_create {};
+			timeline_create.sType           = vk::StructureType::eSemaphoreCreateInfo;
+			timeline_create.pNext           = &timeline_type;
+			vk::Semaphore blocked_timeline = nullptr;
+			Require("GpuCommandLane", "blocked timeline create",
+			        m_runtime_context.device.createSemaphore(
+			            &timeline_create, nullptr, &blocked_timeline) == vk::Result::eSuccess &&
+			            blocked_timeline != nullptr,
+			        "failed to create the blocked GPU timeline");
+
+			constexpr uint64_t release_tick = 1;
+			auto&              gpu_scheduler = context.GetCommandScheduler();
+			auto               processor     = std::make_unique<CommandProcessor>(context);
+			gpu.SendCommandSync([&] {
+				processor->BufferInit();
+				SubmitInfo blocked_submit;
+				blocked_submit.AddWait(blocked_timeline, release_tick);
+				gpu_scheduler.Flush(blocked_submit);
+			});
+
+			std::binary_semaphore parser_complete {0};
+			alignas(uint64_t) uint64_t interrupt_only_gds_label = UINT64_MAX;
+			bool                       parser_kept_nonblocking_boundaries = false;
+			std::jthread               no_gpu_wait([&] {
+				gpu.SendCommandSync([&] {
+					processor->BufferInit();
+					const auto tick_before = gpu_scheduler.CurrentTick();
+					processor->TriggerEvent(0x16u, 0u);
+					auto         packet = make_release_mem(0, 0, nullptr, 0);
+					Pm4Execution execution;
+					const auto   result = processor->Process(execution, packet.data(), packet.size());
+					processor->IncrementDe();
+					const bool cache_and_counter_did_not_submit =
+					    result == Pm4ProcessResult::Complete &&
+					    gpu_scheduler.CurrentTick() == tick_before;
+
+					auto gds_interrupt_only =
+					    make_release_mem(5, 1, &interrupt_only_gds_label, 1ull << 16u);
+					Pm4Execution gds_interrupt_execution;
+					const auto   interrupt_tick = gpu_scheduler.CurrentTick();
+					const auto   interrupt_result = processor->Process(
+					    gds_interrupt_execution, gds_interrupt_only.data(), gds_interrupt_only.size());
+					parser_kept_nonblocking_boundaries =
+					    cache_and_counter_did_not_submit &&
+					    interrupt_result == Pm4ProcessResult::Complete &&
+					    gpu_scheduler.CurrentTick() == interrupt_tick + 1 &&
+					    interrupt_only_gds_label == UINT64_MAX;
+				});
+				parser_complete.release();
+			});
+			const bool parser_did_not_wait_gpu =
+			    parser_complete.try_acquire_for(std::chrono::seconds(2));
+
+			vk::SemaphoreSignalInfo signal_info {};
+			signal_info.sType     = vk::StructureType::eSemaphoreSignalInfo;
+			signal_info.semaphore = blocked_timeline;
+			signal_info.value     = release_tick;
+			Require("GpuCommandLane", "blocked timeline signal",
+			        m_runtime_context.device.signalSemaphore(&signal_info) == vk::Result::eSuccess,
+			        "failed to release the blocked GPU timeline");
+			no_gpu_wait.join();
+			gpu.SendCommandSync([&] { gpu_scheduler.Finish(); });
+			m_runtime_context.device.destroySemaphore(blocked_timeline, nullptr);
+			Require("GpuCommandLane", "nonblocking GPU packets",
+			        parser_did_not_wait_gpu && parser_kept_nonblocking_boundaries,
+			        "a cache event, GL2 writeback, DE counter, or interrupt boundary used the wrong "
+			        "submission behavior");
+
+			alignas(uint64_t) uint64_t release_label = 0;
+			alignas(uint64_t) uint64_t gds_label     = UINT64_MAX;
+			bool                       release_mem_submission_counts = false;
+			gpu.SendCommandSync([&] {
+				processor->BufferInit();
+
+				auto         immediate = make_release_mem(1, 0, &release_label, 0x11223344u);
+				Pm4Execution immediate_execution;
+				const auto   immediate_tick = gpu_scheduler.CurrentTick();
+				const auto   immediate_result =
+				    processor->Process(immediate_execution, immediate.data(), immediate.size());
+				const bool immediate_split_once =
+				    gpu_scheduler.CurrentTick() == immediate_tick + 1;
+
+				auto         gds = make_release_mem(5, 0, &gds_label, 1ull << 16u);
+				Pm4Execution gds_execution;
+				const auto   gds_tick   = gpu_scheduler.CurrentTick();
+				const auto   gds_result = processor->Process(gds_execution, gds.data(), gds.size());
+				const bool   gds_waited_once = gpu_scheduler.CurrentTick() == gds_tick + 1;
+
+				auto         interrupt_only = make_release_mem(0, 4, nullptr, 0);
+				Pm4Execution interrupt_execution;
+				const auto   interrupt_tick = gpu_scheduler.CurrentTick();
+				const auto interrupt_result = processor->Process(
+				    interrupt_execution, interrupt_only.data(), interrupt_only.size());
+				const bool interrupt_split_once =
+				    gpu_scheduler.CurrentTick() == interrupt_tick + 1;
+
+				auto         gds_interrupt = make_release_mem(5, 2, &gds_label, 1ull << 16u);
+				Pm4Execution gds_interrupt_execution;
+				const auto   gds_interrupt_tick = gpu_scheduler.CurrentTick();
+				const auto   gds_interrupt_result = processor->Process(
+				    gds_interrupt_execution, gds_interrupt.data(), gds_interrupt.size());
+				const bool gds_interrupt_waited_once =
+				    gpu_scheduler.CurrentTick() == gds_interrupt_tick + 1;
+
+				release_mem_submission_counts =
+				    immediate_result == Pm4ProcessResult::Complete && immediate_split_once &&
+				    gds_result == Pm4ProcessResult::Complete && gds_waited_once &&
+				    interrupt_result == Pm4ProcessResult::Complete && interrupt_split_once &&
+				    gds_interrupt_result == Pm4ProcessResult::Complete &&
+				    gds_interrupt_waited_once;
+			});
+			gpu.SendCommandSync([&] { gpu_scheduler.Finish(); });
+			Require("GpuCommandLane", "RELEASE_MEM submission counts",
+			        release_mem_submission_counts &&
+			            static_cast<uint32_t>(release_label) == 0x11223344u &&
+			            static_cast<uint32_t>(gds_label) == 0,
+			        "RELEASE_MEM lost its required split/readback or retained a redundant GPU wait");
+		}
+
 		alignas(uint32_t) uint32_t packet_marker_a = 0;
 		alignas(uint32_t) uint32_t packet_marker_b = 0;
 		const auto write_packet = [](uint32_t* packet, uint32_t* destination, uint32_t value) {
@@ -1820,7 +1986,7 @@ public:
 		gpu.SendCommandSync([&] {
 			auto& buffer_cache = resources.GetBufferCache();
 			Require("GpuCommandLane", "clean cached setup",
-			        buffer_cache.HasPageOverlap(clean_cached_fill, sizeof(source_words)) &&
+			        buffer_cache.IsRegionRegistered(clean_cached_fill, sizeof(source_words)) &&
 			            buffer_cache.HasGpuDirtyBytes(immediate_dst, sizeof(source_words)),
 			        "DMA did not establish a cached page with a dirty sibling");
 
@@ -1905,7 +2071,7 @@ public:
 
 		auto& buffer_cache = resources.GetBufferCache();
 		Require("GpuCommandLane", "clean tracked fault setup",
-		        buffer_cache.HasPageOverlap(immediate_dst, sizeof(uint32_t)) &&
+		        buffer_cache.IsRegionRegistered(immediate_dst, sizeof(uint32_t)) &&
 		            !buffer_cache.HasGpuDirtyBytes(immediate_dst, sizeof(uint32_t)),
 		        "clean write-fault test address is not backed by a clean cached Buffer");
 		constexpr uint64_t dirty_fault_address = fault_base + 0xd000;
@@ -2272,6 +2438,46 @@ public:
 				        "dirty-GC buffer allocation failed");
 				scheduler.Current().RetainResourceUntilFence(allocation.owner);
 			};
+
+			constexpr uint64_t index_offset = 0x180000;
+			constexpr uint64_t index_page   = BufferCache::CACHING_PAGE_SIZE;
+			constexpr uint64_t index_span   = 3 * index_page;
+			const uint64_t     index_begin  = base + index_offset;
+			Require(name, "registered-range empty lookup",
+			        !cache.IsRegionRegistered(index_begin, index_span),
+			        "empty Buffer cache reported a registered range");
+			auto index_left = cache.ObtainBuffer(scheduler.Current(), index_begin + 0x100,
+			                                     sizeof(uint32_t), false, false);
+			auto index_right = cache.ObtainBuffer(scheduler.Current(),
+			                                      index_begin + 2 * index_page + 0x100,
+			                                      sizeof(uint32_t), false, false);
+			Require(name, "registered-range owners",
+			        index_left.owner != nullptr && index_right.owner != nullptr,
+			        "failed to create disjoint Buffer index owners");
+			scheduler.Current().RetainResourceUntilFence(index_left.owner);
+			scheduler.Current().RetainResourceUntilFence(index_right.owner);
+			Require(
+			    name, "registered-range boundaries",
+			    cache.IsRegionRegistered(index_begin, 1) &&
+			        cache.IsRegionRegistered(index_begin + index_page - 1, 1) &&
+			        !cache.IsRegionRegistered(index_begin - 1, 1) &&
+			        !cache.IsRegionRegistered(index_begin + index_page, index_page) &&
+			        cache.IsRegionRegistered(index_begin + index_page, index_page + 1) &&
+			        !cache.IsRegionRegistered(index_begin + index_span, 1) &&
+			        cache.IsRegionRegistered(index_begin - 1, index_span + 2),
+			    "indexed lookup mishandled a half-open boundary, gap, or broad overlap");
+			auto index_bridge = cache.ObtainBuffer(scheduler.Current(), index_begin + index_page - 1,
+			                                       index_page + 2, false, false);
+			Require(name, "registered-range merge",
+			        index_bridge.owner != nullptr &&
+			            cache.IsRegionRegistered(index_begin + index_page, index_page),
+			        "bridging acquisition did not publish its merged Buffer range");
+			scheduler.Current().RetainResourceUntilFence(index_bridge.owner);
+			cache.UnmapMemory(index_begin, index_span);
+			Require(name, "registered-range removal",
+			        !cache.IsRegionRegistered(index_begin, index_span),
+			        "unmapped Buffer owner remained in the registered-range index");
+
 			MarkGpuWrite(base + first_offset, sizeof(first_value));
 			MarkGpuWrite(base + second_offset, sizeof(second_value));
 			cache.FillBuffer(base + first_offset, sizeof(first_value), first_value);
@@ -2326,13 +2532,13 @@ public:
 			for (uint32_t tick = 0; tick < 160; tick++) {
 				cache.RunGarbageCollector();
 			}
-			Require(name, "age before pressure", cache.HasPageOverlap(base, allocation_size),
+			Require(name, "age before pressure", cache.IsRegionRegistered(base, allocation_size),
 			        "buffer was reclaimed without memory pressure");
 			BufferCacheTestAccess::SetGarbageCollectionThresholds(
 			    cache, 0, std::numeric_limits<uint64_t>::max());
 			const auto gc_submission_tick = scheduler.CurrentTick();
 			cache.RunGarbageCollector();
-			Require(name, "dirty retirement", !cache.HasPageOverlap(base, allocation_size),
+			Require(name, "dirty retirement", !cache.IsRegionRegistered(base, allocation_size),
 			        "aged GPU-dirty buffer survived pressured "
 			        "collection");
 
@@ -2380,7 +2586,8 @@ public:
 			uint32_t unmap_backing = 0;
 			std::memcpy(&unmap_backing, memory + unmap_offset, sizeof(unmap_backing));
 			Require(name, "direct-unmap contents",
-			        unmap_backing == unmap_value && !cache.HasPageOverlap(base + 0x4000, 0x4000),
+			        unmap_backing == unmap_value &&
+			            !cache.IsRegionRegistered(base + 0x4000, 0x4000),
 			        "direct dirty unmap cleared tracking before "
 			        "publishing bytes");
 
@@ -2445,7 +2652,7 @@ public:
 				cache.RunGarbageCollector();
 			}
 			Require(name, "near-capacity deferred retirement",
-			        !cache.HasPageOverlap(base + large_offset, large_size),
+			        !cache.IsRegionRegistered(base + large_offset, large_size),
 			        "near-capacity dirty Buffer survived pressured collection");
 			uint32_t large_before_completion = 0;
 			Libs::LibKernel::Memory::TryReadBacking(base + large_offset, &large_before_completion,
@@ -2502,8 +2709,8 @@ public:
 				cache.RunGarbageCollector();
 			}
 			Require(name, "per-owner fixed-ring retirement",
-			        !cache.HasPageOverlap(base + grouped_first_offset, grouped_owner_size) &&
-			            !cache.HasPageOverlap(base + grouped_second_offset, grouped_owner_size) &&
+			        !cache.IsRegionRegistered(base + grouped_first_offset, grouped_owner_size) &&
+			            !cache.IsRegionRegistered(base + grouped_second_offset, grouped_owner_size) &&
 			            &BufferCacheTestAccess::DownloadBuffer(cache) == fixed_download &&
 			            fixed_download->Handle() == fixed_download_handle,
 			        "GC aggregated disjoint retirees or replaced the download ring");
@@ -2542,7 +2749,7 @@ public:
 				cache.RunGarbageCollector();
 			}
 			Require(name, "disjoint deferred retirement",
-			        !cache.HasPageOverlap(base + disjoint_owner_offset, disjoint_owner_size),
+			        !cache.IsRegionRegistered(base + disjoint_owner_offset, disjoint_owner_size),
 			        "cross-page owner survived pressured collection");
 			uint32_t disjoint_before_unmap = 0;
 			Libs::LibKernel::Memory::TryReadBacking(base + disjoint_dirty_offset,
@@ -2601,7 +2808,7 @@ public:
 				cache.RunGarbageCollector();
 			}
 			Require(name, "reacquire deferred retirement",
-			        !cache.HasPageOverlap(base + reacquire_owner_offset, reacquire_owner_size),
+			        !cache.IsRegionRegistered(base + reacquire_owner_offset, reacquire_owner_size),
 			        "fresh cross-page owner survived pressured collection");
 			uint32_t reacquire_before = 0;
 			Libs::LibKernel::Memory::TryReadBacking(base + reacquire_dirty_offset,
@@ -2970,11 +3177,11 @@ public:
 			constexpr uint32_t mip_height = 1;
 			constexpr uint32_t mip_levels = 1;
 			const uint32_t     mip_pitch =
-			    TileGetTexturePitch(mip_format, mip_width, mip_levels, mip_tile);
+			    TileGetTexturePitch(mip_format, mip_width, mip_tile);
 			TileSizeAlign                  mip_total {};
 			std::array<TileSizeOffset, 16> mip_sizes {};
 			std::array<TilePaddedSize, 16> mip_padded {};
-			TileGetTextureSize(mip_format, mip_width, mip_height, mip_pitch, mip_levels, mip_tile,
+			TileGetTextureSize(mip_format, mip_width, mip_height, mip_levels, mip_tile,
 			                   &mip_total, mip_sizes.data(), mip_padded.data());
 			const uint64_t mip_prefix_size = mip_sizes[0].offset + mip_sizes[0].size;
 			const uint64_t mip_guest_size  = mip_total.size + 256;
@@ -2997,6 +3204,7 @@ public:
 				                                   mip_padded[level].height};
 			}
 			const auto mip_image = texture_cache.FindImage(mip_desc);
+			(void)texture_cache.FindTexture(mip_image, mip_desc);
 			texture_cache.MarkGpuWritten(mip_image);
 			std::vector<uint32_t> mip_stale(mip_native.size(), 0xdeadbeefu);
 			Libs::LibKernel::Memory::WriteBacking(base + mip_prefix_offset, mip_stale.data(),
@@ -3020,8 +3228,18 @@ public:
 			        "mip, rejected a fitting mip "
 			        "prefix, or transferred ownership");
 
-			auto mip_formatted = resources.GetBufferCache().ObtainBuffer(
-			    command, mip_desc.info.data.address, mip_desc.info.data.size, false, true, true);
+			auto& buffer_cache = resources.GetBufferCache();
+			BufferBinding mip_formatted;
+			bool          formatted_owner_was_absent = false;
+			gpu.SendCommandSync([&] {
+				formatted_owner_was_absent =
+				    !buffer_cache.IsRegionRegistered(mip_desc.info.data.address,
+				                                     mip_desc.info.data.size);
+				mip_formatted = buffer_cache.ObtainBuffer(command, mip_desc.info.data.address,
+				                                            mip_desc.info.data.size, false, true, true);
+			});
+			Require(name, "formatted cache fixture", formatted_owner_was_absent,
+			        "formatted image already had a cached Buffer owner");
 			Require(name, "formatted Buffer path",
 			        mip_formatted.owner != nullptr && mip_formatted.buffer != nullptr &&
 			            texture_cache.GetImage(mip_image).IsGpuModified(),
@@ -3055,6 +3273,7 @@ public:
 			                   Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt),
 			                   Prospero::ImageType::kColor2D, {1, 1, 1}, 2, 4, 1);
 			const auto array_image = texture_cache.FindImage(array_desc);
+			(void)texture_cache.FindTexture(array_image, array_desc);
 			texture_cache.MarkGpuWritten(array_image);
 			auto volume_desc                  = array_desc;
 			volume_desc.info.type             = Prospero::ImageType::kColor3D;
@@ -3078,6 +3297,7 @@ public:
 			    Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt),
 			    Prospero::ImageType::kColor3D, {1, 1, 2}, 1, sizeof(uint32_t), 1);
 			const auto unique_volume_image = texture_cache.FindImage(unique_volume_desc);
+			(void)texture_cache.FindTexture(unique_volume_image, unique_volume_desc);
 			texture_cache.MarkGpuWritten(unique_volume_image);
 			Libs::Graphics::Buffer partial_volume(
 			    m_runtime_context, scheduler, MemoryUsage::DeviceLocal,
@@ -3117,6 +3337,7 @@ public:
 			depth_containment.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
 			depth_containment.view_info.level_count = 2;
 			const auto depth_containment_image      = texture_cache.FindImage(depth_containment);
+			(void)texture_cache.FindDepthTarget(depth_containment_image, depth_containment);
 			texture_cache.MarkGpuWritten(depth_containment_image);
 			Libs::Graphics::Buffer partial_depth(m_runtime_context, scheduler,
 			                                     MemoryUsage::DeviceLocal,
@@ -3159,6 +3380,7 @@ public:
 			    Prospero::GpuEnumValue(Prospero::BufferFormat::k32_32_32_32UInt),
 			    Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 16, 1);
 			const auto uncompressed_block_image = texture_cache.FindImage(uncompressed_block);
+			(void)texture_cache.FindTexture(uncompressed_block_image, uncompressed_block);
 			texture_cache.MarkGpuWritten(uncompressed_block_image);
 			auto compressed_block = MakeLinearDesc(
 			    base + block_alias_offset, sizeof(block_alias_data), vk::Format::eBc3UnormBlock,
@@ -3220,6 +3442,7 @@ public:
 			                   Prospero::GpuEnumValue(Prospero::BufferFormat::k16_16UNorm),
 			                   Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 4, 1);
 			const auto color_image = texture_cache.FindImage(color_desc);
+			(void)texture_cache.FindTexture(color_image, color_desc);
 			texture_cache.MarkGpuWritten(color_image);
 			const std::array<uint16_t, 2> refreshed_multisample_source {0x2000u, 0xe000u};
 			Require(name, "unequal-sample source CPU write",
@@ -3421,6 +3644,7 @@ public:
 			                   Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt),
 			                   Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 4, 1);
 			const auto mirror_image = texture_cache.FindImage(mirror_desc);
+			(void)texture_cache.FindTexture(mirror_image, mirror_desc);
 			texture_cache.MarkGpuWritten(mirror_image);
 			constexpr uint32_t mirror_cpu_value = 0x0f1e2d3cu;
 			Require(name, "CPU-dirty formatted mirror fault",
@@ -3448,6 +3672,7 @@ public:
 			                vk::AccessFlagBits::eTransferWrite);
 			auto       mirror_refresh_desc = mirror_desc;
 			const auto mirror_refresh      = texture_cache.FindImage(mirror_refresh_desc);
+			(void)texture_cache.FindTexture(mirror_refresh, mirror_refresh_desc);
 			Require(name, "buffer-to-image ownership",
 			        mirror_refresh == mirror_image &&
 			            !texture_cache.GetImage(mirror_refresh).IsBufferModified(),
@@ -3464,6 +3689,7 @@ public:
 			    Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt),
 			    Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 4, 1);
 			const auto exact_buffer_image = texture_cache.FindImage(exact_buffer_desc);
+			(void)texture_cache.FindTexture(exact_buffer_image, exact_buffer_desc);
 			texture_cache.MarkGpuWritten(exact_buffer_image);
 			auto exact_buffer_binding = resources.GetBufferCache().ObtainBuffer(
 			    command, exact_buffer_desc.info.data.address, exact_buffer_desc.info.data.size,
@@ -3482,6 +3708,7 @@ public:
 			    Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float);
 			exact_float_desc.view_info.format = vk::Format::eR32Sfloat;
 			const auto exact_float_image      = texture_cache.FindImage(exact_float_desc, true);
+			(void)texture_cache.FindTexture(exact_float_image, exact_float_desc);
 			Require(name, "Buffer-superseded exact coexistence",
 			        exact_float_image != exact_buffer_image &&
 			            TextureCacheTestAccess::Contains(texture_cache, exact_buffer_image) &&
@@ -3631,6 +3858,8 @@ public:
 			fault_b_desc.info.data.address = base + 0x8010;
 			const auto fault_a_image       = texture_cache.FindImage(fault_a_desc);
 			const auto fault_b_image       = texture_cache.FindImage(fault_b_desc);
+			(void)texture_cache.FindTexture(fault_a_image, fault_a_desc);
+			(void)texture_cache.FindTexture(fault_b_image, fault_b_desc);
 			texture_cache.MarkGpuWritten(fault_a_image);
 			texture_cache.MarkGpuWritten(fault_b_image);
 			Require(name, "per-image watcher installation",
@@ -3659,6 +3888,8 @@ public:
 			        "a byte-disjoint CPU write discarded authoritative images");
 			const auto retracked_a    = texture_cache.FindImage(fault_a_desc);
 			const auto retracked_b    = texture_cache.FindImage(fault_b_desc);
+			(void)texture_cache.FindTexture(retracked_a, fault_a_desc);
+			(void)texture_cache.FindTexture(retracked_b, fault_b_desc);
 			auto       fault_a_mirror = resources.GetBufferCache().ObtainBuffer(
 			    command, base + 0x8000, sizeof(fault_a), false, true, true);
 			if (fault_a_mirror.owner != nullptr) {
@@ -3683,8 +3914,10 @@ public:
 			        "the surviving image was not protected after its alias retired");
 			constexpr uint32_t fault_b_cpu = 0xa5a6a7a8u;
 			std::memcpy(memory + 0x8010, &fault_b_cpu, sizeof(fault_b_cpu));
+			const auto refreshed_b = texture_cache.FindImage(fault_b_desc);
+			(void)texture_cache.FindTexture(refreshed_b, fault_b_desc);
 			Require(name, "same-page survivor refresh",
-			        texture_cache.FindImage(fault_b_desc) == fault_b_image &&
+			        refreshed_b == fault_b_image &&
 			            !texture_cache.GetImage(fault_b_image).IsDefinitelyCpuDirty() &&
 			            texture_cache.GetImage(fault_b_image).IsGpuModified(),
 			        "the surviving image could not reconcile its CPU write");
@@ -3700,6 +3933,7 @@ public:
 			    Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt),
 			    Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 4, 1);
 			const auto publish_image = texture_cache.FindImage(publish_image_desc);
+			(void)texture_cache.FindTexture(publish_image, publish_image_desc);
 			texture_cache.MarkGpuWritten(publish_image);
 			resources.GetBufferCache().FillBuffer(
 			    base + publish_buffer_offset, sizeof(publish_buffer_value), publish_buffer_value);
@@ -3739,6 +3973,7 @@ public:
 				standalone_ms.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
 				standalone_ms.view_info.usage  = vk::ImageUsageFlagBits::eDepthStencilAttachment;
 				const auto image               = texture_cache.FindImage(standalone_ms);
+				(void)texture_cache.FindDepthTarget(image, standalone_ms);
 				texture_cache.MarkGpuWritten(image);
 				uint16_t standalone_cpu_read = 1;
 				std::memcpy(&standalone_cpu_read, memory + offset, sizeof(standalone_cpu_read));
@@ -3827,6 +4062,7 @@ public:
 			    Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt),
 			    Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 4, 1);
 			const auto unformatted_alias_image = texture_cache.FindImage(unformatted_alias);
+			(void)texture_cache.FindTexture(unformatted_alias_image, unformatted_alias);
 			texture_cache.MarkGpuWritten(unformatted_alias_image);
 			auto unformatted_alias_buffer = resources.GetBufferCache().ObtainBuffer(
 			    command, unformatted_alias.info.data.address, unformatted_alias.info.data.size,
@@ -3847,11 +4083,10 @@ public:
 			                                            0.625f, 0.75f,  0.875f, 1.0f,   0.0625f};
 			std::memset(memory + layered_offset, 0, layered_guest_size);
 			const auto layered_layout = TextureCalcUploadLayout(
-			    Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float), 2, 2, 2, 2, 2,
+			    Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float), 2, 2, 2, 2,
 			    Prospero::GpuEnumValue(Prospero::TileMode::kLinear), layered_guest_size, true,
 			    false, "UnifiedTextureCacheFlow");
-			const auto layered_upload_regions =
-			    TextureBuildImageCopies(layered_layout, 2, 2, 2, 2, true, false);
+			const auto layered_upload_regions = TextureBuildImageCopies(layered_layout);
 			Require(name, "layered guest layout", layered_upload_regions.size() == 4,
 			        "unexpected layered/mipped upload-region count");
 			for (const auto& region: layered_upload_regions) {
@@ -3881,6 +4116,7 @@ public:
 			layered_color.info.mip_layout[1]    = {32, 8, 1, 1};
 			layered_color.view_info.level_count = 2;
 			const auto layered_color_image      = texture_cache.FindImage(layered_color);
+			(void)texture_cache.FindTexture(layered_color_image, layered_color);
 			texture_cache.MarkGpuWritten(layered_color_image);
 			auto layered_depth                  = layered_color;
 			layered_depth.type                  = BindingType::DepthTarget;
@@ -3920,6 +4156,7 @@ public:
 			                   Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt),
 			                   Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 4, 1);
 			const auto replacement_source_image = texture_cache.FindImage(replacement_source);
+			(void)texture_cache.FindTexture(replacement_source_image, replacement_source);
 			texture_cache.MarkGpuWritten(replacement_source_image);
 			auto replacement_desc =
 			    MakeLinearDesc(base + replacement_offset, replacement_size, vk::Format::eR32Uint,
@@ -3960,7 +4197,7 @@ public:
 			compressed_desc.info.metadata.compression = VideoOutCompression::Dcc256_256_0;
 			compressed_desc.view_info.usage           = vk::ImageUsageFlagBits::eColorAttachment;
 			const auto compressed_image               = texture_cache.FindImage(compressed_desc);
-			texture_cache.MarkGpuWritten(compressed_image);
+			(void)texture_cache.FindRenderTarget(compressed_image, compressed_desc);
 			uint32_t compressed_cpu_read = 0;
 			std::memcpy(&compressed_cpu_read, memory + 0xc000, sizeof(compressed_cpu_read));
 			Require(name, "compressed write-only read policy",
@@ -4006,6 +4243,7 @@ public:
 			                   Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt),
 			                   Prospero::ImageType::kColor2D, {mixed_source_width, 1, 1}, 1, 4, 1);
 			const auto mixed_source_image = texture_cache.FindImage(mixed_source_desc);
+			(void)texture_cache.FindTexture(mixed_source_image, mixed_source_desc);
 			Require(name, "mixed-page image upload",
 			        !texture_cache.GetImage(mixed_source_image).IsGpuModified(),
 			        "clean Buffer source manufactured GPU image ownership");
@@ -4037,6 +4275,7 @@ public:
 			                   Prospero::GpuEnumValue(Prospero::BufferFormat::k8UNorm),
 			                   Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 1, 1);
 			const auto byte_mirror_image = texture_cache.FindImage(byte_mirror_desc);
+			(void)texture_cache.FindTexture(byte_mirror_image, byte_mirror_desc);
 			texture_cache.MarkGpuWritten(byte_mirror_image);
 			auto byte_mirror = resources.GetBufferCache().ObtainBuffer(
 			    command, base + byte_mirror_offset, 1, false, true, true);
@@ -4059,6 +4298,7 @@ public:
 			bgra16_desc.info.bgra16     = true;
 			bgra16_desc.view_info.usage = vk::ImageUsageFlagBits::eColorAttachment;
 			const auto bgra16_image     = texture_cache.FindImage(bgra16_desc);
+			(void)texture_cache.FindRenderTarget(bgra16_image, bgra16_desc);
 			auto  bgra16_readback = CreateHostBuffer(name, sizeof(bgra16_guest),
 			                                         vk::BufferUsageFlagBits::eTransferDst, {0, 0});
 			auto& bgra16_native   = texture_cache.GetImage(bgra16_image);
@@ -4350,6 +4590,7 @@ public:
 			                   Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt),
 			                   Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 4, 1);
 			const auto exact_image = texture_cache.FindImage(exact_image_desc);
+			(void)texture_cache.FindTexture(exact_image, exact_image_desc);
 			texture_cache.MarkGpuWritten(exact_image);
 			Require(name, "same-page exact alias ownership",
 			        resources.GetBufferCache().HasGpuDirtyBytes(base + dirty_sibling_offset,
@@ -4391,6 +4632,8 @@ public:
 			                                          gc_image_desc_a.info.data.size),
 			        "FindImageFromRange accepted an image without current GPU "
 			        "contents");
+			(void)texture_cache.FindTexture(gc_images[0], gc_image_desc_a);
+			(void)texture_cache.FindTexture(gc_images[1], gc_image_desc_b);
 			for (const auto image: gc_images) {
 				texture_cache.MarkGpuWritten(image);
 			}
@@ -4865,6 +5108,7 @@ public:
 			    vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
 			d16_depth_desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
 			const auto d16_depth_image     = texture_cache.FindImage(d16_depth_desc);
+			(void)texture_cache.FindDepthTarget(d16_depth_image, d16_depth_desc);
 			texture_cache.MarkGpuWritten(d16_depth_image);
 			auto d16_storage_desc              = d16_depth_desc;
 			d16_storage_desc.type              = BindingType::Storage;
@@ -5153,11 +5397,11 @@ public:
 		{
 			GpuResourceManager resources(m_runtime_context, scheduler);
 			resources.MapMemory(base, allocation_size);
-			const uint32_t pitch = TileGetTexturePitch(format, 1, 1, tile);
+			const uint32_t pitch = TileGetTexturePitch(format, 1, tile);
 			TileSizeAlign  total {};
 			TileSizeOffset mip {};
 			TilePaddedSize padded {};
-			TileGetTextureSize(format, 1, 1, pitch, 1, tile, &total, &mip, &padded);
+			TileGetTextureSize(format, 1, 1, 1, tile, &total, &mip, &padded);
 			Require(name, "tiled layout", total.size >= 8 && total.size <= allocation_size,
 			        "BGRA16 tiled layout exceeds its guest allocation");
 			std::memset(mapped, 0x5a, total.size);
@@ -5437,9 +5681,8 @@ public:
 
 			constexpr auto stencil_format = Prospero::GpuEnumValue(Prospero::BufferFormat::k8UInt);
 			constexpr auto linear         = Prospero::GpuEnumValue(Prospero::TileMode::kLinear);
-			const auto     stencil_pitch  = TileGetTexturePitch(stencil_format, 1, 1, linear);
 			TileSizeAlign  stencil_layout {};
-			TileGetTextureTotalSize(stencil_format, 1, 1, 1, stencil_pitch, 1, linear, false,
+			TileGetTextureTotalSize(stencil_format, 1, 1, 1, 1, linear, false,
 			                        stencil_layout);
 			Require(name, "stencil footprint",
 			        stencil_layout.size != 0 && stencil_layout.align != 0 &&
@@ -7689,7 +7932,7 @@ public:
 			TileSizeAlign  total {};
 			TileSizeOffset mip[levels] {};
 			TilePaddedSize padded[levels] {};
-			TileGetTextureSize(format, 65, 33, 72, levels,
+			TileGetTextureSize(format, 65, 33, levels,
 			                   Prospero::GpuEnumValue(Prospero::TileMode::kStandard256B), &total,
 			                   mip, padded);
 			constexpr u32 offsets[levels] = {0x1a00, 0xb00, 0x500, 0x300, 0x200, 0x100, 0};
@@ -7798,18 +8041,57 @@ public:
 		struct StandardMode {
 			u32             tile;
 			TileBlockFamily family;
-			bool (*supported)(u32);
 		};
 		constexpr StandardMode standard_modes[] = {
 		    {Prospero::GpuEnumValue(Prospero::TileMode::kStandard256B),
-		     TileBlockFamily::Standard256B, TileIsStandard256BTextureSupported},
-		    {Prospero::GpuEnumValue(Prospero::TileMode::kStandard4KB), TileBlockFamily::Standard4KB,
-		     TileIsStandard4KBTextureSupported},
+		     TileBlockFamily::Standard256B},
+		    {Prospero::GpuEnumValue(Prospero::TileMode::kStandard4KB),
+		     TileBlockFamily::Standard4KB},
 		    {Prospero::GpuEnumValue(Prospero::TileMode::kStandard64KB),
-		     TileBlockFamily::Standard64KB, TileIsStandard64KBTextureSupported},
-		    {Prospero::GpuEnumValue(Prospero::TileMode::kPrt), TileBlockFamily::Prt64KB,
-		     TileIsStandard64KBTextureSupported},
+		     TileBlockFamily::Standard64KB},
+		    {Prospero::GpuEnumValue(Prospero::TileMode::kPrt), TileBlockFamily::Prt64KB},
 		};
+		for (const auto format: {Prospero::BufferFormat::k8Srgb,
+		                         Prospero::BufferFormat::k8_8Srgb,
+		                         Prospero::BufferFormat::k9_9_9_5Float}) {
+			for (const auto tile: {Prospero::TileMode::kDepth,
+			                       Prospero::TileMode::kRenderTarget}) {
+				TileTextureBlockLayout texture {};
+				Require(name, "RT format policy",
+				        !TileGetTextureBlockLayout(Prospero::GpuEnumValue(format),
+				                                   Prospero::GpuEnumValue(tile), false, texture),
+				        "non-render-target format admitted by an RT/depth tile family");
+			}
+		}
+		{
+			TileSurfaceLayout invalid {};
+			const TileSurfaceDescription description {
+			    Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float),
+			    Prospero::GpuEnumValue(Prospero::TileMode::kStandard256B),
+			    TileSurfaceDimension::Dim3D,
+			    16,
+			    16,
+			    16,
+			    1,
+			    1,
+			};
+			Require(name, "3D tile policy", !TileGetTiledTextureLayout(description, invalid),
+			        "Standard256B volume silently fell back to a 2D array layout");
+		}
+		{
+			constexpr u32 format =
+			    Prospero::GpuEnumValue(Prospero::BufferFormat::kFmask8_S4_F4);
+			constexpr u32 tile = Prospero::GpuEnumValue(Prospero::TileMode::kStandard64KB);
+			TileSizeAlign total {};
+			TileGetTextureSize(format, 128, 128, 1, tile, &total, nullptr, nullptr);
+			const auto layout = TextureCalcUploadLayout(format, 128, 128, 1, 1, tile, total.size,
+			                                            false, false, name);
+			const auto regions = TextureBuildImageCopies(layout);
+			std::vector<GpuTileInfo> infos;
+			Require(name, "FMASK policy",
+			        !TextureBuildGpuTileInfos(total.size, regions, layout, 1, infos),
+			        "FMASK entered the texel tiler through a non-depth family");
+		}
 		u32 format_cases = 0;
 		for (u32 format = 1; format <= Prospero::GpuEnumValue(Prospero::BufferFormat::kBc7Srgb);
 		     ++format) {
@@ -7819,30 +8101,28 @@ public:
 				continue;
 			}
 			for (const auto& mode: standard_modes) {
-				if (!mode.supported(format)) {
+				TileTextureBlockLayout texture {};
+				if (!TileGetTextureBlockLayout(format, mode.tile, false, texture)) {
 					continue;
 				}
-				const u32       bpe = std::max(Prospero::NumBytesPerElement(format),
-				                               Prospero::BlockCompressedBytesPerBlock(format));
-				TileBlockLayout block {};
-				Require(name, "format block", TileGetBlockLayout(mode.family, bpe, block),
-				        "CPU-supported format has no GPU family/BPE mapping");
+				const u32 bpe = texture.block.bytes_per_element;
+				Require(name, "format block", texture.block.family == mode.family,
+				        "CPU-supported format selected the wrong block family");
 
 				constexpr u32 width  = 67;
 				constexpr u32 height = 51;
-				const u32     pitch  = TileGetTexturePitch(format, width, 1, mode.tile);
+				const u32     pitch  = TileGetTexturePitch(format, width, mode.tile);
 				TileSizeAlign total {};
-				TileGetTextureSize(format, width, height, pitch, 1, mode.tile, &total, nullptr,
+				TileGetTextureSize(format, width, height, 1, mode.tile, &total, nullptr,
 				                   nullptr);
 				Require(name, "format size", total.size != 0,
 				        "supported format has an empty layout");
 
 				const auto layout = TextureCalcUploadLayout(
-				    format, width, height, 1, 1, pitch, mode.tile, total.size, false, false, name);
-				const auto regions =
-				    TextureBuildImageCopies(layout, width, height, 1, 1, false, false);
+				    format, width, height, 1, 1, mode.tile, total.size, false, false, name);
+				const auto regions = TextureBuildImageCopies(layout);
 				std::vector<GpuTileInfo> infos;
-				if (!TextureBuildGpuTileInfos(total.size, regions, layout, format, 1, 1, infos)) {
+				if (!TextureBuildGpuTileInfos(total.size, regions, layout, 1, infos)) {
 					std::ostringstream out;
 					out << "format=" << format << " tile=" << mode.tile << " size=" << total.size
 					    << " pitch=" << pitch;
@@ -7867,26 +8147,30 @@ public:
 		        "no CPU-supported standard formats were tested");
 
 		{
+			constexpr u32 format = Prospero::GpuEnumValue(Prospero::BufferFormat::k32_32_32Float);
+			TileTextureElementLayout element {};
+			Require(name, "RGB32 texture policy", !TileGetTextureElementLayout(format, element),
+			        "12-byte texel layouts must be rejected");
+		}
+
+		{
 			constexpr u32 format = Prospero::GpuEnumValue(Prospero::BufferFormat::kBc1UNorm);
 			constexpr u32 tile = Prospero::GpuEnumValue(Prospero::TileMode::kStandard64KB);
 			constexpr u32 width = 256, height = 256, levels = 9;
-			const u32     pitch = TileGetTexturePitch(format, width, levels, tile);
 			TileSizeAlign total {};
-			TileGetTextureSize(format, width, height, pitch, levels, tile, &total, nullptr,
+			TileGetTextureSize(format, width, height, levels, tile, &total, nullptr,
 			                   nullptr);
-			const auto layout = TextureCalcUploadLayout(format, width, height, levels, 1, pitch,
-			                                            tile, total.size, false, false, name);
-			const auto regions =
-			    TextureBuildImageCopies(layout, width, height, 1, levels, false, false);
+			const auto layout = TextureCalcUploadLayout(format, width, height, levels, 1, tile,
+			                                            total.size, false, false, name);
+			const auto regions = TextureBuildImageCopies(layout);
 			std::vector<GpuTileInfo> infos;
-			const bool built =
-			    TextureBuildGpuTileInfos(total.size, regions, layout, format, 1, levels, infos);
+			const bool built = TextureBuildGpuTileInfos(total.size, regions, layout, levels, infos);
 			uint64_t linear_size = 0;
 			for (const auto& info: infos) {
 				linear_size = std::max(linear_size, info.linear_offset + info.linear_size);
 			}
 			Require(name, "BC1 mip-tail capacities",
-			        built && total.size == 0x10000 && layout.first_tail_level == 0 &&
+			        built && total.size == 0x10000 && layout.surface.first_tail_level == 0 &&
 			            linear_size == 0x15560 && linear_size > total.size,
 			        "BC1 mip tail conflated tiled and linear capacities");
 			check_round_trip("BC1 mip tail", total.size, infos);
@@ -7896,16 +8180,13 @@ public:
 			constexpr u32 format = Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float);
 			constexpr u32 tile   = Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget);
 			constexpr u32 width = 129, height = 65, layers = 3;
-			const u32     pitch = TileGetTexturePitch(format, width, 1, tile);
 			TileSizeAlign total {};
-			TileGetTextureTotalSize(format, width, height, layers, pitch, 1, tile, false, total);
-			const auto layout = TextureCalcUploadLayout(format, width, height, 1, layers, pitch,
-			                                            tile, total.size, true, false, name);
-			const auto regions =
-			    TextureBuildImageCopies(layout, width, height, layers, 1, true, false);
+			TileGetTextureTotalSize(format, width, height, layers, 1, tile, false, total);
+			const auto layout = TextureCalcUploadLayout(format, width, height, 1, layers, tile,
+			                                            total.size, true, false, name);
+			const auto regions = TextureBuildImageCopies(layout);
 			std::vector<GpuTileInfo> infos;
-			const bool               built =
-			    TextureBuildGpuTileInfos(total.size, regions, layout, format, layers, 1, infos);
+			const bool built = TextureBuildGpuTileInfos(total.size, regions, layout, 1, infos);
 			Require(name, "array infos",
 			        built && infos.size() == layers && infos[0].surface_z == 0 &&
 			            infos[1].surface_z == 1 && infos[2].surface_z == 2,
@@ -7921,18 +8202,16 @@ public:
 			        "odd multi-mip format has no block layout");
 			const u32     width  = block.block_width * 2u + 1u;
 			const u32     height = block.block_height * 2u + 1u;
-			const u32     pitch  = TileGetTexturePitch(format, width, levels, mode.tile);
 			TileSizeAlign total {};
-			TileGetTextureSize(format, width, height, pitch, levels, mode.tile, &total, nullptr,
+			TileGetTextureSize(format, width, height, levels, mode.tile, &total, nullptr,
 			                   nullptr);
-			const auto layout = TextureCalcUploadLayout(format, width, height, levels, 1, pitch,
-			                                            mode.tile, total.size, false, false, name);
-			const auto regions =
-			    TextureBuildImageCopies(layout, width, height, 1, levels, false, false);
+			const auto layout = TextureCalcUploadLayout(format, width, height, levels, 1, mode.tile,
+			                                            total.size, false, false, name);
+			const auto regions = TextureBuildImageCopies(layout);
 			std::vector<GpuTileInfo> infos;
 			Require(
 			    name, "odd mip infos",
-			    TextureBuildGpuTileInfos(total.size, regions, layout, format, 1, levels, infos) &&
+			    TextureBuildGpuTileInfos(total.size, regions, layout, levels, infos) &&
 			        infos.size() == 2 && infos[1].tiled_width >= infos[1].pitch &&
 			        infos[1].tiled_height >= infos[1].height &&
 			        (mode.family == TileBlockFamily::Standard256B ||
@@ -7964,19 +8243,16 @@ public:
 			        "2D tail mode has no block layout");
 			const u32     width  = block.block_width * 2u;
 			const u32     height = block.block_height * 2u;
-			const u32     pitch  = TileGetTexturePitch(format, width, levels, mode.tile);
 			TileSizeAlign total {};
-			TileGetTextureSize(format, width, height, pitch, levels, mode.tile, &total, nullptr,
+			TileGetTextureSize(format, width, height, levels, mode.tile, &total, nullptr,
 			                   nullptr);
-			const auto layout = TextureCalcUploadLayout(format, width, height, levels, 1, pitch,
-			                                            mode.tile, total.size, true, false, name);
-			const auto regions =
-			    TextureBuildImageCopies(layout, width, height, 1, levels, false, false);
+			const auto layout = TextureCalcUploadLayout(format, width, height, levels, 1, mode.tile,
+			                                            total.size, true, false, name);
+			const auto regions = TextureBuildImageCopies(layout);
 			std::vector<GpuTileInfo> infos;
 			Require(name, "2D mip tail seam",
-			        layout.first_tail_level == 2 &&
-			            TextureBuildGpuTileInfos(total.size, regions, layout, format, 1, levels,
-			                                     infos) &&
+			        layout.surface.first_tail_level == 2 &&
+			            TextureBuildGpuTileInfos(total.size, regions, layout, levels, infos) &&
 			            infos.size() == levels && !infos[0].tail && !infos[1].tail &&
 			            std::all_of(infos.begin() + 2, infos.end(),
 			                        [](const auto& info) { return info.tail; }),
@@ -7991,16 +8267,13 @@ public:
 			constexpr u32 height = 129;
 			constexpr u32 depth  = 17;
 			constexpr u32 levels = 2;
-			const u32     pitch  = TileGetTexturePitch(format, width, levels, tile);
 			TileSizeAlign total {};
-			TileGetTextureTotalSize(format, width, height, depth, pitch, levels, tile, true, total);
-			const auto layout = TextureCalcUploadLayout(format, width, height, levels, depth, pitch,
-			                                            tile, total.size, false, true, name);
-			const auto regions =
-			    TextureBuildImageCopies(layout, width, height, depth, levels, false, true);
+			TileGetTextureTotalSize(format, width, height, depth, levels, tile, true, total);
+			const auto layout = TextureCalcUploadLayout(format, width, height, levels, depth, tile,
+			                                            total.size, false, true, name);
+			const auto regions = TextureBuildImageCopies(layout);
 			std::vector<GpuTileInfo> infos;
-			const bool               built =
-			    TextureBuildGpuTileInfos(total.size, regions, layout, format, depth, levels, infos);
+			const bool built = TextureBuildGpuTileInfos(total.size, regions, layout, levels, infos);
 			Require(name, "3D mip infos",
 			        regions.size() == depth + (depth >> 1u) && built && infos.size() == 4 &&
 			            infos[0].depth == 8 && infos[1].depth == 8 && infos[2].depth == 1 &&
@@ -8020,17 +8293,14 @@ public:
 			constexpr u32 height = 129;
 			constexpr u32 depth  = 17;
 			constexpr u32 levels = 2;
-			const u32     pitch  = TileGetTexturePitch(format, width, levels, tile);
 			TileSizeAlign total {};
-			TileGetTextureTotalSize(format, width, height, depth, pitch, levels, tile, true, total);
-			const auto layout = TextureCalcUploadLayout(format, width, height, levels, depth, pitch,
-			                                            tile, total.size, false, true, name);
-			const auto regions =
-			    TextureBuildImageCopies(layout, width, height, depth, levels, false, true);
+			TileGetTextureTotalSize(format, width, height, depth, levels, tile, true, total);
+			const auto layout = TextureCalcUploadLayout(format, width, height, levels, depth, tile,
+			                                            total.size, false, true, name);
+			const auto regions = TextureBuildImageCopies(layout);
 			std::vector<GpuTileInfo> infos;
 			Require(name, "3D BC mip infos",
-			        TextureBuildGpuTileInfos(total.size, regions, layout, format, depth, levels,
-			                                 infos) &&
+			        TextureBuildGpuTileInfos(total.size, regions, layout, levels, infos) &&
 			            infos.size() == 4 && infos[3].pitch == 8 && infos[3].height == 16 &&
 			            infos[3].tiled_width == 16 && infos[3].tiled_height == 24,
 			        "block-compressed 3D mip lost its physical row or slice stride");
@@ -8041,14 +8311,12 @@ public:
 			constexpr u32 format = Prospero::GpuEnumValue(Prospero::BufferFormat::kBc3UNorm);
 			constexpr u32 tile   = Prospero::GpuEnumValue(Prospero::TileMode::kLinear);
 			constexpr u32 width = 8, height = 8, levels = 4;
-			const u32     pitch = TileGetTexturePitch(format, width, levels, tile);
 			TileSizeAlign total {};
-			TileGetTextureSize(format, width, height, pitch, levels, tile, &total, nullptr,
+			TileGetTextureSize(format, width, height, levels, tile, &total, nullptr,
 			                   nullptr);
-			const auto layout = TextureCalcUploadLayout(format, width, height, levels, 1, pitch,
-			                                            tile, total.size, false, false, name);
-			const auto regions =
-			    TextureBuildImageCopies(layout, width, height, 1, levels, false, false);
+			const auto layout = TextureCalcUploadLayout(format, width, height, levels, 1, tile,
+			                                            total.size, false, false, name);
+			const auto regions = TextureBuildImageCopies(layout);
 			Require(name, "linear BC native regions",
 			        regions.size() == levels &&
 			            std::all_of(regions.begin(), regions.end(),
@@ -8086,18 +8354,15 @@ public:
 		};
 		for (const auto test: volume_modes) {
 			constexpr u32 width = 65, height = 33, depth = 37, levels = 6;
-			const u32     pitch = TileGetTexturePitch(test.format, width, levels, test.tile);
 			TileSizeAlign total {};
-			TileGetTextureTotalSize(test.format, width, height, depth, pitch, levels, test.tile,
-			                        true, total);
+			TileGetTextureTotalSize(test.format, width, height, depth, levels, test.tile, true,
+			                        total);
 			const auto layout =
-			    TextureCalcUploadLayout(test.format, width, height, levels, depth, pitch, test.tile,
+			    TextureCalcUploadLayout(test.format, width, height, levels, depth, test.tile,
 			                            total.size, true, true, name);
-			const auto regions =
-			    TextureBuildImageCopies(layout, width, height, depth, levels, false, true);
+			const auto regions = TextureBuildImageCopies(layout);
 			std::vector<GpuTileInfo> infos;
-			const bool built  = TextureBuildGpuTileInfos(total.size, regions, layout, test.format,
-			                                             depth, levels, infos);
+			const bool built = TextureBuildGpuTileInfos(total.size, regions, layout, levels, infos);
 			const bool uses_z = test.family == TileBlockFamily::RenderTarget64KB ||
 			                    test.family == TileBlockFamily::Depth64KB;
 			Require(
@@ -8140,21 +8405,18 @@ public:
 			const u32     width      = block.block_width * (compressed ? 4u : 1u);
 			const u32     height     = block.block_height / 2u * (compressed ? 4u : 1u);
 			const u32     depth      = block.block_depth + 1u;
-			const u32     pitch      = TileGetTexturePitch(tail.format, width, levels, tile);
 			TileSizeAlign total {};
-			TileGetTextureTotalSize(tail.format, width, height, depth, pitch, levels, tile, true,
+			TileGetTextureTotalSize(tail.format, width, height, depth, levels, tile, true,
 			                        total);
 			const auto layout = TextureCalcUploadLayout(tail.format, width, height, levels, depth,
-			                                            pitch, tile, total.size, false, true, name);
-			const auto regions =
-			    TextureBuildImageCopies(layout, width, height, depth, levels, false, true);
+			                                            tile, total.size, false, true, name);
+			const auto regions = TextureBuildImageCopies(layout);
 			std::vector<GpuTileInfo> infos;
 			bool                     valid =
 			    total.size == 8192 &&
 			    regions.size() == depth + std::max(depth >> 1u, 1u) + std::max(depth >> 2u, 1u) +
 			                          std::max(depth >> 3u, 1u) + std::max(depth >> 4u, 1u) &&
-			    TextureBuildGpuTileInfos(total.size, regions, layout, tail.format, depth, levels,
-			                             infos) &&
+			    TextureBuildGpuTileInfos(total.size, regions, layout, levels, infos) &&
 			    infos.size() == 6;
 			const u32 table = std::countr_zero(tail.bytes);
 			for (u32 level = 0; level < levels && valid; level++) {
@@ -8252,15 +8514,14 @@ public:
 		constexpr u32 volume_width = 8, volume_height = 4, volume_depth = 5;
 		constexpr u32 volume_levels = 3;
 		const u32     volume_pitch =
-		    TileGetTexturePitch(volume_format, volume_width, volume_levels, volume_tile);
+		    TileGetTexturePitch(volume_format, volume_width, volume_tile);
 		TileSizeAlign volume_size {};
 		TileGetTextureTotalSize(volume_format, volume_width, volume_height, volume_depth,
-		                        volume_pitch, volume_levels, volume_tile, true, volume_size);
+		                        volume_levels, volume_tile, true, volume_size);
 		const auto volume_layout = TextureCalcUploadLayout(
-		    volume_format, volume_width, volume_height, volume_levels, volume_depth, volume_pitch,
-		    volume_tile, volume_size.size, true, true, name);
-		const auto volume_copies = TextureBuildImageCopies(
-		    volume_layout, volume_width, volume_height, volume_depth, volume_levels, false, true);
+		    volume_format, volume_width, volume_height, volume_levels, volume_depth, volume_tile,
+		    volume_size.size, true, true, name);
+		const auto volume_copies = TextureBuildImageCopies(volume_layout);
 		std::vector<u32>                    volume_source(volume_size.size / sizeof(u32), 0);
 		std::vector<std::pair<size_t, u32>> volume_probes;
 		for (const auto& copy: volume_copies) {
@@ -8295,9 +8556,10 @@ public:
 		volume_info.bytes_per_block = sizeof(u32);
 		volume_info.tile_mode       = volume_tile;
 		for (u32 level = 0; level < volume_levels; level++) {
-			volume_info.mip_layout[level] = {
-			    volume_layout.level_sizes[level].offset, volume_layout.level_sizes[level].size,
-			    volume_layout.padded_sizes[level].width, volume_layout.padded_sizes[level].height};
+			volume_info.mip_layout[level] = {volume_layout.mips[level].offset,
+			                                 volume_layout.mips[level].size,
+			                                 volume_layout.mips[level].row_length,
+			                                 volume_layout.mips[level].image_height};
 		}
 		Libs::Graphics::Image volume_image(m_runtime_context, scheduler, volume_info);
 		volume_image.Upload(volume_copies, volume_upload.buffer, 0, volume_size.size);
@@ -9050,6 +9312,8 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode, const std::set<ShaderOpcode>& 
 		case Opcode::BufferAtomicAnd:
 		case Opcode::BufferAtomicOr:
 		case Opcode::BufferAtomicXor:
+		case Opcode::BufferAtomicFMin:
+		case Opcode::BufferAtomicFMax:
 		case Opcode::FlatLoadUbyte:
 		case Opcode::FlatLoadSbyte:
 		case Opcode::FlatLoadUshort:
@@ -9580,6 +9844,8 @@ TestCase ScalarCompareOps() {
 	code.push_back(EncodeSMovB32(11, InlineU32(0)));
 	code.push_back(EncodeSMovB32(12, InlineU32(2)));
 	code.push_back(EncodeSMovB32(13, InlineU32(0)));
+	code.push_back(EncodeSMovB32(14, InlineU32(1)));
+	code.push_back(EncodeSMovB32(15, InlineU32(1)));
 
 	u32  dst            = 20;
 	auto append_compare = [&](u32 opcode, u32 src0, u32 src1) {
@@ -9597,9 +9863,13 @@ TestCase ScalarCompareOps() {
 	append_compare(0x08, 4, 3);
 	append_compare(0x09, 4, 4);
 	append_compare(0x0b, 3, 4);
+	append_compare(0x12, 10, 10);
+	append_compare(0x12, 10, 12);
+	append_compare(0x12, 10, 14);
 	append_compare(0x13, 10, 12);
+	append_compare(0x13, 10, 14);
 
-	for (u32 i = 0; i < 11u; i++) {
+	for (u32 i = 0; i < 15u; i++) {
 		AppendStoreSgpr(&code, 20u + i, i);
 	}
 	AppendEnd(&code);
@@ -9607,10 +9877,10 @@ TestCase ScalarCompareOps() {
 	return {"ScalarCompareOps",
 	        code,
 	        {},
-	        std::vector<u32>(11, 1),
+	        {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 1, 1},
 	        {O::SMovB32, O::SCmpEqI32, O::SCmpLgI32, O::SCmpGtI32, O::SCmpGeI32, O::SCmpLtI32,
-	         O::SCmpLeI32, O::SCmpLgU32, O::SCmpGtU32, O::SCmpGeU32, O::SCmpLeU32, O::SCmpLgU64,
-	         O::SCselectB32, O::VMovB32, O::BufferStoreDword, O::SEndpgm}};
+	         O::SCmpLeI32, O::SCmpLgU32, O::SCmpGtU32, O::SCmpGeU32, O::SCmpLeU32, O::SCmpEqU64,
+	         O::SCmpLgU64, O::SCselectB32, O::VMovB32, O::BufferStoreDword, O::SEndpgm}};
 }
 
 TestCase ScalarShiftAddAndMaskOps() {
@@ -10108,6 +10378,73 @@ TestCase VectorIntegerOps() {
 	         O::VLshlrevB32, O::VLshrB32,         O::VLshrrevB32,  O::VAshrI32,   O::VAshrrevI32,
 	         O::VNotB32,     O::VBfrevB32,        O::VFfblB32,     O::VFfbhU32,   O::VCmpEqU32,
 	         O::VCndmaskB32, O::BufferStoreDword, O::SEndpgm}};
+}
+
+TestCase Vop2SdwaSubNcExactByte2Destination() {
+	using O = ShaderOpcode;
+
+	std::vector<u32> code;
+	AppendVMovU32(&code, 11, 2);
+	code.push_back(0x4c1616f9u);
+	code.push_back(0x0686128du);
+	AppendStoreVgpr(&code, 11, 0);
+	AppendEnd(&code);
+
+	TestCase test;
+	test.name           = "Vop2SdwaSubNcExactByte2Destination";
+	test.code           = code;
+	test.expected       = {0x000b0002u};
+	test.opcodes        = {O::VMovB32, O::VSubNcU32, O::BufferStoreDword, O::SEndpgm};
+	test.required_spirv = {"OpISub", "OpShiftLeftLogical", "OpBitwiseOr"};
+	return test;
+}
+
+TestCase Vop2SdwaSubNcPreservesByteAndWordDestinations() {
+	using O = ShaderOpcode;
+
+	std::vector<u32> code;
+	AppendVMovU32(&code, 0, 3);
+	for (u32 dst = 10; dst <= 15; dst++) {
+		AppendVMovLiteral(&code, dst, 0xa1b2c3d4u);
+	}
+	for (u32 sel = 0; sel <= 5; sel++) {
+		code.push_back(EncodeVop2(0x26, 10 + sel, 249, 0));
+		code.push_back(EncodeVop2Sdwa(InlineU32(20), sel, 2, 6, 6, 0, 0, 0, 0, 0, 0, 1));
+		AppendStoreVgpr(&code, 10 + sel, sel);
+	}
+	AppendEnd(&code);
+
+	return {"Vop2SdwaSubNcPreservesByteAndWordDestinations",
+	        code,
+	        {},
+	        {0xa1b2c311u, 0xa1b211d4u, 0xa111c3d4u, 0x11b2c3d4u, 0xa1b20011u,
+	         0x0011c3d4u},
+	        {O::VMovB32, O::VSubNcU32, O::BufferStoreDword, O::SEndpgm}};
+}
+
+TestCase Vop2SdwaMinU32PreservesWordDestination() {
+	using O = ShaderOpcode;
+
+	std::vector<u32> code;
+	AppendVMovLiteral(&code, 10, 0xa1b2c3d4u);
+	AppendVMovU32(&code, 12, 7);
+	code.push_back(0x261418f9u);
+	code.push_back(0x0686149fu);
+	AppendStoreVgpr(&code, 10, 0);
+	AppendVMovLiteral(&code, 10, 0xa1b2c3d4u);
+	AppendVMovU32(&code, 12, 64);
+	code.push_back(0x261418f9u);
+	code.push_back(0x0686149fu);
+	AppendStoreVgpr(&code, 10, 1);
+	AppendEnd(&code);
+
+	TestCase test;
+	test.name           = "Vop2SdwaMinU32PreservesWordDestination";
+	test.code           = code;
+	test.expected       = {0xa1b20007u, 0xa1b2001fu};
+	test.opcodes        = {O::VMovB32, O::VMinU32, O::BufferStoreDword, O::SEndpgm};
+	test.required_spirv = {"OpULessThan", "OpSelect", "OpBitwiseOr"};
+	return test;
 }
 
 TestCase VectorShiftCountsMaskLowBits() {
@@ -11593,6 +11930,33 @@ TestCase VectorVop3CompareNeU64OnGpu() {
 	         O::SEndpgm}};
 }
 
+TestCase VectorVop3CompareEqI64OnGpu() {
+	using O = ShaderOpcode;
+
+	std::vector<u32> code;
+	code.push_back(EncodeVop1(0x01, 1, InlineU32(1)));
+	code.push_back(EncodeSop1(0x04, 4, 126)); // s_mov_b64 s[4:5], exec
+
+	code.push_back(0xd4a2006au);
+	code.push_back(0x0000087eu); // v_cmp_eq_i64 vcc, exec, s[4:5]
+	code.push_back(EncodeVop2(0x01, 2, InlineU32(0), 1));
+	AppendStoreVgpr(&code, 2, 0);
+
+	AppendSMovLiteral(&code, 4, 0);
+	code.push_back(0xd4a2006au);
+	code.push_back(0x0000087eu); // low dword mismatch
+	code.push_back(EncodeVop2(0x01, 3, InlineU32(0), 1));
+	AppendStoreVgpr(&code, 3, 1);
+	AppendEnd(&code);
+
+	return {"VectorVop3CompareEqI64OnGpu",
+	        code,
+	        {},
+	        {1, 0},
+	        {O::VMovB32, O::SMovB64, O::VCmpEqI64, O::VCndmaskB32, O::SMovB32,
+	         O::BufferStoreDword, O::SEndpgm}};
+}
+
 TestCase VectorCompareClassF32() {
 	using O = ShaderOpcode;
 
@@ -11706,6 +12070,32 @@ TestCase Vop2SdwaCndmaskSourceModifier() {
 	        {},
 	        {0xbf800000u},
 	        {O::VMovB32, O::VCmpTU32, O::VCndmaskB32, O::BufferStoreDword, O::SEndpgm}};
+}
+
+TestCase Vop2SdwaCndmaskFullDestinationWithSubDwordSource() {
+	using O = ShaderOpcode;
+
+	std::vector<u32> code;
+	AppendVMovLiteral(&code, 0, 0xabcd1234u);
+	AppendVMovLiteral(&code, 1, 0x55667788u);
+	code.push_back(EncodeVopc(0xc0, Vgpr(0), 0)); // v_cmp_f_u32
+	code.push_back(0x020e02f9u);
+	code.push_back(0x06040600u);
+	AppendStoreVgpr(&code, 7, 0);
+	code.push_back(EncodeVopc(0xc7, Vgpr(0), 0)); // v_cmp_t_u32
+	code.push_back(0x020e02f9u);
+	code.push_back(0x06040600u);
+	AppendStoreVgpr(&code, 7, 1);
+	AppendEnd(&code);
+
+	TestCase test;
+	test.name           = "Vop2SdwaCndmaskFullDestinationWithSubDwordSource";
+	test.code           = code;
+	test.expected       = {0x00001234u, 0x55667788u};
+	test.opcodes        = {O::VMovB32, O::VCmpFU32, O::VCmpTU32, O::VCndmaskB32,
+	                       O::BufferStoreDword, O::SEndpgm};
+	test.required_spirv = {"OpBitFieldUExtract", "OpSelect"};
+	return test;
 }
 
 TestCase Vop3CndmaskUsesSgprMaskLaneBits() {
@@ -13803,6 +14193,192 @@ TestCase BufferAtomicGlc0DoesNotReturnOldValue() {
 	        {O::VMovB32, O::BufferAtomicAdd, O::BufferStoreDword, O::SEndpgm}};
 }
 
+TestCase BufferAtomicFMinExactRawGlcModes() {
+	using O = ShaderOpcode;
+
+	std::vector<u32> code;
+	AppendVMovLiteral(&code, 0, 0x40000000u); // 2.0
+	code.push_back(0xe0fc0000u);
+	code.push_back(0x80010000u); // exact failing buffer_atomic_fmin, GLC=0
+	AppendStoreVgpr(&code, 0, 1);
+	AppendVMovLiteral(&code, 0, 0x3f800000u); // 1.0
+	code.push_back(0xe0fc4000u);
+	code.push_back(0x80010000u); // same instruction with GLC=1
+	AppendStoreVgpr(&code, 0, 2);
+	AppendEnd(&code);
+
+	TestCase test;
+	test.name     = "BufferAtomicFMinExactRawGlcModes";
+	test.code     = code;
+	test.initial  = {0x40800000u, 0, 0}; // 4.0
+	test.expected = {0x3f800000u, 0x40000000u, 0x40000000u};
+	test.opcodes  = {O::VMovB32, O::BufferAtomicFMin, O::BufferStoreDword, O::SEndpgm};
+	const auto descriptor =
+	    MakeStructuredStorageBufferData(0, static_cast<u32>(test.initial.size() * sizeof(u32)));
+	std::copy_n(descriptor.begin(), 4, test.user_data.begin() + 4);
+	test.user_data[50] = 1u << 20u;
+	test.has_user_data = true;
+	return test;
+}
+
+TestCase BufferAtomicFMinSpecialValues() {
+	using O = ShaderOpcode;
+
+	const u32 values[] = {
+	    0x40000000u, // 2.0
+	    0x7f800000u, // +infinity
+	    0xff800000u, // -infinity
+	    0x3f800000u, // 1.0
+	    0x7fc00000u, // quiet NaN
+	    0x00000000u, // +0.0
+	    0x80000000u, // -0.0
+	    0x00000000u, // +0.0
+	    0x80000001u, // smallest negative denorm
+	};
+	std::vector<u32> code;
+	for (u32 i = 0; i < static_cast<u32>(std::size(values)); i++) {
+		AppendVMovU32(&code, 20, i * 4u);
+		AppendVMovLiteral(&code, i, values[i]);
+		AppendBufferStoreOpcode(&code, 0x3f, i, 20, true);
+	}
+	for (u32 i = 0; i < static_cast<u32>(std::size(values)); i++) {
+		AppendStoreVgpr(&code, i, i + static_cast<u32>(std::size(values)));
+	}
+	AppendEnd(&code);
+
+	return {"BufferAtomicFMinSpecialValues",
+	        code,
+	        {0x40800000u, 0xbf800000u, 0x7f800000u, 0x7fc00000u, 0x3f800000u,
+	         0x80000000u, 0x00000000u, 0x00000001u, 0x00000000u, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+	        {0x40000000u, 0xbf800000u, 0xff800000u, 0x7fc00000u, 0x3f800000u,
+	         0x80000000u, 0x00000000u, 0x00000000u, 0x80000001u, 0x40800000u,
+	         0xbf800000u, 0x7f800000u, 0x7fc00000u, 0x3f800000u, 0x80000000u,
+	         0x00000000u, 0x00000001u, 0x00000000u},
+	        {O::VMovB32, O::BufferAtomicFMin, O::BufferStoreDword, O::SEndpgm}};
+}
+
+TestCase BufferAtomicFMinContendedWorkgroup() {
+	using O = ShaderOpcode;
+
+	std::vector<u32> code;
+	code.push_back(EncodeVop1(0x06, 1, Vgpr(0))); // v_cvt_f32_u32 v1, thread_id.x
+	AppendVMovU32(&code, 20, 0);
+	AppendBufferStoreOpcode(&code, 0x3f, 1, 20);
+	AppendEnd(&code);
+
+	TestCase test;
+	test.name     = "BufferAtomicFMinContendedWorkgroup";
+	test.code     = code;
+	test.initial  = {0x42c80000u}; // 100.0
+	test.expected = {0x00000000u}; // min(100.0, 0.0 .. 63.0)
+	test.opcodes  = {O::VCvtF32U32, O::VMovB32, O::BufferAtomicFMin, O::SEndpgm};
+	test.compute_info.threads_num[0] = 64;
+	test.compute_info.threads_num[1] = 1;
+	test.compute_info.threads_num[2] = 1;
+	test.compute_info.thread_ids_num = 1;
+	test.has_compute_info            = true;
+	return test;
+}
+
+TestCase BufferAtomicFMaxExactRawGlcModes() {
+	using O = ShaderOpcode;
+
+	std::vector<u32> code;
+	AppendVMovLiteral(&code, 3, 0x40000000u); // 2.0
+	code.push_back(0xe100000cu);
+	code.push_back(0x80010300u); // exact failing buffer_atomic_fmax v3, offset 12, GLC=0
+	AppendStoreVgpr(&code, 3, 4);
+	AppendVMovLiteral(&code, 0, 0x40800000u); // 4.0
+	code.push_back(0xe100400cu);
+	code.push_back(0x80010000u); // same address with GLC=1
+	AppendStoreVgpr(&code, 0, 5);
+	AppendEnd(&code);
+
+	TestCase test;
+	test.name     = "BufferAtomicFMaxExactRawGlcModes";
+	test.code     = code;
+	test.initial  = {0, 0, 0, 0x3f800000u, 0, 0}; // memory[3] = 1.0
+	test.expected = {0, 0, 0, 0x40800000u, 0x40000000u, 0x40000000u};
+	test.opcodes  = {O::VMovB32, O::BufferAtomicFMax, O::BufferStoreDword, O::SEndpgm};
+	const auto descriptor =
+	    MakeStructuredStorageBufferData(0, static_cast<u32>(test.initial.size() * sizeof(u32)));
+	std::copy_n(descriptor.begin(), 4, test.user_data.begin() + 4);
+	test.user_data[50] = 1u << 20u;
+	test.has_user_data = true;
+	return test;
+}
+
+TestCase BufferAtomicFMaxSpecialValues() {
+	using O = ShaderOpcode;
+
+	const u32 values[] = {
+	    0x40000000u, // 2.0, finite update
+	    0x40000000u, // 2.0, finite no-update
+	    0x7f800000u, // incoming +infinity
+	    0xff800000u, // incoming -infinity
+	    0x3f800000u, // finite against old +infinity
+	    0x3f800000u, // finite against old -infinity
+	    0x3f800000u, // finite against old quiet NaN
+	    0x7fcabcdeu, // incoming quiet NaN
+	    0x3f800000u, // finite against old signaling NaN
+	    0x7faabcdeu, // incoming signaling NaN
+	    0x00000000u, // +0.0 against old -0.0
+	    0x80000000u, // -0.0 against old +0.0
+	    0x80000000u, // -0.0 against a negative denorm
+	    0x80000001u, // negative denorm against -0.0
+	    0x00000001u, // positive denorm against +0.0
+	    0x00000000u, // +0.0 against a positive denorm
+	};
+	std::vector<u32> code;
+	for (u32 i = 0; i < static_cast<u32>(std::size(values)); i++) {
+		AppendVMovU32(&code, 20, i * 4u);
+		AppendVMovLiteral(&code, i, values[i]);
+		AppendBufferStoreOpcode(&code, 0x40, i, 20, true);
+	}
+	for (u32 i = 0; i < static_cast<u32>(std::size(values)); i++) {
+		AppendStoreVgpr(&code, i, i + static_cast<u32>(std::size(values)));
+	}
+	AppendEnd(&code);
+
+	return {"BufferAtomicFMaxSpecialValues",
+	        code,
+	        {0x3f800000u, 0x40800000u, 0xbf800000u, 0x3f800000u, 0x7f800000u,
+	         0xff800000u, 0x7fc12345u, 0x3f800000u, 0x7fa54321u, 0x3f800000u,
+	         0x80000000u, 0x00000000u, 0x80000001u, 0x80000000u, 0x00000000u,
+	         0x00000001u, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+	        {0x40000000u, 0x40800000u, 0x7f800000u, 0x3f800000u, 0x7f800000u,
+	         0x3f800000u, 0x7fc12345u, 0x3f800000u, 0x7fa54321u, 0x3f800000u,
+	         0x80000000u, 0x00000000u, 0x80000000u, 0x80000000u, 0x00000001u,
+	         0x00000001u, 0x3f800000u, 0x40800000u, 0xbf800000u, 0x3f800000u,
+	         0x7f800000u, 0xff800000u, 0x7fc12345u, 0x3f800000u, 0x7fa54321u,
+	         0x3f800000u, 0x80000000u, 0x00000000u, 0x80000001u, 0x80000000u,
+	         0x00000000u, 0x00000001u},
+	        {O::VMovB32, O::BufferAtomicFMax, O::BufferStoreDword, O::SEndpgm}};
+}
+
+TestCase BufferAtomicFMaxContendedWorkgroup() {
+	using O = ShaderOpcode;
+
+	std::vector<u32> code;
+	code.push_back(EncodeVop1(0x06, 1, Vgpr(0))); // v_cvt_f32_u32 v1, thread_id.x
+	AppendVMovU32(&code, 20, 0);
+	AppendBufferStoreOpcode(&code, 0x40, 1, 20);
+	AppendEnd(&code);
+
+	TestCase test;
+	test.name     = "BufferAtomicFMaxContendedWorkgroup";
+	test.code     = code;
+	test.initial  = {0xc2c80000u}; // -100.0
+	test.expected = {0x427c0000u}; // max(-100.0, 0.0 .. 63.0)
+	test.opcodes  = {O::VCvtF32U32, O::VMovB32, O::BufferAtomicFMax, O::SEndpgm};
+	test.compute_info.threads_num[0] = 64;
+	test.compute_info.threads_num[1] = 1;
+	test.compute_info.threads_num[2] = 1;
+	test.compute_info.thread_ids_num = 1;
+	test.has_compute_info            = true;
+	return test;
+}
+
 std::vector<u32> MakeRgbaImage(u32 width, u32 height, u32 value = 0) {
 	return std::vector<u32>(static_cast<size_t>(width) * height * 4u, value);
 }
@@ -15017,6 +15593,9 @@ std::vector<TestCase> MakeCases() {
 	AddCase(VectorMoves);
 	AddCase(VectorVop3MoveAppliesFloatSourceModifiers);
 	AddCase(VectorIntegerOps);
+	AddCase(Vop2SdwaSubNcExactByte2Destination);
+	AddCase(Vop2SdwaSubNcPreservesByteAndWordDestinations);
+	AddCase(Vop2SdwaMinU32PreservesWordDestination);
 	AddCase(VectorShiftCountsMaskLowBits);
 	AddCase(VectorVop3IntegerOps);
 	AddCase(VectorBfeI32ArithmeticShiftMasksField);
@@ -15060,10 +15639,12 @@ std::vector<TestCase> MakeCases() {
 	AddCase(VectorSpecialF32FlushesDenormalInputs);
 	AddCase(VectorSinCosMaxFiniteSpecialCases);
 	AddCase(VectorCompareOps);
+	AddCase(VectorVop3CompareEqI64OnGpu);
 	AddCase(VectorVop3CompareNeU64OnGpu);
 	AddCase(VectorCompareClassF32);
 	AddCase(VectorCompareF16Ops);
 	AddCase(Vop2SdwaCndmaskSourceModifier);
+	AddCase(Vop2SdwaCndmaskFullDestinationWithSubDwordSource);
 	AddCase(Vop3CndmaskUsesSgprMaskLaneBits);
 	AddCase(Vop3CndmaskAllowsDataSourceModifier);
 	AddCase(VectorCompareExecOps);
@@ -15148,6 +15729,12 @@ std::vector<TestCase> MakeCases() {
 	AddCase(DsSwizzleInvalidSourceLaneZero);
 	AddCase(BufferAtomicVariants);
 	AddCase(BufferAtomicGlc0DoesNotReturnOldValue);
+	AddCase(BufferAtomicFMinExactRawGlcModes);
+	AddCase(BufferAtomicFMinSpecialValues);
+	AddCase(BufferAtomicFMinContendedWorkgroup);
+	AddCase(BufferAtomicFMaxExactRawGlcModes);
+	AddCase(BufferAtomicFMaxSpecialValues);
+	AddCase(BufferAtomicFMaxContendedWorkgroup);
 	AddCase(ImageLoadVariants);
 	AddCase(ImageLoadR32UintUsesIntegerSampledImage);
 	AddCase(ImageLoad1DUsesScalarCoordinate);
@@ -15389,6 +15976,15 @@ void CheckEmbeddedFetchVertexOffset() {
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 void CheckRenderTargetFormatContract() {
+	const auto r8_uint =
+	    TextureGetRenderTargetFormat(Prospero::GpuEnumValue(Prospero::ChannelLayout::k8),
+	                                 Prospero::GpuEnumValue(Prospero::ChannelType::kUInt),
+	                                 Prospero::GpuEnumValue(Prospero::ChannelOrder::kStandard));
+	Require("RenderTargetFormat", "R8 uint",
+	        r8_uint.format == vk::Format::eR8Uint && r8_uint.bytes_per_element == 1u &&
+	            r8_uint.export_mapping.IsIdentity(),
+	        "R8 uint render-target tuple was rejected");
+
 	const auto rgb565 = TextureGetRenderTargetFormat(16u, 0u, 0u);
 	Require("RenderTargetFormat", "RGB565 UNorm",
 	        rgb565.format == vk::Format::eB5G6R5UnormPack16 && rgb565.bytes_per_element == 2u &&
@@ -16404,7 +17000,7 @@ ShaderTextureResource AtomicStorageTextureDescriptor() {
 	} else if (std::strcmp(kind, "type") == 0) {
 		descriptor.fields[3] = (descriptor.fields[3] & 0x0fffffffu) |
 		                       (Prospero::GpuEnumValue(Prospero::ImageType::kColor2D) << 28u);
-	} else if (std::strcmp(kind, "tile") == 0) {
+	} else if (std::strcmp(kind, "standard256b-volume") == 0) {
 		descriptor.fields[3] = (descriptor.fields[3] & ~(0x1fu << 20u)) |
 		                       (Prospero::GpuEnumValue(Prospero::TileMode::kStandard256B) << 20u);
 	} else if (std::strcmp(kind, "mip") == 0) {
@@ -16614,11 +17210,39 @@ void CheckBasicStorageTextureDescriptor() {
 	        "PPSA21268 uint 2D-array storage descriptor fixture is malformed");
 	ValidateStorageTexture(BasicUintArrayStorageTextureResource(), uint_array, 0x10000);
 
+	const ShaderTextureResource standard256b {{
+	    0x204e4900u,
+	    0x43c00000u,
+	    0x00004000u,
+	    0x90100facu,
+	    0x00000000u,
+	    0x00700000u,
+	    0x00000000u,
+	    0x00000000u,
+	}};
+	auto standard256b_resource = BasicBgraStorageTextureResource();
+	standard256b_resource.kind = ShaderRecompiler::IR::ResourceKind::StorageImageUint;
+	TileSizeAlign standard256b_size {};
+	TileGetTextureTotalSize(standard256b.Format(), standard256b.Width5() + 1u,
+	                        standard256b.Height5() + 1u, standard256b.Depth() + 1u,
+	                        1, standard256b.TileMode(), false,
+	                        standard256b_size);
+	Require("BasicStorageTexture", "Standard256B uint 2D descriptor",
+	        standard256b.Width5() + 1u == 2 && standard256b.Height5() + 1u == 2 &&
+	            standard256b.Depth() + 1u == 1 &&
+	            standard256b.Type() == Prospero::GpuEnumValue(Prospero::ImageType::kColor2D) &&
+	            standard256b.Format() ==
+	                Prospero::GpuEnumValue(Prospero::BufferFormat::k8_8_8_8UInt) &&
+	            standard256b.TileMode() ==
+	                Prospero::GpuEnumValue(Prospero::TileMode::kStandard256B) &&
+	            standard256b.DstSelXYZW() == DstSel(4, 5, 6, 7) &&
+	            standard256b_size.size == 0x100 && standard256b_size.align == 0x100,
+	        "captured PPSA08511 Standard256B storage descriptor is malformed");
+	ValidateStorageTexture(standard256b_resource, standard256b, standard256b_size.size);
+
 	const auto standard4kb_array = Standard4KBUintArrayStorageTextureDescriptor();
-	const auto standard4kb_pitch =
-	    TileGetTexturePitch(standard4kb_array.Format(), 1, 1, standard4kb_array.TileMode());
 	TileSizeAlign standard4kb_size {};
-	TileGetTextureTotalSize(standard4kb_array.Format(), 1, 1, 1, standard4kb_pitch, 1,
+	TileGetTextureTotalSize(standard4kb_array.Format(), 1, 1, 1, 1,
 	                        standard4kb_array.TileMode(), false, standard4kb_size);
 	Require(
 	    "BasicStorageTexture", "Standard4KB uint 2D-array descriptor",
@@ -16635,11 +17259,9 @@ void CheckBasicStorageTextureDescriptor() {
 	auto based_standard4kb_array       = standard4kb_array;
 	based_standard4kb_array.fields[0]  = 0x006c6800u;
 	based_standard4kb_array.fields[4]  = 0x00010001u;
-	const auto based_standard4kb_pitch = TileGetTexturePitch(based_standard4kb_array.Format(), 1, 1,
-	                                                         based_standard4kb_array.TileMode());
 	TileSizeAlign based_standard4kb_size {};
 	TileGetTextureTotalSize(based_standard4kb_array.Format(), 1, 1,
-	                        based_standard4kb_array.Depth() + 1u, based_standard4kb_pitch, 1,
+	                        based_standard4kb_array.Depth() + 1u, 1,
 	                        based_standard4kb_array.TileMode(), false, based_standard4kb_size);
 	Require("BasicStorageTexture", "based Standard4KB array view",
 	        based_standard4kb_array.Base40() == 0x6c680000ull &&
@@ -16650,12 +17272,10 @@ void CheckBasicStorageTextureDescriptor() {
 	                       based_standard4kb_size.size);
 
 	const auto standard64kb       = Standard64KBStorageTextureDescriptor();
-	const auto standard64kb_pitch = TileGetTexturePitch(
-	    standard64kb.Format(), standard64kb.Width5() + 1u, 1, standard64kb.TileMode());
 	TileSizeAlign standard64kb_size {};
 	TileGetTextureTotalSize(standard64kb.Format(), standard64kb.Width5() + 1u,
 	                        standard64kb.Height5() + 1u, standard64kb.Depth() + 1u,
-	                        standard64kb_pitch, 1, standard64kb.TileMode(), false,
+	                        1, standard64kb.TileMode(), false,
 	                        standard64kb_size);
 	Require("BasicStorageTexture", "Standard64KB 2D descriptor",
 	        standard64kb.Type() == Prospero::GpuEnumValue(Prospero::ImageType::kColor2DArray) &&
@@ -16715,11 +17335,11 @@ void CheckBasicStorageTextureDescriptor() {
 	        d16_depth_tile.DstSelXYZW() == DstSel(4, 0, 0, 1),
 	    "PPSA10112 writable D16 depth-plane descriptor fixture is malformed");
 	const auto d16_pitch = TileGetTexturePitch(
-	    d16_depth_tile.Format(), d16_depth_tile.Width5() + 1u, 1, d16_depth_tile.TileMode());
+	    d16_depth_tile.Format(), d16_depth_tile.Width5() + 1u, d16_depth_tile.TileMode());
 	TileSizeAlign d16_size {};
 	TileGetTextureTotalSize(d16_depth_tile.Format(), d16_depth_tile.Width5() + 1u,
-	                        d16_depth_tile.Height5() + 1u, d16_depth_tile.Depth() + 1u, d16_pitch,
-	                        1, d16_depth_tile.TileMode(), false, d16_size);
+	                        d16_depth_tile.Height5() + 1u, d16_depth_tile.Depth() + 1u, 1,
+	                        d16_depth_tile.TileMode(), false, d16_size);
 	Require("BasicStorageTexture", "PPSA10112 D16 depth-tile footprint",
 	        d16_pitch == 256 && d16_size.size == 0x20000 && d16_size.align == 0x10000,
 	        "PPSA10112 writable D16 depth-plane footprint is incorrect");
@@ -16750,7 +17370,7 @@ void CheckBasicStorageTextureDescriptor() {
 	        "GetModuleFileName failed");
 	for (const char* kind: {"resource",
 	                        "type",
-	                        "tile",
+	                        "standard256b-volume",
 	                        "mip",
 	                        "swizzle",
 	                        "linear-rgb1-read",
@@ -16797,16 +17417,17 @@ void CheckStorageTextureLinearUploadLayout() {
 	constexpr uint32_t height = 2160;
 	constexpr uint32_t depth  = 1;
 	constexpr uint32_t tile   = Prospero::GpuEnumValue(Prospero::TileMode::kLinear);
-	const auto         pitch  = TileGetTexturePitch(format, width, 1, tile);
+	const auto         pitch  = TileGetTexturePitch(format, width, tile);
 	TileSizeAlign      total {};
-	TileGetTextureTotalSize(format, width, height, depth, pitch, 1, tile, false, total);
+	TileGetTextureTotalSize(format, width, height, depth, 1, tile, false, total);
 	const auto layout =
-	    TextureCalcUploadLayout(format, width, height, 1, depth, pitch, tile, total.size, true,
+	    TextureCalcUploadLayout(format, width, height, 1, depth, tile, total.size, true,
 	                            false, "StorageTextureLinearTest");
-	const auto regions = TextureBuildImageCopies(layout, width, height, depth, 1, false, false);
+	const auto regions = TextureBuildImageCopies(layout);
 	Require("StorageTextureLinearUpload", "layout",
 	        pitch == width && total.size == 0x1fa4000 && total.align == 256 &&
-	            layout.tile == tile && layout.pitch == width && layout.slice_stride == total.size &&
+	            layout.surface.description.tile_mode == tile && layout.pitch == width &&
+	            layout.slice_stride == total.size &&
 	            regions.size() == 1 && regions[0].bufferOffset == 0 &&
 	            regions[0].imageExtent.width == width && regions[0].imageExtent.height == height &&
 	            regions[0].bufferRowLength == width,
@@ -16820,25 +17441,27 @@ void CheckStorageTextureDepthTileUploadLayout() {
 	constexpr uint32_t height = 1;
 	constexpr uint32_t depth  = 1;
 	constexpr uint32_t tile   = Prospero::GpuEnumValue(Prospero::TileMode::kDepth);
-	const auto         pitch  = TileGetTexturePitch(format, width, 1, tile);
+	const auto         pitch  = TileGetTexturePitch(format, width, tile);
 	TileSizeAlign      slice {};
 	TileSizeAlign      total {};
 	TileSizeOffset     level {};
 	TilePaddedSize     padded {};
-	TileGetTextureSize(format, width, height, pitch, 1, tile, &slice, &level, &padded);
-	TileGetTextureTotalSize(format, width, height, depth, pitch, 1, tile, false, total);
+	TileGetTextureSize(format, width, height, 1, tile, &slice, &level, &padded);
+	TileGetTextureTotalSize(format, width, height, depth, 1, tile, false, total);
 	const auto layout =
-	    TextureCalcUploadLayout(format, width, height, 1, depth, pitch, tile, total.size, true,
+	    TextureCalcUploadLayout(format, width, height, 1, depth, tile, total.size, true,
 	                            false, "StorageTextureDepthTileTest");
-	const auto regions = TextureBuildImageCopies(layout, width, height, depth, 1, true, false);
+	const auto regions = TextureBuildImageCopies(layout);
 	Require("StorageTextureDepthTileUpload", "PPSA14053 layout",
 	        pitch == 256 && padded.width == 256 && padded.height == 256 && slice.size == 0x10000 &&
 	            slice.align == 0x10000 && level.size == slice.size && level.offset == 0 &&
-	            total.size == slice.size && total.align == slice.align && layout.tile == tile &&
-	            layout.tile_family == TileBlockFamily::Depth64KB && layout.pitch == pitch &&
+	            total.size == slice.size && total.align == slice.align &&
+	            layout.surface.description.tile_mode == tile &&
+	            layout.surface.texture.block.family == TileBlockFamily::Depth64KB &&
+	            layout.pitch == pitch &&
 	            layout.slice_stride == pitch && layout.source_slice_stride == total.size &&
-	            layout.level_sizes[0].size == pitch &&
-	            layout.level_sizes[0].src_size == total.size && regions.size() == 1 &&
+	            layout.mips[0].size == pitch &&
+	            layout.surface.mips[0].size == total.size && regions.size() == 1 &&
 	            regions[0].bufferOffset == 0 && regions[0].imageExtent.width == width &&
 	            regions[0].imageExtent.height == height && regions[0].bufferRowLength == pitch,
 	        "1x1 R8_UINT depth tile lost its 64 KiB source footprint");
@@ -16880,24 +17503,24 @@ void CheckStorageTextureVolumeUploadLayout() {
 	constexpr uint32_t height = 33;
 	constexpr uint32_t depth  = 33;
 	const auto         pitch  = TileGetTexturePitch(
-	    format, width, 1, Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget));
+	    format, width, Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget));
 	TileSizeAlign total {};
-	TileGetTextureTotalSize(format, width, height, depth, pitch, 1,
+	TileGetTextureTotalSize(format, width, height, depth, 1,
 	                        Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget), true, total);
 	const auto layout =
-	    TextureCalcUploadLayout(format, width, height, 1, depth, pitch,
+	    TextureCalcUploadLayout(format, width, height, 1, depth,
 	                            Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget),
 	                            total.size, true, true, "StorageTextureVolumeTest");
-	const auto regions = TextureBuildImageCopies(layout, width, height, depth, 1, false, true);
+	const auto regions = TextureBuildImageCopies(layout);
 	Require("StorageTextureVolumeUpload", "layout",
 	        pitch == 128 && total.size == 0x210000 && layout.slice_stride == 0x2208 &&
-	            layout.source_slice_stride == 0 && layout.level_sizes[0].size == 0x2208 &&
-	            layout.level_sizes[0].src_size == 0 && regions.size() == depth,
+	            layout.source_slice_stride == 0 && layout.mips[0].size == 0x2208 &&
+	            layout.surface.mips[0].size == 0x10000 && regions.size() == depth,
 	        "3D render-target upload did not preserve its compact linear layout");
 
 	std::vector<GpuTileInfo> infos;
 	Require("StorageTextureVolumeUpload", "GPU records",
-	        TextureBuildGpuTileInfos(total.size, regions, layout, format, depth, 1, infos) &&
+	        TextureBuildGpuTileInfos(total.size, regions, layout, 1, infos) &&
 	            infos.size() == depth,
 	        "3D render-target GPU records were not built");
 	for (const uint32_t z: {0u, 1u, depth - 1u}) {
@@ -16917,13 +17540,12 @@ void CheckStorageTextureVolumeMipRegions() {
 	constexpr uint32_t depth  = 5;
 	constexpr uint32_t levels = 3;
 	constexpr uint32_t tile   = Prospero::GpuEnumValue(Prospero::TileMode::kLinear);
-	const auto         pitch  = TileGetTexturePitch(format, width, levels, tile);
 	TileSizeAlign      total {};
-	TileGetTextureTotalSize(format, width, height, depth, pitch, levels, tile, true, total);
+	TileGetTextureTotalSize(format, width, height, depth, levels, tile, true, total);
 	const auto layout =
-	    TextureCalcUploadLayout(format, width, height, levels, depth, pitch, tile, total.size, true,
+	    TextureCalcUploadLayout(format, width, height, levels, depth, tile, total.size, true,
 	                            true, "StorageTextureVolumeMipTest");
-	const auto copies = TextureBuildImageCopies(layout, width, height, depth, levels, false, true);
+	const auto copies = TextureBuildImageCopies(layout);
 
 	bool   valid = copies.size() == 8;
 	size_t index = 0;
@@ -16937,9 +17559,9 @@ void CheckStorageTextureVolumeMipRegions() {
 			    copy.imageSubresource.mipLevel == level &&
 			    copy.imageOffset.z == static_cast<int>(z) && copy.imageExtent.width == mip_width &&
 			    copy.imageExtent.height == mip_height &&
-			    copy.bufferOffset == layout.level_sizes[level].offset + z * layout.slice_stride &&
-			    copy.bufferRowLength == layout.padded_sizes[level].width &&
-			    copy.bufferImageHeight == layout.padded_sizes[level].height;
+			    copy.bufferOffset == layout.mips[level].offset + z * layout.slice_stride &&
+			    copy.bufferRowLength == layout.mips[level].row_length &&
+			    copy.bufferImageHeight == layout.mips[level].image_height;
 		}
 	}
 	valid &= index == copies.size();
@@ -16954,9 +17576,9 @@ void CheckStandard64RenderTargetTileRoundTrip() {
 
 	constexpr uint32_t observed_width  = 3840;
 	constexpr uint32_t observed_height = 2160;
-	const auto         observed_pitch  = TileGetTexturePitch(format, observed_width, 1, tile);
+	const auto         observed_pitch  = TileGetTexturePitch(format, observed_width, tile);
 	TileSizeAlign      observed {};
-	TileGetTextureSize(format, observed_width, observed_height, observed_pitch, 1, tile, &observed,
+	TileGetTextureSize(format, observed_width, observed_height, 1, tile, &observed,
 	                   nullptr, nullptr);
 	Require("Standard64RenderTarget", "observed layout",
 	        observed_pitch == 3840 && observed.size == 0x1fe0000 && observed.align == 0x10000,
@@ -16964,9 +17586,9 @@ void CheckStandard64RenderTargetTileRoundTrip() {
 
 	constexpr uint32_t width  = 257;
 	constexpr uint32_t height = 131;
-	const auto         pitch  = TileGetTexturePitch(format, width, 1, tile);
+	const auto         pitch  = TileGetTexturePitch(format, width, tile);
 	TileSizeAlign      storage {};
-	TileGetTextureSize(format, width, height, pitch, 1, tile, &storage, nullptr, nullptr);
+	TileGetTextureSize(format, width, height, 1, tile, &storage, nullptr, nullptr);
 	Require("Standard64RenderTarget", "partial layout",
 	        pitch == 384 && storage.size == 0x60000 && storage.align == 0x10000,
 	        "partial Standard64KB footprint was not padded in 128x128 blocks");
@@ -17444,11 +18066,11 @@ void CheckDepthTargetFootprints() {
 	        "non-HTile depth/stencil footprint disagrees with Prospero block rules");
 
 	const auto depth_pitch =
-	    TileGetTexturePitch(Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float), 640, 1,
+	    TileGetTexturePitch(Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float), 640,
 	                        Prospero::GpuEnumValue(Prospero::TileMode::kDepth));
 	TileSizeAlign texture_depth {};
 	TileGetTextureTotalSize(Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float), 640, 360, 1,
-	                        depth_pitch, 1, Prospero::GpuEnumValue(Prospero::TileMode::kDepth),
+	                        1, Prospero::GpuEnumValue(Prospero::TileMode::kDepth),
 	                        false, texture_depth);
 	Require("DepthTargetFootprints", "640x360 generic depth tile",
 	        depth_pitch == 640 && texture_depth.size == 0xf0000 && texture_depth.align == 0x10000,
@@ -17654,6 +18276,41 @@ void CheckPm4StencilInfoValueLane(RenderContext& renderer) {
 	std::printf("[host]    %-32s ok\n", "Pm4StencilInfoValueLane");
 }
 
+void CheckPm4PolygonOffsetRegisters(RenderContext& renderer) {
+	GraphicsInitJmpTables();
+	CommandProcessor processor(renderer);
+	const auto&      defaults = processor.GetCtx().GetPolyOffset();
+	Require("Pm4PolygonOffset", "format defaults",
+	        defaults.neg_num_db_bits == -23 && defaults.db_is_float_fmt,
+	        "polygon offset Z format did not default to D32F");
+
+	constexpr std::array<uint32_t, 6> payload {
+	    0x000000f0u, std::bit_cast<uint32_t>(2.5f), std::bit_cast<uint32_t>(16.0f),
+	    std::bit_cast<uint32_t>(-3.25f), std::bit_cast<uint32_t>(32.0f),
+	    std::bit_cast<uint32_t>(4.5f)};
+	const auto consumed = HwCtxSetPolyOffsetRegisters(
+	    processor, KYTY_PM4(8, Pm4::IT_SET_CONTEXT_REG, Pm4::R_ZERO),
+	    Pm4::PA_SU_POLY_OFFSET_DB_FMT_CNTL, payload.data(), 0);
+	const auto& direct = processor.GetCtx().GetPolyOffset();
+	Require("Pm4PolygonOffset", "direct registers",
+	        consumed == payload.size() && direct.neg_num_db_bits == -16 &&
+	            !direct.db_is_float_fmt && direct.clamp == 2.5f && direct.front_scale == 16.0f &&
+	            direct.front_offset == -3.25f && direct.back_scale == 32.0f &&
+	            direct.back_offset == 4.5f,
+	        "direct polygon offset register packet was decoded incorrectly");
+
+	g_hw_ctx_indirect_func[Pm4::PA_SU_POLY_OFFSET_DB_FMT_CNTL](
+	    processor, Pm4::PA_SU_POLY_OFFSET_DB_FMT_CNTL, 0x000001e9u);
+	g_hw_ctx_indirect_func[Pm4::PA_SU_POLY_OFFSET_FRONT_SCALE](
+	    processor, Pm4::PA_SU_POLY_OFFSET_FRONT_SCALE, std::bit_cast<uint32_t>(24.0f));
+	const auto& indirect = processor.GetCtx().GetPolyOffset();
+	Require("Pm4PolygonOffset", "indirect registers",
+	        indirect.neg_num_db_bits == -23 && indirect.db_is_float_fmt &&
+	            indirect.front_scale == 24.0f && indirect.front_offset == -3.25f,
+	        "indirect polygon offset register write was decoded incorrectly");
+	std::printf("[host]    %-32s ok\n", "Pm4PolygonOffset");
+}
+
 void CheckPm4ContextStateOperations(RenderContext& renderer) {
 	GraphicsInitJmpTables();
 	CommandProcessor processor(renderer);
@@ -17749,39 +18406,67 @@ void CheckPm4ContextStateOperations(RenderContext& renderer) {
 	            processor.GetCtx().GetRenderTargetMask() == 0x1234abcd,
 	        "push changed live Cx state");
 	processor.GetCtx().SetRenderTargetMask(0x01020304);
-	Require("Pm4ContextState", "push-pop restore",
-	        invoke(ContextStateOperation::Pop) == Pm4ProcessResult::Complete &&
-	            processor.GetCtx().GetRenderTargetMask() == 0x1234abcd,
-	        "ordinary push/pop did not restore Cx state");
+        Require("Pm4ContextState", "push-pop restore",
+                invoke(ContextStateOperation::Pop) ==
+                        Pm4ProcessResult::Complete &&
+                    processor.GetCtx().GetRenderTargetMask() == 0x1234abcd,
+                "ordinary push/pop did not restore Cx state");
 
-	Require("Pm4ContextState", "clear",
-	        invoke(ContextStateOperation::Clear) == Pm4ProcessResult::Complete &&
-	            !processor.GetCtx().GetRenderControl().depth_clear_enable &&
-	            processor.GetCtx().GetRenderTargetMask() == HW::Context {}.GetRenderTargetMask() &&
-	            processor.GetUcfg().GetPrimType() == 0x35 &&
-	            processor.GetShCtx().GetPs().ps_regs.data_addr == shader_address,
-	        "clear reset state outside the Cx register domain");
+        Require("Pm4ContextState", "clear",
+                invoke(ContextStateOperation::Clear) ==
+                        Pm4ProcessResult::Complete &&
+                    !processor.GetCtx().GetRenderControl().depth_clear_enable &&
+                    processor.GetCtx().GetRenderTargetMask() ==
+                        HW::Context{}.GetRenderTargetMask() &&
+                    processor.GetUcfg().GetPrimType() == 0x35 &&
+                    processor.GetShCtx().GetPs().ps_regs.data_addr ==
+                        shader_address,
+                "clear reset state outside the Cx register domain");
 
-	processor.GetCtx().SetRenderTargetMask(0xabcdef01);
-	Require("Pm4ContextState", "push before processor reset",
-	        invoke(ContextStateOperation::Push) == Pm4ProcessResult::Complete,
-	        "push before reset failed");
-	processor.Reset();
-	processor.GetCtx().SetRenderTargetMask(0x76543210);
-	Require("Pm4ContextState", "processor reset discards push",
-	        invoke(ContextStateOperation::Push) == Pm4ProcessResult::Complete &&
-	            invoke(ContextStateOperation::Pop) == Pm4ProcessResult::Complete &&
-	            processor.GetCtx().GetRenderTargetMask() == 0x76543210,
-	        "processor reset retained an invalid saved Cx state");
+        processor.GetCtx().SetRenderTargetMask(0x0badc0de);
+        Require("Pm4ContextState", "push before clear-state packet",
+                invoke(ContextStateOperation::Push) ==
+                    Pm4ProcessResult::Complete,
+                "push before CLEAR_STATE failed");
+        processor.GetCtx().SetRenderTargetMask(0xfeedface);
+        std::array<uint32_t, 2> clear_state_packet{0xc0001200, 0};
+        Pm4Execution clear_state_execution;
+        Require("Pm4ContextState", "clear-state packet",
+                processor.Process(
+                    clear_state_execution, clear_state_packet.data(),
+                    clear_state_packet.size()) == Pm4ProcessResult::Complete &&
+                    processor.GetCtx().GetRenderTargetMask() ==
+                        HW::Context{}.GetRenderTargetMask(),
+                "CLEAR_STATE did not clear the current Cx state");
+        Require("Pm4ContextState", "pop after clear-state packet",
+                invoke(ContextStateOperation::Pop) ==
+                        Pm4ProcessResult::Complete &&
+                    processor.GetCtx().GetRenderTargetMask() == 0x0badc0de,
+                "CLEAR_STATE discarded the pushed Cx state");
 
-	Require("Pm4ContextState", "HLE packet size",
-	        Gen5::GraphicsDcbContextStateOpGetSize(0) == 20 &&
-	            Gen5::GraphicsDcbContextStateOpGetSize(1) == 108 &&
-	            Gen5::GraphicsDcbContextStateOpGetSize(2) == 108 &&
-	            Gen5::GraphicsDcbContextStateOpGetSize(3) == 128 &&
-	            Gen5::GraphicsDcbContextStateOpGetSize(4) == 0,
-	        "context-state HLE sizes do not match libSceAgc");
-	std::printf("[host]    %-32s ok\n", "Pm4ContextState");
+        processor.GetCtx().SetRenderTargetMask(0xabcdef01);
+        Require("Pm4ContextState", "push before processor reset",
+                invoke(ContextStateOperation::Push) ==
+                    Pm4ProcessResult::Complete,
+                "push before reset failed");
+        processor.Reset();
+        processor.GetCtx().SetRenderTargetMask(0x76543210);
+        Require("Pm4ContextState", "processor reset discards push",
+                invoke(ContextStateOperation::Push) ==
+                        Pm4ProcessResult::Complete &&
+                    invoke(ContextStateOperation::Pop) ==
+                        Pm4ProcessResult::Complete &&
+                    processor.GetCtx().GetRenderTargetMask() == 0x76543210,
+                "processor reset retained an invalid saved Cx state");
+
+        Require("Pm4ContextState", "HLE packet size",
+                Gen5::GraphicsDcbContextStateOpGetSize(0) == 20 &&
+                    Gen5::GraphicsDcbContextStateOpGetSize(1) == 108 &&
+                    Gen5::GraphicsDcbContextStateOpGetSize(2) == 108 &&
+                    Gen5::GraphicsDcbContextStateOpGetSize(3) == 128 &&
+                    Gen5::GraphicsDcbContextStateOpGetSize(4) == 0,
+                "context-state HLE sizes do not match libSceAgc");
+        std::printf("[host]    %-32s ok\n", "Pm4ContextState");
 }
 
 void CheckPm4WaitResume(RenderContext& renderer) {
@@ -17852,14 +18537,16 @@ void CheckPm4CeCompletion(RenderContext& renderer) {
 	uint32_t         suffix  = 0;
 	const auto       address = reinterpret_cast<uint64_t>(&suffix);
 
-	std::array<uint32_t, 7> commands {};
+	std::array<uint32_t, 9> commands {};
 	commands[0] = 0xc0008600u;
 	commands[1] = 1;
-	commands[2] = KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0);
+	commands[2] = 0xc0008500u;
 	commands[3] = 0;
-	commands[4] = static_cast<uint32_t>(address);
-	commands[5] = static_cast<uint32_t>(address >> 32u);
-	commands[6] = 33;
+	commands[4] = KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0);
+	commands[5] = 0;
+	commands[6] = static_cast<uint32_t>(address);
+	commands[7] = static_cast<uint32_t>(address >> 32u);
+	commands[8] = 33;
 
 	processor.ResetDeCe();
 	Pm4Execution execution;
@@ -17869,9 +18556,28 @@ void CheckPm4CeCompletion(RenderContext& renderer) {
 	            suffix == 0,
 	        "DE did not wait for an active CE stream");
 
-	processor.SetCeComplete(true);
-	Require("Pm4CeCompletion", "complete",
+	std::array<uint32_t, 2> ce_increment {0xc0008400u, 1};
+	Pm4Execution            ce_execution;
+	Require("Pm4CeCompletion", "CE increment",
+	        processor.Process(ce_execution, ce_increment.data(), ce_increment.size()) ==
+	            Pm4ProcessResult::Complete,
+	        "CE counter increment did not complete");
+	Require("Pm4CeCompletion", "counter gate",
 	        processor.Process(execution, commands.data(), commands.size()) ==
+	                Pm4ProcessResult::Complete &&
+	            suffix == 33,
+	        "DE did not resume after CE advanced or failed to increment its counter");
+
+	suffix = 0;
+	Pm4Execution balanced_execution;
+	Require("Pm4CeCompletion", "balanced wait",
+	        processor.Process(balanced_execution, commands.data(), commands.size()) ==
+	                Pm4ProcessResult::Blocked &&
+	            suffix == 0,
+	        "balanced CE/DE counters did not gate the next DE packet");
+	processor.SetCeComplete(true);
+	Require("Pm4CeCompletion", "stream complete",
+	        processor.Process(balanced_execution, commands.data(), commands.size()) ==
 	                Pm4ProcessResult::Complete &&
 	            suffix == 33,
 	        "DE remained blocked after the CE stream completed");
@@ -17922,6 +18628,7 @@ int main(int argc, char** argv) {
 	}
 	if (argc == 2 && std::strcmp(argv[1], "--context-state-only") == 0) {
 		VulkanHarness vulkan;
+		CheckPm4PolygonOffsetRegisters(vulkan.RuntimeRenderer());
 		CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
 		return 0;
 	}
@@ -18059,6 +18766,7 @@ int main(int argc, char** argv) {
 	CheckVulkan13FeatureRequirements();
 	CheckPm4AcquireMemNoOp(vulkan.RuntimeRenderer());
 	CheckPm4StencilInfoValueLane(vulkan.RuntimeRenderer());
+	CheckPm4PolygonOffsetRegisters(vulkan.RuntimeRenderer());
 	CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
 	CheckPm4WaitResume(vulkan.RuntimeRenderer());
 	CheckPm4CeCompletion(vulkan.RuntimeRenderer());

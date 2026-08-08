@@ -18,7 +18,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 #define KYTY_HW_CTX_PARSER_ARGS                                                                    \
@@ -895,23 +897,44 @@ KYTY_HW_CTX_PARSER(HwCtxSetModeControl) {
 	return 1;
 }
 
-static void HwCtxIgnorePolyOffsetRegister(uint32_t cmd_offset, uint32_t value) {
-	static std::atomic<uint32_t> log_count = 0;
+static void HwCtxSetPolyOffsetRegister(CommandProcessor& cp, uint32_t cmd_offset, uint32_t value) {
+	HW::PolyOffset offset = cp.GetCtx().GetPolyOffset();
 
-	auto count = log_count.fetch_add(1);
-	if (count < 8) {
-		LOGF_COLOR(Log::Color::Red,
-		           "\t temporary: ignoring polygon offset context register 0x%03" PRIx32
-		           " = 0x%08" PRIx32 " (depth bias not implemented)\n",
-		           cmd_offset, value);
+	switch (cmd_offset) {
+		case Pm4::PA_SU_POLY_OFFSET_DB_FMT_CNTL: {
+			const auto neg_bits =
+			    KYTY_PM4_GET(value, PA_SU_POLY_OFFSET_DB_FMT_CNTL, NEG_NUM_DB_BITS);
+			offset.neg_num_db_bits = std::bit_cast<int8_t>(static_cast<uint8_t>(neg_bits));
+			offset.db_is_float_fmt =
+			    KYTY_PM4_GET(value, PA_SU_POLY_OFFSET_DB_FMT_CNTL, DB_IS_FLOAT_FMT) != 0;
+			break;
+		}
+		case Pm4::PA_SU_POLY_OFFSET_CLAMP: offset.clamp = std::bit_cast<float>(value); break;
+		case Pm4::PA_SU_POLY_OFFSET_FRONT_SCALE:
+			offset.front_scale = std::bit_cast<float>(value);
+			break;
+		case Pm4::PA_SU_POLY_OFFSET_FRONT_OFFSET:
+			offset.front_offset = std::bit_cast<float>(value);
+			break;
+		case Pm4::PA_SU_POLY_OFFSET_BACK_SCALE:
+			offset.back_scale = std::bit_cast<float>(value);
+			break;
+		case Pm4::PA_SU_POLY_OFFSET_BACK_OFFSET:
+			offset.back_offset = std::bit_cast<float>(value);
+			break;
+		default:
+			EXIT("unknown polygon offset context register 0x%03" PRIx32 " = 0x%08" PRIx32 "\n",
+			     cmd_offset, value);
 	}
+
+	cp.GetCtx().SetPolyOffset(offset);
 }
 
 KYTY_HW_CTX_PARSER(HwCtxSetPolyOffsetRegisters) {
 	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
 
 	for (uint32_t i = 0; i < num_values; i++) {
-		HwCtxIgnorePolyOffsetRegister(cmd_offset + i, buffer[i]);
+		HwCtxSetPolyOffsetRegister(cp, cmd_offset + i, buffer[i]);
 	}
 
 	return num_values;
@@ -1312,26 +1335,36 @@ static void HwShSetCsRegister(CommandProcessor& cp, uint32_t cmd_offset, uint32_
 			    (value >> Pm4::COMPUTE_PGM_RSRC1_VGPRS_SHIFT) & Pm4::COMPUTE_PGM_RSRC1_VGPRS_MASK;
 			cs_regs.sgprs =
 			    (value >> Pm4::COMPUTE_PGM_RSRC1_SGPRS_SHIFT) & Pm4::COMPUTE_PGM_RSRC1_SGPRS_MASK;
-			cs_regs.bulky =
-			    (value >> Pm4::COMPUTE_PGM_RSRC1_BULKY_SHIFT) & Pm4::COMPUTE_PGM_RSRC1_BULKY_MASK;
-			cs_regs.wave_size = (((value >> Pm4::COMPUTE_PGM_RSRC1_W32_EN_SHIFT) &
-			                      Pm4::COMPUTE_PGM_RSRC1_W32_EN_MASK) != 0u)
-			                        ? 32u
-			                        : 64u;
+			cs_regs.float_mode    = (value >> Pm4::COMPUTE_PGM_RSRC1_FLOAT_MODE_SHIFT) &
+			                        Pm4::COMPUTE_PGM_RSRC1_FLOAT_MODE_MASK;
+			cs_regs.dx10_clamp    = ((value >> Pm4::COMPUTE_PGM_RSRC1_DX10_CLAMP_SHIFT) &
+			                         Pm4::COMPUTE_PGM_RSRC1_DX10_CLAMP_MASK) != 0u;
+			cs_regs.ieee_mode     = ((value >> Pm4::COMPUTE_PGM_RSRC1_IEEE_MODE_SHIFT) &
+			                         Pm4::COMPUTE_PGM_RSRC1_IEEE_MODE_MASK) != 0u;
+			cs_regs.fp16_overflow = ((value >> Pm4::COMPUTE_PGM_RSRC1_FP16_OVFL_SHIFT) &
+			                         Pm4::COMPUTE_PGM_RSRC1_FP16_OVFL_MASK) != 0u;
+			cs_regs.bulky         = ((value >> Pm4::COMPUTE_PGM_RSRC1_BULKY_SHIFT) &
+			                         Pm4::COMPUTE_PGM_RSRC1_BULKY_MASK) != 0u;
+			cs_regs.threadgroup_configuration = ((value >> Pm4::COMPUTE_PGM_RSRC1_WGP_MODE_SHIFT) &
+			                                     Pm4::COMPUTE_PGM_RSRC1_WGP_MODE_MASK) != 0u;
+			cs_regs.wave_size                 = (((value >> Pm4::COMPUTE_PGM_RSRC1_W32_EN_SHIFT) &
+			                                      Pm4::COMPUTE_PGM_RSRC1_W32_EN_MASK) != 0u)
+			                                        ? 32u
+			                                        : 64u;
 			break;
 		case Pm4::COMPUTE_PGM_RSRC2:
-			cs_regs.scratch_en     = (value >> Pm4::COMPUTE_PGM_RSRC2_SCRATCH_EN_SHIFT) &
-			                         Pm4::COMPUTE_PGM_RSRC2_SCRATCH_EN_MASK;
+			cs_regs.scratch_en     = ((value >> Pm4::COMPUTE_PGM_RSRC2_SCRATCH_EN_SHIFT) &
+			                          Pm4::COMPUTE_PGM_RSRC2_SCRATCH_EN_MASK) != 0u;
 			cs_regs.user_sgpr      = (value >> Pm4::COMPUTE_PGM_RSRC2_USER_SGPR_SHIFT) &
 			                         Pm4::COMPUTE_PGM_RSRC2_USER_SGPR_MASK;
-			cs_regs.tgid_x_en      = (value >> Pm4::COMPUTE_PGM_RSRC2_TGID_X_EN_SHIFT) &
-			                         Pm4::COMPUTE_PGM_RSRC2_TGID_X_EN_MASK;
-			cs_regs.tgid_y_en      = (value >> Pm4::COMPUTE_PGM_RSRC2_TGID_Y_EN_SHIFT) &
-			                         Pm4::COMPUTE_PGM_RSRC2_TGID_Y_EN_MASK;
-			cs_regs.tgid_z_en      = (value >> Pm4::COMPUTE_PGM_RSRC2_TGID_Z_EN_SHIFT) &
-			                         Pm4::COMPUTE_PGM_RSRC2_TGID_Z_EN_MASK;
-			cs_regs.tg_size_en     = (value >> Pm4::COMPUTE_PGM_RSRC2_TG_SIZE_EN_SHIFT) &
-			                         Pm4::COMPUTE_PGM_RSRC2_TG_SIZE_EN_MASK;
+			cs_regs.tgid_x_en      = ((value >> Pm4::COMPUTE_PGM_RSRC2_TGID_X_EN_SHIFT) &
+			                          Pm4::COMPUTE_PGM_RSRC2_TGID_X_EN_MASK) != 0u;
+			cs_regs.tgid_y_en      = ((value >> Pm4::COMPUTE_PGM_RSRC2_TGID_Y_EN_SHIFT) &
+			                          Pm4::COMPUTE_PGM_RSRC2_TGID_Y_EN_MASK) != 0u;
+			cs_regs.tgid_z_en      = ((value >> Pm4::COMPUTE_PGM_RSRC2_TGID_Z_EN_SHIFT) &
+			                          Pm4::COMPUTE_PGM_RSRC2_TGID_Z_EN_MASK) != 0u;
+			cs_regs.tg_size_en     = ((value >> Pm4::COMPUTE_PGM_RSRC2_TG_SIZE_EN_SHIFT) &
+			                          Pm4::COMPUTE_PGM_RSRC2_TG_SIZE_EN_MASK) != 0u;
 			cs_regs.tidig_comp_cnt = (value >> Pm4::COMPUTE_PGM_RSRC2_TIDIG_COMP_CNT_SHIFT) &
 			                         Pm4::COMPUTE_PGM_RSRC2_TIDIG_COMP_CNT_MASK;
 			cs_regs.lds_size       = (value >> Pm4::COMPUTE_PGM_RSRC2_LDS_SIZE_SHIFT) &
@@ -2102,7 +2135,7 @@ KYTY_CP_OP_PARSER(CpOpClearState) {
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0001200);
 	EXIT_NOT_IMPLEMENTED((buffer[0] & ~0xfu) != 0);
 
-	cp.Reset();
+	cp.ApplyContextStateOperation(ContextStateOperation::Clear);
 
 	return 1;
 }
@@ -2649,23 +2682,26 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	const bool gl2_writeback = ((gcr_cntl & GcrGl2Writeback) != 0);
 
 	auto trigger_interrupt = [&]() {
+		bool queued = false;
 		switch (interrupt_selector) {
 			case 0x00:
 			case 0x03: break;
 			case 0x01:
 			case 0x02:
-			case 0x04: cp.TriggerEopEventAtEndOfPipe(interrupt_context_id); break;
+			case 0x04:
+				cp.TriggerEopEventAtEndOfPipe(interrupt_context_id);
+				queued = true;
+				break;
 			default: EXIT("unknown release_mem interrupt selector\n");
+		}
+		if (queued) {
+			cp.BufferFlush();
 		}
 	};
 
 	if (data_sel == 0 || interrupt_selector == 4) {
 		if (eop_event_type != 0x28 || gcr_cntl != 0) {
 			cp.EmitGlobalBarrier();
-		}
-
-		if (gl2_writeback) {
-			cp.SynchronizeGpu();
 		}
 
 		trigger_interrupt();
@@ -2676,10 +2712,6 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	if (release_dst == ReleaseMemDstMemory && dst_gpu_addr == nullptr) {
 		if (eop_event_type != 0x28 || gcr_cntl != 0) {
 			cp.EmitGlobalBarrier();
-		}
-
-		if (gl2_writeback) {
-			cp.SynchronizeGpu();
 		}
 
 		trigger_interrupt();
@@ -2695,17 +2727,6 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	cache_policy      = 0;
 
 	if (data_sel == 1) {
-		static std::atomic<uint32_t> log_count {0};
-		const auto                   dst_addr = reinterpret_cast<uint64_t>(dst_gpu_addr);
-		if ((dst_addr & 0xffffffffff000000ull) == 0x0000001021000000ull || log_count.load() < 64) {
-			if (log_count.fetch_add(1) < 256) {
-				LOGF(
-				    "\t runtime release_mem32: dst=0x%016" PRIx64 ", value=0x%08" PRIx32
-				    ", action=0x%02" PRIx32 ", gcr=0x%04" PRIx32 ", cache_action=0x%08" PRIx32 "\n",
-				    dst_addr, static_cast<uint32_t>(value), eop_event_type, gcr_cntl, cache_action);
-			}
-		}
-
 		eop_event_type    = 0x2f;
 		event_index       = 6;
 		auto event_source = 2u;
@@ -2720,7 +2741,6 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 
 	if (data_sel == 5) {
 		if (gl2_writeback) {
-			cp.SynchronizeGpu();
 			cache_action = 0;
 		}
 
@@ -2731,7 +2751,9 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 		cp.WriteAtEndOfPipe32(cache_policy, event_write_dest, eop_event_type, cache_action,
 		                      event_index, event_source, dst_gpu_addr, static_cast<uint32_t>(value),
 		                      interrupt_selector, interrupt_context_id);
-		cp.BufferFlush();
+		if (interrupt_selector == 0x01) {
+			cp.BufferFlush();
+		}
 
 		return 7;
 	}
@@ -3695,22 +3717,22 @@ void GraphicsInitJmpTablesCxIndirect() {
 	};
 
 	g_hw_ctx_indirect_func[Pm4::PA_SU_POLY_OFFSET_DB_FMT_CNTL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnorePolyOffsetRegister(cmd_offset, value);
+		HwCtxSetPolyOffsetRegister(cp, cmd_offset, value);
 	};
 	g_hw_ctx_indirect_func[Pm4::PA_SU_POLY_OFFSET_CLAMP] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnorePolyOffsetRegister(cmd_offset, value);
+		HwCtxSetPolyOffsetRegister(cp, cmd_offset, value);
 	};
 	g_hw_ctx_indirect_func[Pm4::PA_SU_POLY_OFFSET_FRONT_SCALE] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnorePolyOffsetRegister(cmd_offset, value);
+		HwCtxSetPolyOffsetRegister(cp, cmd_offset, value);
 	};
 	g_hw_ctx_indirect_func[Pm4::PA_SU_POLY_OFFSET_FRONT_OFFSET] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnorePolyOffsetRegister(cmd_offset, value);
+		HwCtxSetPolyOffsetRegister(cp, cmd_offset, value);
 	};
 	g_hw_ctx_indirect_func[Pm4::PA_SU_POLY_OFFSET_BACK_SCALE] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnorePolyOffsetRegister(cmd_offset, value);
+		HwCtxSetPolyOffsetRegister(cp, cmd_offset, value);
 	};
 	g_hw_ctx_indirect_func[Pm4::PA_SU_POLY_OFFSET_BACK_OFFSET] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnorePolyOffsetRegister(cmd_offset, value);
+		HwCtxSetPolyOffsetRegister(cp, cmd_offset, value);
 	};
 
 	g_hw_ctx_indirect_func[Pm4::DB_Z_INFO] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
@@ -4233,29 +4255,28 @@ void GraphicsInitJmpTablesShIndirect() {
 	};
 
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_RSRC1_HS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HW::VsShaderResource1 r1;
-		r1.vgprs                = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_VS, VGPRS);
-		r1.sgprs                = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_VS, SGPRS);
-		r1.priority             = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_VS, PRIORITY);
-		r1.float_mode           = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_VS, FLOAT_MODE);
-		r1.dx10_clamp           = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_VS, DX10_CLAMP) != 0;
-		r1.ieee_mode            = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_VS, IEEE_MODE) != 0;
-		r1.vgpr_component_count = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_VS, VGPR_COMP_CNT);
-		r1.cu_group_enable = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_VS, CU_GROUP_ENABLE) != 0;
+		HW::HsShaderResource1 r1;
+		r1.vgprs      = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_HS, VGPRS);
+		r1.priority   = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_HS, PRIORITY);
+		r1.float_mode = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_HS, FLOAT_MODE);
+		r1.dx10_clamp = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_HS, DX10_CLAMP) != 0;
+		r1.debug_mode = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_HS, DEBUG_MODE) != 0;
+		r1.ieee_mode  = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_HS, IEEE_MODE) != 0;
 		r1.require_forward_progress =
-		    KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_VS, FWD_PROGRESS) != 0;
-		r1.fp16_overflow = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_VS, FP16_OVFL) != 0;
+		    KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_HS, FWD_PROGRESS) != 0;
+		r1.threadgroup_configuration = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_HS, WGP_MODE) != 0;
+		r1.ls_vgpr_component_count = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_HS, LS_VGPR_COMP_CNT);
+		r1.fp16_overflow           = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_HS, FP16_OVFL) != 0;
 		cp.GetShCtx().SetHsShaderResource1(r1);
 	};
 
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_RSRC2_HS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HW::VsShaderResource2 r2;
-		r2.scratch_en        = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_VS, SCRATCH_EN) != 0;
-		r2.user_sgpr         = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_VS, USER_SGPR) +
-		                       (KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_VS, USER_SGPR_MSB) << 5u);
-		r2.offchip_lds       = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_VS, OC_LDS_EN) != 0;
-		r2.streamout_enabled = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_VS, SO_EN) != 0;
-		r2.shared_vgprs      = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_VS, SHARED_VGPR_CNT);
+		HW::HsShaderResource2 r2;
+		r2.scratch_en   = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_HS, SCRATCH_EN) != 0;
+		r2.user_sgpr    = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_HS, USER_SGPR) +
+		                  (KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_HS, USER_SGPR_MSB) << 5u);
+		r2.lds_size     = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_HS, LDS_SIZE);
+		r2.shared_vgprs = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_HS, SHARED_VGPR_CNT);
 		cp.GetShCtx().SetHsShaderResource2(r2);
 	};
 
@@ -4343,7 +4364,7 @@ void GraphicsInitJmpTablesShIndirect() {
 		r1.cu_group_enable = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_GS, CU_GROUP_ENABLE) != 0;
 		r1.require_forward_progress =
 		    KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_GS, FWD_PROGRESS) != 0;
-		r1.lds_configuration       = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_GS, WGP_MODE) != 0;
+		r1.threadgroup_configuration = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_GS, WGP_MODE) != 0;
 		r1.gs_vgpr_component_count = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_GS, GS_VGPR_COMP_CNT);
 		r1.fp16_overflow           = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_GS, FP16_OVFL) != 0;
 		cp.GetShCtx().SetGsShaderResource1(r1);
@@ -4403,7 +4424,7 @@ void GraphicsInitJmpTablesShIndirect() {
 		r2.wave_cnt_en    = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_PS, WAVE_CNT_EN);
 		r2.extra_lds_size = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_PS, EXTRA_LDS_SIZE);
 		r2.raster_ordered_shading =
-		    KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_PS, LOAD_INTRAWAVE_COLLISION);
+		    KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_PS, RASTER_ORDERED_SHADING);
 		r2.shared_vgprs = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_PS, SHARED_VGPR_CNT);
 		cp.GetShCtx().SetPsShaderResource2(r2);
 	};

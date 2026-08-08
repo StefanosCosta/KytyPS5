@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <fmt/format.h>
@@ -686,14 +687,6 @@ static void McCheck(const HW::ModeControl& c) {
 	}
 	EXIT_NOT_IMPLEMENTED(c.polymode_front_ptype != 0 && c.polymode_front_ptype != 2);
 	EXIT_NOT_IMPLEMENTED(c.polymode_back_ptype != 0 && c.polymode_back_ptype != 2);
-	if (c.poly_offset_front_enable || c.poly_offset_back_enable) {
-		static bool logged = false;
-		if (!logged) {
-			LOGF("\t temporary: PA_SU_SC_MODE_CNTL.POLY_OFFSET_*_ENABLE is not implemented; "
-			     "continuing without depth bias\n");
-			logged = true;
-		}
-	}
 	if (c.vtx_window_offset_enable) {
 		static bool logged = false;
 		if (!logged) {
@@ -1067,18 +1060,24 @@ static ScissorRect ScissorRectClamp(ScissorRect r, uint32_t width, uint32_t heig
 	return r;
 }
 
+static constexpr std::array<uint16_t, 16> MakeScissorIntersectionRules() {
+	std::array<uint16_t, 16> rules {};
+	for (uint32_t candidate = 0; candidate < rules.size(); candidate++) {
+		for (uint32_t combination = 0; combination < 16; combination++) {
+			if ((combination & candidate) == candidate) {
+				rules[candidate] |= static_cast<uint16_t>(1u << combination);
+			}
+		}
+	}
+	return rules;
+}
+
 static bool ScissorClipRuleToIntersectionMask(uint16_t rule, uint8_t* mask) {
 	EXIT_IF(mask == nullptr);
 
-	for (uint32_t candidate = 0; candidate < 16; candidate++) {
-		uint16_t expected = 0;
-		for (uint32_t combination = 0; combination < 16; combination++) {
-			if ((combination & candidate) == candidate) {
-				expected |= static_cast<uint16_t>(1u << combination);
-			}
-		}
-
-		if (expected == rule) {
+	static constexpr auto rules = MakeScissorIntersectionRules();
+	for (uint32_t candidate = 0; candidate < rules.size(); candidate++) {
+		if (rules[candidate] == rule) {
 			*mask = static_cast<uint8_t>(candidate);
 			return true;
 		}

@@ -623,6 +623,7 @@ ImageTestUserData(Prospero::ImageType type = Prospero::ImageType::kColor2D) {
 	std::array<uint32_t, 64> data {};
 	for (uint32_t start = 0; start + 3u < data.size(); start += 4u) {
 		data[start]      = 0x1000u + start * 0x100u;
+		data[start + 1u] = Prospero::GpuEnumValue(Prospero::BufferFormat::k8UNorm) << 20u;
 		data[start + 2u] = UINT32_MAX;
 		data[start + 3u] = Prospero::GpuEnumValue(type) << 28u;
 	}
@@ -1169,6 +1170,8 @@ void TestNewShaderRecompilerMoreAluFamilies() {
 	    EncodeVop2Sdwa(5, 6, 0, 4, 5),
 	    0x025e6af9u,
 	    0x16060635u, // v_cndmask_b32 v47, v53, -v53
+	    0x020e02f9u,
+	    0x06040600u, // v_cndmask_b32 v7, v0.lo, v1; full-width destination
 	    0x100490f9u,
 	    0x86860600u, // v_mul_f32 v2, s0, s72 (SDWA full)
 	    EncodeVop2(0x35, 9, 249, 1),
@@ -1395,6 +1398,9 @@ void TestNewShaderRecompilerMoreAluFamilies() {
 	Check(Common::ContainsStr(result.decoded_dump, "v_cndmask_b32 v47, v53,") &&
 	          Common::ContainsStr(result.decoded_dump, "v53.neg"),
 	      "new decoder did not decode V_CNDMASK_B32 SDWA source modifier");
+	Check(Common::ContainsStr(result.decoded_dump, "v_cndmask_b32 v7, v0.sdwa(sel=4") &&
+	          Common::ContainsStr(result.decoded_dump, "v1"),
+	      "new decoder did not decode full-destination V_CNDMASK_B32 with SDWA source");
 	Check(Common::ContainsStr(result.decoded_dump, "v_add_f32 v125, v5.dpp"),
 	      "new decoder did not decode VOP2 DPP source metadata");
 	Check(!Common::ContainsStr(result.decoded_dump, "VOP2 SDWA/DPP modifiers are not implemented"),
@@ -1699,6 +1705,8 @@ void TestNewShaderRecompilerMoreAluFamilies() {
 	Check(Common::ContainsStr(result.ir_dump, "SelectMaskF32Bits v47, vcc_lo, v53.neg, v53") &&
 	          Common::ContainsStr(result.ir_dump, "v53.neg"),
 	      "V_CNDMASK_B32 SDWA source modifier did not lower to float-bit select IR");
+	Check(Common::ContainsStr(result.ir_dump, "SelectMaskU32 v7, vcc_lo, v1, v0.sdwa(sel=4"),
+	      "full-destination V_CNDMASK_B32 with SDWA source did not lower to integer select IR");
 	Check(Common::ContainsStr(result.ir_dump, "FAddF32 v125.dpp") &&
 	          Common::ContainsStr(result.ir_dump, "v5.dpp"),
 	      "VOP2 DPP source/destination did not lower to IR metadata");
@@ -2416,6 +2424,10 @@ void TestNewShaderRecompilerBootB16PackedAndSdwaOpcodes() {
 	    0x0c860688u, // v_add_nc_u32 v5, 8, sign-extended v4.lo
 	    0x4a0c0cf9u,
 	    0x0d860688u, // v_add_nc_u32 v6, 8, sign-extended v6.hi
+	    0x4c1616f9u,
+	    0x0686128du, // v_sub_nc_u32 v11.byte2, 13, v11; preserve other destination bytes
+	    0x261418f9u,
+	    0x0686149fu, // v_min_u32 v10.word0, 31, v12; preserve upper destination word
 	    0xbf810000u,
 	};
 
@@ -2464,6 +2476,10 @@ void TestNewShaderRecompilerBootB16PackedAndSdwaOpcodes() {
 	Check(Common::ContainsStr(result.decoded_dump, "v_add_nc_u32 v6") &&
 	          Common::ContainsStr(result.decoded_dump, "v6.sdwa(sel=5,sext=1"),
 	      "new decoder did not decode V_ADD_NC_U32 SDWA sign-extended high word");
+	Check(Common::ContainsStr(result.decoded_dump, "v_sub_nc_u32 v11.sdwa(sel=2"),
+	      "new decoder did not decode V_SUB_NC_U32 SDWA byte-2 destination");
+	Check(Common::ContainsStr(result.decoded_dump, "v_min_u32 v10.sdwa(sel=4"),
+	      "new decoder did not decode V_MIN_U32 SDWA low-word destination");
 	Check(!Common::ContainsStr(result.decoded_dump, "unsupported family=VOP2 opcode=0x00"),
 	      "literal/SDWA extension words were decoded as phantom VOP2 instructions");
 	Check(!Common::ContainsStr(result.decoded_dump,
@@ -2497,6 +2513,10 @@ void TestNewShaderRecompilerBootB16PackedAndSdwaOpcodes() {
 	Check(Common::ContainsStr(result.ir_dump, "IAddU32 v6") &&
 	          Common::ContainsStr(result.ir_dump, "v6.sdwa(sel=5,sext=1"),
 	      "V_ADD_NC_U32 SDWA sign-extended high word did not lower to IR");
+	Check(Common::ContainsStr(result.ir_dump, "ISubU32 v11.sdwa(sel=2"),
+	      "V_SUB_NC_U32 SDWA byte-2 destination did not lower to IR");
+	Check(Common::ContainsStr(result.ir_dump, "UMinU32 v10.sdwa(sel=4"),
+	      "V_MIN_U32 SDWA low-word destination did not lower to IR");
 	Check(SpirvContainsOpcode(result.spirv, 128),
 	      "SPIR-V binary does not contain OpIAdd for U16 operations");
 	Check(SpirvContainsOpcode(result.spirv, 202),
@@ -2893,6 +2913,61 @@ void CheckNewDecoderUnsupported(const uint32_t* shader, uint32_t words, const ch
 	Check(Common::ContainsStr(error, "no IR lowering") ||
 	          Common::ContainsStr(error, "unsupported decoded"),
 	      "unsupported lowering error was not explicit");
+}
+
+void TestNewShaderRecompilerRejectsDppOn64BitCompares() {
+	const uint32_t opcodes[] = {0xa2u, 0xe5u}; // v_cmp_eq_i64, v_cmp_ne_u64
+	for (const auto opcode: opcodes) {
+		const uint32_t shader[] = {
+		    EncodeVopc(opcode, 250u, 0u), // DPP escape in SRC0
+		    EncodeVop2Dpp(0u),
+		    0xbf810000u,
+		};
+
+		ShaderRecompiler::Decoder::Program program;
+		std::string                        error;
+		Check(ShaderRecompiler::Decoder::DecodeProgram(shader, program, &error), error.c_str());
+		Check(program.instructions.size() == 2u,
+		      "64-bit VOPC DPP decode did not consume its modifier word");
+		const auto& compare = program.instructions.front();
+		Check(compare.opcode == ShaderRecompiler::Decoder::Opcode::Unsupported,
+		      "64-bit VOPC illegally accepted a DPP modifier");
+		Check(Common::ContainsStr(compare.unsupported_reason,
+		                          "VOPC DPP modifier is not supported for opcode"),
+		      "64-bit VOPC DPP rejection reason was not explicit");
+	}
+}
+
+void TestNewShaderRecompilerIrLookupMissFailsExplicitly() {
+	ShaderRecompiler::Decoder::Program decoded;
+	ShaderRecompiler::Decoder::Instruction missing;
+	missing.pc     = 0u;
+	missing.family = ShaderRecompiler::Decoder::Family::VOP1;
+	missing.opcode = ShaderRecompiler::Decoder::Opcode::Unknown;
+	decoded.instructions.push_back(missing);
+
+	ShaderRecompiler::CFG::Graph cfg;
+	ShaderRecompiler::CFG::BasicBlock block;
+	block.inst_end = 1u;
+	cfg.blocks.push_back(block);
+	cfg.entry_block = 0u;
+
+	ShaderRecompiler::IR::Program ir;
+	std::string                   error;
+	Check(!ShaderRecompiler::IR::LowerProgram(decoded, cfg, ShaderType::Compute, 64u, ir, &error),
+	      "missing decoder-to-IR mapping unexpectedly lowered as an instruction");
+	Check(Common::ContainsStr(error, "no IR lowering"),
+	      "missing decoder-to-IR mapping did not report an explicit error");
+	Check(ir.blocks.empty(), "missing decoder-to-IR mapping emitted a fallback IR block");
+
+	decoded.instructions.front().family = ShaderRecompiler::Decoder::Family::MUBUF;
+	decoded.instructions.front().opcode = ShaderRecompiler::Decoder::Opcode::VAddNcU32;
+	error.clear();
+	Check(!ShaderRecompiler::IR::LowerProgram(decoded, cfg, ShaderType::Compute, 64u, ir, &error),
+	      "memory-family opcode bypassed specialized memory lowering");
+	Check(Common::ContainsStr(error, "memory-family opcode") &&
+	          Common::ContainsStr(error, "specialized IR lowering"),
+	      "memory-family lowering bypass did not report an explicit error");
 }
 
 void TestNewShaderRecompilerMemoryFamilyLowering() {
@@ -4722,6 +4797,10 @@ void TestNewShaderRecompilerAtomicLowering() {
 	    EncodeMubuf1(5, 0, 1), // buffer_atomic_or
 	    EncodeMubuf0(0x3b, 40, true, true),
 	    EncodeMubuf1(6, 0, 1), // buffer_atomic_xor
+	    0xe0fc0000u,
+	    0x80010000u, // exact buffer_atomic_fmin v0, s[4:7], 0 (GLC=0)
+	    0xe100000cu,
+	    0x80010300u, // exact failing buffer_atomic_fmax v3, s[4:7], 12 (GLC=0)
 	    EncodeDs0(0x00),
 	    EncodeDs1(0, 2, 1), // ds_add_u32
 	    EncodeDs0(0x01),
@@ -4776,6 +4855,10 @@ void TestNewShaderRecompilerAtomicLowering() {
 	      "new decoder did not decode buffer atomic signed max");
 	Check(Common::ContainsStr(result.decoded_dump, "buffer_atomic_xor"),
 	      "new decoder did not decode buffer atomic xor");
+	Check(Common::ContainsStr(result.decoded_dump, "buffer_atomic_fmin"),
+	      "new decoder did not decode buffer atomic float min");
+	Check(Common::ContainsStr(result.decoded_dump, "buffer_atomic_fmax"),
+	      "new decoder did not decode buffer atomic float max");
 	Check(Common::ContainsStr(result.decoded_dump, "ds_add_u32"),
 	      "new decoder did not decode DS atomic add");
 	Check(Common::ContainsStr(result.decoded_dump, "ds_sub_u32"),
@@ -4808,6 +4891,10 @@ void TestNewShaderRecompilerAtomicLowering() {
 	      "buffer atomic or did not lower to IR");
 	Check(Common::ContainsStr(result.ir_dump, "AtomicXorU32 v6"),
 	      "buffer atomic xor did not lower to IR");
+	Check(Common::ContainsStr(result.ir_dump, "AtomicFMinF32 null, v0"),
+	      "buffer atomic float min did not lower to IR without a GLC return");
+	Check(Common::ContainsStr(result.ir_dump, "AtomicFMaxF32 null, v3"),
+	      "buffer atomic float max did not lower to IR without a GLC return");
 	Check(Common::ContainsStr(result.ir_dump, "AtomicAddU32 null, v2"),
 	      "DS no-return atomic add did not lower to IR");
 	Check(Common::ContainsStr(result.ir_dump, "AtomicSubU32 null, v10"),
@@ -4851,6 +4938,8 @@ void TestNewShaderRecompilerAtomicLowering() {
 	Check(SpirvContainsOpcode(result.spirv, 240), "SPIR-V binary does not contain OpAtomicAnd");
 	Check(SpirvContainsOpcode(result.spirv, 241), "SPIR-V binary does not contain OpAtomicOr");
 	Check(SpirvContainsOpcode(result.spirv, 242), "SPIR-V binary does not contain OpAtomicXor");
+	Check(SpirvContainsOpcode(result.spirv, 230),
+	      "SPIR-V binary does not contain OpAtomicCompareExchange for float min");
 	Check(SpirvContainsOpcode(result.spirv, 225),
 	      "buffer atomic SPIR-V binary does not contain OpMemoryBarrier");
 	CheckSpirvBinaryValidates(result.spirv);
@@ -6638,6 +6727,35 @@ void TestNewShaderRecompilerNativeBindingPlan() {
 	        rejected_spirv == rejected_before && rejected_error.find("atomic") != std::string::npos,
 	    "malformed atomic instruction reached a fatal descriptor path");
 
+	auto malformed_float_atomic = result.program;
+	atomic_inst                 = FindBufferInstruction(&malformed_float_atomic);
+	Check(atomic_inst != nullptr, "native validation fixture lacks a float atomic candidate");
+	atomic_inst->op              = ShaderRecompiler::IR::Opcode::AtomicFMaxF32;
+	atomic_inst->memory.kind     = ShaderRecompiler::IR::ResourceKind::Lds;
+	atomic_inst->memory.resource = 0;
+	atomic_inst->src_count       = 2;
+	rejected_spirv               = rejected_before;
+	rejected_error.clear();
+	Check(!ShaderRecompiler::Spirv::EmitProgram(malformed_float_atomic, result.resources, nullptr,
+	                                            nullptr, nullptr, rejected_spirv,
+	                                            &rejected_error) &&
+	          rejected_spirv == rejected_before &&
+	          rejected_error.find("floating-point atomic") != std::string::npos,
+	      "buffer-only floating-point atomic accepted a non-buffer resource");
+
+	auto invalid_ir_opcode = result.program;
+	Check(!invalid_ir_opcode.blocks.empty() && !invalid_ir_opcode.blocks.front().instructions.empty(),
+	      "native validation fixture lacks an invalid-opcode candidate");
+	invalid_ir_opcode.blocks.front().instructions.front().op =
+	    ShaderRecompiler::IR::Opcode::Count;
+	rejected_spirv = rejected_before;
+	rejected_error.clear();
+	Check(!ShaderRecompiler::Spirv::EmitProgram(invalid_ir_opcode, result.resources, nullptr, nullptr,
+	                                            nullptr, rejected_spirv, &rejected_error) &&
+	          rejected_spirv == rejected_before &&
+	          rejected_error.find("opcode is out of range") != std::string::npos,
+	      "out-of-range IR opcode was not rejected transactionally before emission");
+
 	auto overwide_atomic = result.program;
 	atomic_inst          = FindBufferInstruction(&overwide_atomic);
 	Check(atomic_inst != nullptr, "native validation fixture lacks an overwide atomic candidate");
@@ -7417,6 +7535,8 @@ int main() {
 	TestNewShaderRecompilerScalarVectorAlu();
 	TestNewShaderRecompilerVop3LaneReadDestinationEncoding();
 	TestNewShaderRecompilerMoreAluFamilies();
+	TestNewShaderRecompilerRejectsDppOn64BitCompares();
+	TestNewShaderRecompilerIrLookupMissFailsExplicitly();
 	TestNewShaderRecompilerExpandedAluBatch();
 	TestNewShaderRecompilerVop3pPackedF16();
 	TestNewShaderRecompilerStagedShaderOps();

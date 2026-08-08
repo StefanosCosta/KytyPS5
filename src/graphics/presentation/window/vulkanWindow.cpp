@@ -31,6 +31,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vma.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/presentation/imeDialogOverlay.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/videoOut.h"
@@ -257,6 +258,10 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		}
 		if (device_features2.features.sampleRateShading != VK_TRUE) {
 			LOGF("sampleRateShading is not supported\n");
+			skip_device = true;
+		}
+		if (device_features2.features.depthBiasClamp != VK_TRUE) {
+			LOGF("depthBiasClamp is not supported\n");
 			skip_device = true;
 		}
 
@@ -548,6 +553,7 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	EXIT_NOT_IMPLEMENTED(required_features13.synchronization2 == VK_TRUE &&
 	                     supported_features13.synchronization2 != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.sampleRateShading != VK_TRUE);
+	EXIT_NOT_IMPLEMENTED(supported_features2.features.depthBiasClamp != VK_TRUE);
 	features12.timelineSemaphore = VK_TRUE;
 
 	vk::PhysicalDeviceFeatures device_features {};
@@ -563,6 +569,7 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	device_features.independentBlend                     = VK_TRUE;
 	device_features.tessellationShader                   = VK_TRUE;
 	device_features.sampleRateShading                    = VK_TRUE;
+	device_features.depthBiasClamp                       = VK_TRUE;
 	graphics.sample_rate_shading_enabled                 = true;
 	device_features.vertexPipelineStoresAndAtomics =
 	    supported_features2.features.vertexPipelineStoresAndAtomics;
@@ -1008,6 +1015,7 @@ void WindowContext::RecreateSurface() {
 }
 
 WindowContext::~WindowContext() {
+	ShutdownImeDialogInput();
 	presenter.reset();
 	LibKernel::Memory::InstallGpuResources(nullptr);
 	render_context.reset();

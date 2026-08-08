@@ -490,13 +490,26 @@ bool IsScalarMinMaxOpcode(Decoder::Opcode opcode) {
 	}
 }
 
+bool ResolveIrOpcode(Decoder::Opcode decoded, Opcode& lowered, std::string* error) {
+	const auto opcode = LookupIrOpcode(decoded);
+	if (!opcode.has_value()) {
+		if (error != nullptr) {
+			*error = fmt::format("decoded opcode has no IR lowering: {}",
+			                     Decoder::OpcodeToString(decoded));
+		}
+		return false;
+	}
+	lowered = *opcode;
+	return true;
+}
+
 bool LowerScalarMinMaxWithScc(const Decoder::Instruction& decoded, BasicBlock& block,
                               std::string* error) {
 	Instruction result;
 	result.pc        = decoded.pc;
-	result.op        = LookupIrOpcode(decoded.opcode);
 	result.src_count = 2;
-	if (!LowerRegisterOperand(decoded.dst, result.dst, error) ||
+	if (!ResolveIrOpcode(decoded.opcode, result.op, error) ||
+	    !LowerRegisterOperand(decoded.dst, result.dst, error) ||
 	    !LowerSourceOperand(decoded.src0, result.src[0], error) ||
 	    !LowerSourceOperand(decoded.src1, result.src[1], error)) {
 		return false;
@@ -962,7 +975,12 @@ bool LowerControlInstruction(const Decoder::Instruction& decoded, BasicBlock& bl
 			return LowerControlMarker(decoded, block, Opcode::TtraceData, true, error);
 		case Decoder::Opcode::SInstPrefetch:
 			return LowerControlMarker(decoded, block, Opcode::InstPrefetch, true, error);
-		default: return false;
+		default:
+			if (error != nullptr) {
+				*error = fmt::format("control opcode has no specialized IR lowering: {}",
+				                     Decoder::OpcodeToString(decoded.opcode));
+			}
+			return false;
 	}
 }
 
@@ -1051,6 +1069,18 @@ bool IsTerminatorOpcode(Decoder::Opcode opcode) {
 
 bool LowerImplemented(const Decoder::Instruction& decoded, BasicBlock& block, std::string* error);
 
+bool IsMemoryFamily(Decoder::Family family) {
+	switch (family) {
+		case Decoder::Family::SMEM:
+		case Decoder::Family::MUBUF:
+		case Decoder::Family::MTBUF:
+		case Decoder::Family::FLAT:
+		case Decoder::Family::DS:
+		case Decoder::Family::MIMG: return true;
+		default: return false;
+	}
+}
+
 bool LowerDecodedInstruction(const Decoder::Instruction& inst, BasicBlock& block,
                              std::string* error) {
 	switch (inst.opcode) {
@@ -1104,6 +1134,15 @@ bool LowerDecodedInstruction(const Decoder::Instruction& inst, BasicBlock& block
 	if (IsMemoryOpcode(inst.opcode)) {
 		return LowerMemoryInstruction(inst, block, error);
 	}
+	// Memory instructions require specialized lowering to populate MemoryInfo. Never let a
+	// newly decoded memory-family opcode fall through to generic register-only IR.
+	if (IsMemoryFamily(inst.family)) {
+		if (error != nullptr) {
+			*error = fmt::format("decoded memory-family opcode has no specialized IR lowering: {}",
+			                     Decoder::OpcodeToString(inst.opcode));
+		}
+		return false;
+	}
 	if (ScalarShiftLeftAddAmount(inst.opcode) != 0) {
 		return LowerScalarShiftLeftAdd(inst, block, error);
 	}
@@ -1116,23 +1155,16 @@ bool LowerDecodedInstruction(const Decoder::Instruction& inst, BasicBlock& block
 	if (VectorByteConvertIndex(inst.opcode) <= 3u) {
 		return LowerVectorByteConvert(inst, block, error);
 	}
-	if (!IsImplemented(inst.opcode)) {
-		if (error != nullptr) {
-			*error = fmt::format("decoded opcode has no IR lowering yet: {}",
-			                     Decoder::InstructionToString(inst).c_str());
-		}
-		return false;
-	}
 	return LowerImplemented(inst, block, error);
 }
 
 bool LowerImplemented(const Decoder::Instruction& decoded, BasicBlock& block, std::string* error) {
 	Instruction inst;
 	inst.pc        = decoded.pc;
-	inst.op        = LookupIrOpcode(decoded.opcode);
 	inst.src_count = decoded.src_count;
 
-	if (!LowerRegisterOperand(decoded.dst, inst.dst, error)) {
+	if (!ResolveIrOpcode(decoded.opcode, inst.op, error) ||
+	    !LowerRegisterOperand(decoded.dst, inst.dst, error)) {
 		return false;
 	}
 	ApplyDppDestinationMask(decoded, inst.dst);

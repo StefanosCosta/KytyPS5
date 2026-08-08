@@ -124,7 +124,6 @@ private:
 		uint64_t       flip_request_id               = 0;
 	};
 
-	void              WaitLocked();
 	void              Enqueue(Submission submission);
 	void              WaitForIdle();
 	void              ProcessCommands();
@@ -276,10 +275,8 @@ void GpuState::SubmitFlipPreparation(uint64_t request_id) {
 
 void GpuState::Done() {
 	GpuMutexLock lock(m_submission_mutex);
-	if (IsGpuThread()) {
-		m_gfx_cp->BufferWait();
-	} else {
-		WaitLocked();
+	if (!IsGpuThread()) {
+		WaitForIdle();
 	}
 	m_graphics_done = true;
 	m_done_num++;
@@ -287,11 +284,6 @@ void GpuState::Done() {
 
 int GpuState::GetFrameNum() {
 	return m_done_num;
-}
-
-void GpuState::WaitLocked() {
-	WaitForIdle();
-	SendCommandSync([this] { m_gfx_cp->BufferWait(); });
 }
 
 CommandProcessor& GpuState::GetProcessor(uint32_t queue_id) {
@@ -307,13 +299,11 @@ CommandProcessor& GpuState::GetProcessor(uint32_t queue_id) {
 }
 
 void CommandProcessor::Reset() {
-	BufferWait();
-
 	m_sh_ctx.Reset();
 	m_ucfg.Reset();
 	m_ctx.Reset();
 	m_saved_ctx.Reset();
-	m_context_state_pushed = false;
+	m_context_state_pushed             = false;
 	m_index_type_and_size              = 0;
 	m_index_buffer_size                = 0;
 	m_user_data_marker                 = HW::UserSgprType::Unknown;
@@ -385,7 +375,6 @@ void CommandProcessor::WaitDeDiff(uint32_t diff) {
 }
 
 void CommandProcessor::IncrementDe() {
-	BufferWait();
 	m_de_count++;
 }
 
@@ -1176,9 +1165,9 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y,
                                       uint32_t thread_group_z, uint32_t mode) {
 	uint32_t frame_num = 0;
-	uint32_t local_x   = 1;
-	uint32_t local_y   = 1;
-	uint32_t local_z   = 1;
+	// uint32_t local_x   = 1;
+	// uint32_t local_y   = 1;
+	// uint32_t local_z   = 1;
 
 	{
 		CheckBuffer();
@@ -1202,9 +1191,9 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 		}
 
 		const auto& cs = m_sh_ctx.GetCs().cs_regs;
-		local_x        = std::max(cs.num_thread_x, 1u);
-		local_y        = std::max(cs.num_thread_y, 1u);
-		local_z        = std::max(cs.num_thread_z, 1u);
+		// local_x        = std::max(cs.num_thread_x, 1u);
+		// local_y        = std::max(cs.num_thread_y, 1u);
+		// local_z        = std::max(cs.num_thread_z, 1u);
 		if (cs.wave_size == 64u) {
 			static std::atomic_bool logged_wave64_shader {false};
 			if (!logged_wave64_shader.exchange(true, std::memory_order_relaxed)) {
@@ -1220,27 +1209,27 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 		                                              thread_group_y, thread_group_z, mode);
 	}
 
-	constexpr uint32_t DispatchInitiatorUseThreadDimensions = 1u << 5u;
+	/*constexpr uint32_t DispatchInitiatorUseThreadDimensions = 1u << 5u;
 	auto               group_count = [](uint32_t threads, uint32_t group_size) {
-		return (threads == 0
-		            ? 0u
-		            : (threads + std::max(group_size, 1u) - 1u) / std::max(group_size, 1u));
+	    return (threads == 0
+	                ? 0u
+	                : (threads + std::max(group_size, 1u) - 1u) / std::max(group_size, 1u));
 	};
 
 	auto groups_x = thread_group_x;
 	auto groups_y = thread_group_y;
 	auto groups_z = thread_group_z;
 	if ((mode & DispatchInitiatorUseThreadDimensions) != 0) {
-		groups_x = group_count(thread_group_x, local_x);
-		groups_y = group_count(thread_group_y, local_y);
-		groups_z = group_count(thread_group_z, local_z);
+	    groups_x = group_count(thread_group_x, local_x);
+	    groups_y = group_count(thread_group_y, local_y);
+	    groups_z = group_count(thread_group_z, local_z);
 	}
 
 	const uint64_t invocations =
 	    static_cast<uint64_t>(groups_x) * groups_y * groups_z * local_x * local_y * local_z;
 	if (invocations != 0) {
-		BufferFlushAndWait();
-	}
+	    BufferFlushAndWait();
+	}*/
 }
 
 void CommandProcessor::DispatchIndirect(uint32_t data_offset, uint32_t mode) {
@@ -1352,6 +1341,9 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 					              value >> 16u);
 					Sync::WriteAtEndOfPipeGds32(m_submit_id, CurrentBuffer(), dst, value & 0xffffu,
 					                            value >> 16u);
+					if (with_interrupt) {
+						m_renderer.TriggerEopEvent(interrupt_context_id);
+					}
 					return;
 				}
 			} else if (eop_event_type == 0x04 && cache_action == 0x00 && event_index == 0x05) {
@@ -1554,7 +1546,6 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index) {
 				     event_index);
 			}
 			EmitGlobalBarrier();
-			SynchronizeGpu();
 			break;
 		// DbDataWritebackInvalidate, DbMetadataWritebackInvalidate, CbMetadataWritebackInvalidate.
 		case 0x0000002a:

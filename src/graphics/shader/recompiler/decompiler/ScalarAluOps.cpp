@@ -1,14 +1,11 @@
 #include "graphics/shader/recompiler/decompiler/ScalarAluOps.h"
 
-#include <iterator>
+#include "graphics/shader/recompiler/decompiler/OpcodeTable.h"
 
 namespace Libs::Graphics::ShaderRecompiler::Decoder {
 namespace {
 
-struct OpcodeMap {
-	uint32_t opcode = 0;
-	Opcode   ir     = Opcode::Unknown;
-};
+using Detail::OpcodeMap;
 
 constexpr OpcodeMap SOP2_OPS[] = {
     {0x00u, Opcode::SAddU32},       {0x01u, Opcode::SSubU32},       {0x02u, Opcode::SAddI32},
@@ -58,7 +55,8 @@ constexpr OpcodeMap SOPC_OPS[] = {
     {0x03u, Opcode::SCmpGeI32},   {0x04u, Opcode::SCmpLtI32},   {0x05u, Opcode::SCmpLeI32},
     {0x06u, Opcode::SCmpEqU32},   {0x07u, Opcode::SCmpLgU32},   {0x08u, Opcode::SCmpGtU32},
     {0x09u, Opcode::SCmpGeU32},   {0x0au, Opcode::SCmpLtU32},   {0x0bu, Opcode::SCmpLeU32},
-    {0x0cu, Opcode::SBitcmp0B32}, {0x0du, Opcode::SBitcmp1B32}, {0x13u, Opcode::SCmpLgU64},
+    {0x0cu, Opcode::SBitcmp0B32}, {0x0du, Opcode::SBitcmp1B32}, {0x12u, Opcode::SCmpEqU64},
+    {0x13u, Opcode::SCmpLgU64},
 };
 
 constexpr OpcodeMap SOPK_OPS[] = {
@@ -78,15 +76,11 @@ constexpr OpcodeMap SOPP_OPS[] = {
     {0x0au, Opcode::SBarrier},      {0x0cu, Opcode::SWaitcnt},      {0x0eu, Opcode::SSleep},
     {0x10u, Opcode::SSendmsg},      {0x16u, Opcode::STtraceData},   {0x20u, Opcode::SInstPrefetch},
 };
-
-Opcode Lookup(const OpcodeMap* ops, uint32_t count, uint32_t opcode) {
-	for (uint32_t i = 0; i < count; i++) {
-		if (ops[i].opcode == opcode) {
-			return ops[i].ir;
-		}
-	}
-	return Opcode::Unsupported;
-}
+static_assert(Detail::HasUniqueEncodings(SOP1_OPS));
+static_assert(Detail::HasUniqueEncodings(SOP2_OPS));
+static_assert(Detail::HasUniqueEncodings(SOPK_OPS));
+static_assert(Detail::HasUniqueEncodings(SOPC_OPS));
+static_assert(Detail::HasUniqueEncodings(SOPP_OPS));
 
 bool DecodeBinarySources(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
                          Instruction& inst, uint32_t ssrc0, uint32_t ssrc1, std::string* error) {
@@ -111,7 +105,7 @@ bool DecodeSop1(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	inst.word      = word;
 	inst.family    = Family::SOP1;
 	inst.opcode_id = opcode;
-	inst.opcode    = Lookup(SOP1_OPS, static_cast<uint32_t>(std::size(SOP1_OPS)), opcode);
+	inst.opcode    = Detail::LookupOpcode(SOP1_OPS, opcode);
 	SetRawWords(inst, code, word_index, 1);
 
 	if (inst.opcode == Opcode::Unsupported) {
@@ -153,7 +147,7 @@ bool DecodeSop2(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	inst.word      = word;
 	inst.family    = Family::SOP2;
 	inst.opcode_id = opcode;
-	inst.opcode    = Lookup(SOP2_OPS, static_cast<uint32_t>(std::size(SOP2_OPS)), opcode);
+	inst.opcode    = Detail::LookupOpcode(SOP2_OPS, opcode);
 	SetRawWords(inst, code, word_index, 1);
 
 	if (inst.opcode == Opcode::Unsupported) {
@@ -180,7 +174,7 @@ bool DecodeSopk(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	inst.word            = word;
 	inst.family          = Family::SOPK;
 	inst.opcode_id       = opcode;
-	inst.opcode          = Lookup(SOPK_OPS, static_cast<uint32_t>(std::size(SOPK_OPS)), opcode);
+	inst.opcode          = Detail::LookupOpcode(SOPK_OPS, opcode);
 	inst.src0.kind       = OperandKind::IntegerInlineConstant;
 	inst.src0.signed_val = imm;
 	inst.src0.value      = static_cast<uint32_t>(imm);
@@ -237,7 +231,7 @@ bool DecodeSopc(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	inst.word      = word;
 	inst.family    = Family::SOPC;
 	inst.opcode_id = opcode;
-	inst.opcode    = Lookup(SOPC_OPS, static_cast<uint32_t>(std::size(SOPC_OPS)), opcode);
+	inst.opcode    = Detail::LookupOpcode(SOPC_OPS, opcode);
 	inst.dst.kind  = OperandKind::Scc;
 	SetRawWords(inst, code, word_index, 1);
 
@@ -261,7 +255,7 @@ bool DecodeSopp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	inst.word            = word;
 	inst.family          = Family::SOPP;
 	inst.opcode_id       = opcode;
-	inst.opcode          = Lookup(SOPP_OPS, static_cast<uint32_t>(std::size(SOPP_OPS)), opcode);
+	inst.opcode          = Detail::LookupOpcode(SOPP_OPS, opcode);
 	inst.src0.kind       = OperandKind::LiteralConstant;
 	inst.src0.value      = simm;
 	inst.src0.signed_val = static_cast<int16_t>(simm);

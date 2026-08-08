@@ -31,6 +31,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/vma.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/presentation/imeDialogOverlay.h"
 #include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/window/hostInput.h"
 #include "graphics/presentation/window/windowInternal.h"
@@ -476,6 +477,9 @@ void WindowContext::ProcessEvent(double time_s) {
 	auto& game  = loop;
 	auto* event = &game.event;
 	EXIT_IF(SDL_GetEventState(SDL_DISPLAYEVENT) != SDL_ENABLE);
+	if (ProcessImeDialogInput(*event)) {
+		return;
+	}
 
 	switch (event->type) {
 		case SDL_QUIT: GameEventQuit(game); break;
@@ -748,26 +752,18 @@ void WindowContext::Run() {
 #if defined(__APPLE__)
 		DrainMainThreadTasks();
 #endif
-		if (SDL_PollEvent(&loop.event) != 0) {
-			ProcessEvent(timer.GetTimeS());
-			continue;
-		}
-
 		if (loop.paused.load(std::memory_order_acquire)) {
 			if (!timer.IsPaused()) {
 				timer.Pause();
 			}
-			if (SDL_WaitEvent(&loop.event) == 0) {
-				EXIT("%s\n", SDL_GetError());
-			}
-			ProcessEvent(timer.GetTimeS());
-			continue;
-		}
-
-		if (timer.IsPaused()) {
+		} else if (timer.IsPaused()) {
 			timer.Resume();
 		}
-		Common::Thread::SleepMicro(1000);
+
+		if (SDL_WaitEvent(&loop.event) == 0) {
+			EXIT("%s\n", SDL_GetError());
+		}
+		ProcessEvent(timer.GetTimeS());
 	}
 }
 
@@ -787,6 +783,7 @@ static void WindowCreate(WindowContext& context) {
 		EXIT("%s\n", SDL_GetError());
 	}
 	HostInputInit();
+	InitializeImeDialogInput();
 
 	LOGF("WindowCreate(): width = %d, height = %d\n", width, height);
 
@@ -941,13 +938,6 @@ void WindowContext::UpdateTitle() {
 	static constexpr auto build_type = "Unknown";
 #endif
 
-#if defined(KYTY_OFFICIAL_BUILD)
-	static constexpr auto build_label = "Official build " KYTY_RELEASE_TAG;
-#elif defined(KYTY_FORK_BUILD)
-	static constexpr auto build_label = "Fork build " KYTY_BUILD_REPOSITORY " " KYTY_GIT_HASH;
-#else
-	static constexpr auto build_label = "Source build " KYTY_GIT_HASH;
-#endif
 
 	const auto now       = Common::Timer::QueryPerformanceCounter();
 	const auto frequency = Common::Timer::QueryPerformanceFrequency();
@@ -960,7 +950,7 @@ void WindowContext::UpdateTitle() {
 		fps_frames  = 0;
 	}
 
-	auto fps = fmt::format("[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:f}", build_label,
+	auto fps = fmt::format("[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:f}", KYTY_BUILD_LABEL,
 	                       build_type, (has_title ? title : ""), (has_title ? ", " : ""),
 	                       (has_title_id ? title_id : ""), (has_title_id ? ", " : ""),
 	                       (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""), device_name,

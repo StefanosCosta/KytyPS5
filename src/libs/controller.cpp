@@ -56,6 +56,7 @@ public:
 	void Disconnect(int id);
 	void Button(int id, uint32_t button, bool down);
 	void Axis(int id, Axis axis, int value);
+	void ResetInputState();
 	void GetConnectionInfo(bool* flag, int* count);
 	void ReadState(ControllerState* state, bool* flag, int* count);
 	int  ReadStates(ControllerState* states, int states_num, bool* flag, int* count);
@@ -207,7 +208,8 @@ void GameController::AddState(const ControllerState& state) {
 void GameController::Button(int id, uint32_t button, bool down) {
 	Common::LockGuard lock(m_mutex);
 
-	if (m_active_id == id) {
+	// The keyboard shares the player-1 pad with the active gamepad.
+	if (m_active_id == id || id == HOST_INPUT_CONTROLLER_ID) {
 		auto state = GetLastState();
 
 		state.time = LibKernel::KernelGetProcessTime();
@@ -225,7 +227,7 @@ void GameController::Button(int id, uint32_t button, bool down) {
 void GameController::Axis(int id, Controller::Axis axis, int value) {
 	Common::LockGuard lock(m_mutex);
 
-	if (m_active_id == id) {
+	if (m_active_id == id || id == HOST_INPUT_CONTROLLER_ID) {
 		auto state = GetLastState();
 
 		state.time = LibKernel::KernelGetProcessTime();
@@ -254,6 +256,15 @@ void GameController::Axis(int id, Controller::Axis axis, int value) {
 
 		AddState(state);
 	}
+}
+
+void GameController::ResetInputState() {
+	Common::LockGuard lock(m_mutex);
+	ControllerState   state {};
+	state.time    = LibKernel::KernelGetProcessTime();
+	m_states_num  = 0;
+	m_first_state = 0;
+	AddState(state);
 }
 
 void GameController::GetConnectionInfo(bool* flag, int* count) {
@@ -332,6 +343,11 @@ void ControllerAxis(int id, Axis axis, int value) {
 	EXIT_IF(g_controller == nullptr);
 
 	g_controller->Axis(id, axis, value);
+}
+
+void ControllerResetInputState() {
+	EXIT_IF(g_controller == nullptr);
+	g_controller->ResetInputState();
 }
 
 int KYTY_SYSV_ABI PadInit() {

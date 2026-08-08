@@ -3,7 +3,6 @@
 
 #include "common/abi.h"
 #include "common/common.h"
-#include "common/threads.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
@@ -20,7 +19,6 @@ struct GraphicContext;
 class CommandBuffer;
 class CommandScheduler;
 class TextureCache;
-class ResourceMutex;
 
 struct BufferBinding {
 	std::shared_ptr<void> owner;
@@ -41,7 +39,7 @@ public:
 	}
 
 	BufferCache(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager,
-	            TextureCache& texture_cache, ResourceMutex& resource_mutex);
+	            TextureCache& texture_cache);
 	~BufferCache();
 	KYTY_CLASS_NO_COPY(BufferCache);
 
@@ -61,7 +59,8 @@ public:
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds = false);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds = false,
 	                bool src_gds = false);
-	[[nodiscard]] bool HasPageOverlap(uint64_t vaddr, uint64_t size);
+	// Cache-index and exact dirty-range queries require GPU-thread serialization.
+	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
@@ -84,8 +83,6 @@ private:
 	[[nodiscard]] static constexpr uint64_t AlignDownload(uint64_t size) noexcept {
 		return (size + DOWNLOAD_ALIGNMENT - 1) & ~(DOWNLOAD_ALIGNMENT - 1);
 	}
-	[[nodiscard]] static bool PageOverlaps(uint64_t left, uint64_t left_size, uint64_t right,
-	                                       uint64_t right_size) noexcept;
 	[[nodiscard]] static std::pair<uint64_t, uint64_t> DownloadEnvelope(const DownloadCopy& copy);
 	[[nodiscard]] static bool ResolveOverlap(CacheRange& merged, CacheRange candidate) noexcept;
 	void Upload(CommandBuffer& command, Buffer& destination, uint64_t destination_offset,
@@ -102,7 +99,6 @@ private:
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
 	Buffer                                            m_gds_buffer;
-	Common::Mutex                                     m_mutex;
 	std::shared_ptr<Buffer>                           m_null_buffer;
 	std::map<uint64_t, std::unique_ptr<CachedBuffer>> m_buffers;
 	RangeSet                                          m_gpu_modified_ranges;
@@ -112,7 +108,6 @@ private:
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;
 	TextureCache&                                     m_texture_cache;
-	ResourceMutex&                                    m_resource_mutex;
 	uint64_t                                          m_total_used_memory = 0;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
