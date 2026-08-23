@@ -7134,7 +7134,8 @@ public:
               std::move(null_program)),
           std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>(
               std::move(null_snapshot))};
-      auto null_bindings = executor.PrepareBindings(null_runtime);
+      PreparedBindings null_bindings;
+      executor.PrepareBindings(null_runtime, null_bindings);
       executor.RebindImages(null_bindings);
       Require(name, "null descriptor count",
               null_bindings.resources.images.size() == 3,
@@ -7481,7 +7482,8 @@ public:
               std::move(storage_program)),
           std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>(
               std::move(storage_snapshot))};
-      auto storage_discovery = executor.PrepareBindings(storage_runtime);
+      PreparedBindings storage_discovery;
+      executor.PrepareBindings(storage_runtime, storage_discovery);
       const auto storage_id = storage_discovery.resources.images[0].image_id;
       Require(name, "storage prefetch purity",
               storage_discovery.resources.images[0].image_view == nullptr &&
@@ -7540,7 +7542,7 @@ public:
           ordered_bindings.pixel->resources.images[0].image_id;
       Require(
           name, "VS-before-PS retained-owner order",
-          ordered_bindings.vertex.resources.images[0].image_id == storage_id &&
+          ordered_bindings.vertex->resources.images[0].image_id == storage_id &&
               ordered_sampled_id != storage_id &&
               RenderExecutorTestAccess::BoundImagesInOrder(executor, storage_id,
                                                            ordered_sampled_id),
@@ -7552,7 +7554,7 @@ public:
           RenderExecutorTestAccess::PrepareGraphicsBindings(
               executor, storage_runtime, sampled_runtime, true);
       const auto &storage_binding =
-          graphics_bindings.vertex.resources.images[0];
+          graphics_bindings.vertex->resources.images[0];
       const auto &sampled_binding =
           graphics_bindings.pixel->resources.images[0];
       Require(name, "storage final acquisition",
@@ -7574,7 +7576,7 @@ public:
               "the production graphics binding path did not complete vertex "
               "storage acquisition before pixel sampling");
       descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
-          executor, scheduler.Current(), graphics_bindings.vertex,
+          executor, scheduler.Current(), *graphics_bindings.vertex,
           *graphics_bindings.pixel));
       Require(name, "early writable alias retention",
               texture_cache.GetImage(storage_id).backing.state.access_mask ==
@@ -7605,15 +7607,15 @@ public:
               "an already sampled image was not promoted when a later "
               "storage alias bound the same backing");
       descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
-          executor, scheduler.Current(), writable_alias_bindings.vertex,
+          executor, scheduler.Current(), *writable_alias_bindings.vertex,
           *writable_alias_bindings.pixel));
       Require(
           name, "forced-general descriptor capture",
-          writable_alias_bindings.vertex.resources.images[0].layout ==
+          writable_alias_bindings.vertex->resources.images[0].layout ==
                   vk::ImageLayout::eGeneral &&
               writable_alias_bindings.pixel->resources.images[0].layout ==
                   vk::ImageLayout::eGeneral &&
-              MakeImageInfo(writable_alias_bindings.vertex.resources.images[0])
+              MakeImageInfo(writable_alias_bindings.vertex->resources.images[0])
                       .imageLayout == vk::ImageLayout::eGeneral &&
               MakeImageInfo(writable_alias_bindings.pixel->resources.images[0])
                       .imageLayout == vk::ImageLayout::eGeneral &&
@@ -8064,7 +8066,8 @@ public:
           std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>(
               std::move(array_snapshot))};
 
-      auto array_binding = executor.PrepareBindings(array_runtime);
+      PreparedBindings array_binding;
+      executor.PrepareBindings(array_runtime, array_binding);
       executor.RebindImages(array_binding);
       const auto expanded_array_id = array_binding.resources.images[0].image_id;
       const auto &expanded_array = texture_cache.GetImage(expanded_array_id);
@@ -8137,8 +8140,8 @@ public:
       ShaderStageRuntime colliding_msaa_runtime{
           std::move(colliding_msaa_program),
           std::move(colliding_msaa_snapshot)};
-      auto colliding_msaa_binding =
-          executor.PrepareBindings(colliding_msaa_runtime);
+      PreparedBindings colliding_msaa_binding;
+      executor.PrepareBindings(colliding_msaa_runtime, colliding_msaa_binding);
       executor.RebindImages(colliding_msaa_binding);
       const auto &resolved_colliding_msaa =
           colliding_msaa_binding.resources.images[0];
@@ -8196,7 +8199,8 @@ public:
       msaa_snapshot->images.push_back(msaa_descriptor);
       ShaderStageRuntime msaa_runtime{std::move(msaa_program),
                                       std::move(msaa_snapshot)};
-      auto msaa_binding = executor.PrepareBindings(msaa_runtime);
+      PreparedBindings msaa_binding;
+      executor.PrepareBindings(msaa_runtime, msaa_binding);
       executor.RebindImages(msaa_binding);
       const auto &resolved_msaa = msaa_binding.resources.images[0];
       Require(
@@ -8235,7 +8239,8 @@ public:
       msaa_array_snapshot->images.push_back(msaa_array_descriptor);
       ShaderStageRuntime msaa_array_runtime{std::move(msaa_array_program),
                                             std::move(msaa_array_snapshot)};
-      auto msaa_array_binding = executor.PrepareBindings(msaa_array_runtime);
+      PreparedBindings msaa_array_binding;
+      executor.PrepareBindings(msaa_array_runtime, msaa_array_binding);
       executor.RebindImages(msaa_array_binding);
       const auto &resolved_msaa_array = msaa_array_binding.resources.images[0];
       Require(name, "MSAA array backing expansion",
@@ -8472,7 +8477,8 @@ public:
           std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>(
               std::move(snapshot))};
 
-      auto prepared = context.GetRenderExecutor().PrepareBindings(runtime);
+      PreparedBindings prepared;
+      context.GetRenderExecutor().PrepareBindings(runtime, prepared);
       const auto sampled_stencil_id = prepared.resources.images[0].image_id;
       Require(name, "first stencil discovery",
               prepared.resources.images.size() == 1 &&
@@ -8505,7 +8511,8 @@ public:
               "at the stencil guest address");
       RenderExecutorTestAccess::ResetBindings(executor);
 
-      auto redirected = context.GetRenderExecutor().PrepareBindings(runtime);
+      PreparedBindings redirected;
+      context.GetRenderExecutor().PrepareBindings(runtime, redirected);
       Require(name, "redirected owner discovery",
               redirected.resources.images.size() == 1 &&
                   redirected.resources.images[0].image_id == depth_id &&
@@ -8541,8 +8548,8 @@ public:
           std::move(stencil_storage_program),
           std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>(
               std::move(stencil_storage_snapshot))};
-      auto storage_redirected =
-          executor.PrepareBindings(stencil_storage_runtime);
+      PreparedBindings storage_redirected;
+      executor.PrepareBindings(stencil_storage_runtime, storage_redirected);
       executor.RebindImages(storage_redirected);
       Require(
           name, "storage stencil acquisition",

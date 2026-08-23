@@ -274,10 +274,10 @@ static void LogDrawInputState(const RenderCommandBuffer& buffer, const RenderCol
 				     flt[6], flt[7], flt[8]);
 
 				for (int ai = 0; ai < b.attr_num; ai++) {
-					const auto  res_index = b.attr_indices[ai];
+					const auto  res_index = vs_input_info.attr_indices[b.attr_first + ai];
 					const auto& r         = vs_input_info.resources[res_index];
 					const auto& rd        = vs_input_info.resources_dst[res_index];
-					const auto  offset    = b.attr_offsets[ai];
+					const auto  offset    = vs_input_info.attr_offsets[b.attr_first + ai];
 					if (offset + 4u <= b.stride &&
 					    r.Format() == Prospero::BufferFormat::k8_8_8_8UNorm) {
 						uint32_t packed = 0;
@@ -298,12 +298,13 @@ static void LogDrawInputState(const RenderCommandBuffer& buffer, const RenderCol
 		}
 
 		for (int ai = 0; ai < b.attr_num; ai++) {
-			const auto  res_index = b.attr_indices[ai];
+			const auto  res_index = vs_input_info.attr_indices[b.attr_first + ai];
 			const auto& r         = vs_input_info.resources[res_index];
 			const auto& rd        = vs_input_info.resources_dst[res_index];
 			LOGF("DrawInputState[%u]: attr[%d] res=%d offset=%u dst=v%d regs=%d fetch_index=%u "
 			     "sharp=%08" PRIx32 " %08" PRIx32 " %08" PRIx32 " %08" PRIx32 "\n",
-			     log_id, ai, res_index, b.attr_offsets[ai], rd.register_start, rd.registers_num,
+			     log_id, ai, res_index, vs_input_info.attr_offsets[b.attr_first + ai],
+			     rd.register_start, rd.registers_num,
 			     rd.fetch_index, r.fields[0], r.fields[1], r.fields[2], r.fields[3]);
 		}
 	}
@@ -1002,9 +1003,11 @@ static void RefreshShaders(RenderCommandBuffer& buffer, const DrawCallInfo& draw
 	const auto& pixel_shader_info  = sh_ctx.GetPs();
 	const auto& shader_regs        = ctx.GetShaderRegisters();
 
-	state.vs_shader     = {};
-	state.ps_shader     = {};
-	state.ps_input_info = {};
+	state.vs_shader = {};
+	state.ps_shader = {};
+	// ps_input_info is not cleared here: this was its third clear in one draw. The caller's
+	// DrawRenderState is freshly value-initialized, and ShaderGetStaticInputInfoPS clears it again
+	// whenever the pixel shader is active.
 	std::array<Prospero::ColorComponentMapping, RENDER_COLOR_ATTACHMENTS_MAX>
 	    target_export_mapping {};
 	for (uint32_t i = 0; i < state.color_count; i++) {
@@ -1194,15 +1197,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, RenderCommandBuffer
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x200u);
 	}
 	CommitVertexBuffers(vk_buffer, vertex_bindings);
-	if (bindings.pixel.has_value()) {
+	if (bindings.pixel != nullptr) {
 		if (set_auto_debug) {
 			SetDrawDebugPhase(buffer, submit_id, draw, 0x300u);
 		}
 	}
-	std::array<PreparedBindings*, 2> descriptor_stages {&bindings.vertex, nullptr};
-	const size_t                     descriptor_stage_count = bindings.pixel.has_value() ? 2u : 1u;
-	if (bindings.pixel) {
-		descriptor_stages[1] = &*bindings.pixel;
+	std::array<PreparedBindings*, 2> descriptor_stages {bindings.vertex, nullptr};
+	const size_t descriptor_stage_count = bindings.pixel != nullptr ? 2u : 1u;
+	if (bindings.pixel != nullptr) {
+		descriptor_stages[1] = bindings.pixel;
 	}
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline,
 	               std::span {descriptor_stages.data(), descriptor_stage_count});

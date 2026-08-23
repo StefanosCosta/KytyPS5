@@ -158,7 +158,9 @@ public:
 	void DispatchDirect(uint64_t submit_id, RenderCommandBuffer& buffer, uint32_t thread_group_x,
 	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode);
 
-	[[nodiscard]] PreparedBindings PrepareBindings(const ShaderStageRuntime& runtime);
+	// Fills `out`, which the caller owns. Long-lived slots let a draw reuse the vectors instead of
+	// reconstructing seven heap-allocating containers per stage.
+	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& out);
 	void                           FindBuffers(PreparedBindings& bindings);
 	void                           RebindBuffers(PreparedBindings& bindings);
 	void                           RebindImages(PreparedBindings& bindings);
@@ -168,8 +170,9 @@ public:
 
 private:
 	struct GraphicsBindings {
-		PreparedBindings                vertex;
-		std::optional<PreparedBindings> pixel;
+		// Point into the executor's slots below; null pixel means the stage is inactive.
+		PreparedBindings* vertex = nullptr;
+		PreparedBindings* pixel  = nullptr;
 	};
 
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
@@ -205,6 +208,10 @@ private:
 	                                                     const RenderCommandBuffer&    buffer);
 
 	RenderContext&                        m_context;
+	// Reused across draws; ResetBindings() recycles them. See PreparedBindings::Recycle.
+	PreparedBindings                      m_prepared_vertex;
+	PreparedBindings                      m_prepared_pixel;
+	PreparedBindings                      m_prepared_compute;
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;

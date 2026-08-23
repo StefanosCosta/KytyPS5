@@ -9,6 +9,7 @@
 #include "common/singleton.h"
 #include "common/stringUtils.h"
 #include "common/subsystems.h"
+#include "common/syncStats.h"
 #include "common/systemInfo.h"
 #include "common/threads.h"
 #include "graphics/presentation/window.h"
@@ -187,6 +188,7 @@ void Run(const RunOptions& options) {
 	MountSandboxDirs();
 
 	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
+	Common::SyncStats::Start();
 	Libs::InitAll(rt->Symbols());
 
 	LoadElf(options.elf);

@@ -86,19 +86,54 @@ struct ShaderVertexInputInfo {
 	ShaderVertexDestination resources_dst[RES_MAX];
 	int                     resource_fetch_components[RES_MAX] = {};
 	ShaderVertexInputBuffer buffers[RES_MAX];
-	ShaderStageRuntime      stage;
-	int                     resources_num       = 0;
-	int                     fetch_shader_reg    = 0;
-	int                     fetch_attrib_reg    = 0;
-	int                     fetch_buffer_reg    = 0;
-	int                     buffers_num         = 0;
-	int                     export_count        = 0;
-	uint32_t                scratch_size_dwords = 0;
-	uint32_t                param_export_mask   = 0;
-	uint32_t                pa_cl_vs_out_cntl    = 0;
-	bool                    fetch_external      = false;
-	bool                    fetch_embedded      = false;
+	// Attribute lists for every buffer, packed end to end. Buffer bi owns
+	// [buffers[bi].attr_first, buffers[bi].attr_first + buffers[bi].attr_num); the ranges tile
+	// [0, resources_num) because every attribute lands in exactly one buffer.
+	int                attr_indices[RES_MAX] = {};
+	uint32_t           attr_offsets[RES_MAX] = {};
+	ShaderStageRuntime stage;
+	int                resources_num       = 0;
+	int                fetch_shader_reg    = 0;
+	int                fetch_attrib_reg    = 0;
+	int                fetch_buffer_reg    = 0;
+	int                buffers_num         = 0;
+	int                export_count        = 0;
+	uint32_t           scratch_size_dwords = 0;
+	uint32_t           param_export_mask   = 0;
+	uint32_t           pa_cl_vs_out_cntl   = 0;
+	bool               fetch_external      = false;
+	bool               fetch_embedded      = false;
+
+	// Clears everything a re-fill does not overwrite, so a draw can reuse the object.
+	//
+	// It deliberately leaves resources, resources_dst, buffers, attr_indices and attr_offsets
+	// alone: entry i of the first two is fully written before resources_num reaches i + 1, buffers
+	// is fully written for every index below buffers_num, and the attribute ranges tile
+	// [0, resources_num). Every reader is bounded by one of those counts, so the tails are never
+	// observed. resource_fetch_components is the exception - only the recompiler writes it, and
+	// only for the shaders it actually compiles, so pipeline creation reads zeroes for the rest.
+	void Reset() {
+		for (int& components: resource_fetch_components) {
+			components = 0;
+		}
+		stage               = {};
+		resources_num       = 0;
+		fetch_shader_reg    = 0;
+		fetch_attrib_reg    = 0;
+		fetch_buffer_reg    = 0;
+		buffers_num         = 0;
+		export_count        = 0;
+		scratch_size_dwords = 0;
+		param_export_mask   = 0;
+		pa_cl_vs_out_cntl   = 0;
+		fetch_external      = false;
+		fetch_embedded      = false;
+	}
 };
+
+// One of these is built per draw on the command-processor thread, so its size is a per-draw cost.
+// It was 10 178 bytes before the attribute lists were packed; keep it from growing back.
+static_assert(sizeof(ShaderVertexInputInfo) <= 2560);
 
 struct ShaderComputeInputInfo {
 	uint32_t           threads_num[3]             = {0, 0, 0};

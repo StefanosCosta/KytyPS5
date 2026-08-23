@@ -541,10 +541,10 @@ void CreatePipelineInternal(
 		    (b.fetch_index == 0 ? vk::VertexInputRate::eVertex : vk::VertexInputRate::eInstance);
 
 		for (int ai = 0; ai < b.attr_num; ai++) {
-			auto index                 = b.attr_indices[ai];
+			auto index                 = vs_input_info.attr_indices[b.attr_first + ai];
 			input_attr[index].binding  = bi;
 			input_attr[index].location = index;
-			input_attr[index].offset   = b.attr_offsets[ai];
+			input_attr[index].offset   = vs_input_info.attr_offsets[b.attr_first + ai];
 
 			uint32_t attr_size       = 4;
 			auto     registers_num   = vs_input_info.resources_dst[index].registers_num;

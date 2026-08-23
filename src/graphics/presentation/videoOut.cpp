@@ -8,6 +8,7 @@
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "common/syncStats.h"
 #include "common/timer.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -807,6 +808,7 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 			continue;
 		}
 
+		Common::SyncStats::CountEvent(Common::SyncStats::Event::FlipTick);
 		VblankBegin();
 		bool presented = m_flip_queue.Flip(0);
 		if (!presented && m_presenter.NeedsImeRefresh()) {
@@ -1060,6 +1062,8 @@ void FlipQueue::Complete(uint64_t request_id) {
 }
 
 void FlipQueue::WaitForSubmitSlot() {
+	Common::SyncStats::Scope stats(Common::SyncStats::Site::SubmitSlotWait);
+
 	Common::LockGuard lock(m_mutex);
 	while (m_requests.size() + m_cpu_requests.size() >= VIDEO_OUT_FLIP_QUEUE_CAPACITY) {
 		if (m_requests.empty()) {
@@ -1091,6 +1095,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 
 		if (m_requests.empty()) {
 			m_mutex.Unlock();
+			Common::SyncStats::CountEvent(Common::SyncStats::Event::FlipTickIdle);
 			return false;
 		}
 	}
@@ -1099,6 +1104,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 	}
 	if (m_requests.front().state != RequestState::Ready) {
 		m_mutex.Unlock();
+		Common::SyncStats::CountEvent(Common::SyncStats::Event::FlipTickNotReady);
 		return false;
 	}
 	m_processing = true;
@@ -1111,6 +1117,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 		Common::LockGuard queue_lock(m_mutex);
 		m_processing = false;
 		m_done_cond_var.SignalAll();
+		Common::SyncStats::CountEvent(Common::SyncStats::Event::FlipTickNotDue);
 		return false;
 	}
 

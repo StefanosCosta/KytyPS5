@@ -1,4 +1,5 @@
 #include "graphics/shader/shader.h"
+#include "graphics/shader/shaderVertexBuffers.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -490,58 +491,6 @@ static void GetNextGenFallbackShaderId(uint64_t addr, uint32_t& hash0, uint32_t&
 	crc32 = static_cast<uint32_t>(x & 0xffffffffu);
 }
 
-static void ShaderDetectBuffers(ShaderVertexInputInfo& info) {
-	KYTY_PROFILER_FUNCTION();
-
-	info.buffers_num = 0;
-
-	for (int ri = 0; ri < info.resources_num; ri++) {
-		const auto& r = info.resources[ri];
-
-		bool merged = false;
-		for (int bi = 0; bi < info.buffers_num; bi++) {
-			auto& b = info.buffers[bi];
-
-			uint64_t stride = b.stride;
-
-			if (stride == r.Stride() &&
-			    b.fetch_index == static_cast<uint32_t>(info.resources_dst[ri].fetch_index)) {
-				uint64_t rbase   = r.Base48();
-				uint64_t base    = std::min(rbase, b.addr);
-				uint64_t offset1 = rbase - base;
-				uint64_t offset2 = b.addr - base;
-
-				if (offset1 < stride && offset2 < stride) {
-					EXIT_NOT_IMPLEMENTED(b.num_records != r.NumRecords());
-					b.addr = base;
-					EXIT_NOT_IMPLEMENTED(b.attr_num >= ShaderVertexInputBuffer::ATTR_MAX);
-					b.attr_indices[b.attr_num++] = ri;
-					merged                       = true;
-					break;
-				}
-			}
-		}
-
-		if (!merged) {
-			EXIT_NOT_IMPLEMENTED(info.buffers_num >= ShaderVertexInputInfo::RES_MAX);
-			int bi                           = info.buffers_num++;
-			info.buffers[bi].addr            = r.Base48();
-			info.buffers[bi].stride          = r.Stride();
-			info.buffers[bi].num_records     = r.NumRecords();
-			info.buffers[bi].fetch_index     = info.resources_dst[ri].fetch_index;
-			info.buffers[bi].attr_num        = 1;
-			info.buffers[bi].attr_indices[0] = ri;
-		}
-	}
-
-	for (int bi = 0; bi < info.buffers_num; bi++) {
-		auto& b = info.buffers[bi];
-		for (int ri = 0; ri < b.attr_num; ri++) {
-			b.attr_offsets[ri] = info.resources[b.attr_indices[ri]].Base48() - b.addr;
-		}
-	}
-}
-
 static Prospero::BufferFormat
 VertexAttribFormatToBufferFormat(Prospero::VertexAttribFormat format) {
 	struct FormatMap {
@@ -781,7 +730,7 @@ static bool ShaderGetStaticInputInfoVS(const HW::VertexShaderInfo& regs,
                                        const HW::ShaderRegisters& sh, ShaderVertexInputInfo& info) {
 	KYTY_PROFILER_FUNCTION();
 
-	info = {};
+	info.Reset();
 
 	info.export_count      = static_cast<int>(sh.GetExportCount());
 	info.pa_cl_vs_out_cntl = sh.m_paClVsOutCntl;
@@ -1302,7 +1251,8 @@ void ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info) {
 		for (int j = 0; j < r.attr_num; j++) {
 			LOGF("\t\t attr_indices[%d]  = %d\n"
 			     "\t\t attr_offsets[%d]  = %u\n",
-			     j, r.attr_indices[j], j, r.attr_offsets[j]);
+			     j, info.attr_indices[r.attr_first + j], j,
+			     info.attr_offsets[r.attr_first + j]);
 		}
 	}
 }
@@ -1653,8 +1603,8 @@ ShaderId ShaderGetIdVS(const HW::VertexShaderInfo& regs, const ShaderVertexInput
 		ret.ids.push_back(r.stride);
 		ret.ids.push_back(r.fetch_index);
 		for (int j = 0; j < r.attr_num; j++) {
-			ret.ids.push_back(r.attr_indices[j]);
-			ret.ids.push_back(r.attr_offsets[j]);
+			ret.ids.push_back(input_info.attr_indices[r.attr_first + j]);
+			ret.ids.push_back(input_info.attr_offsets[r.attr_first + j]);
 		}
 	}
 

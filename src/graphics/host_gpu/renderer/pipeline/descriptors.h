@@ -53,6 +53,29 @@ struct PreparedBindings {
 	std::vector<uint32_t>                         flattened_srt;
 	std::vector<uint32_t>                         user_data;
 	bool                                          committed = false;
+	// Set while a RenderExecutor slot is handed out, so a second PrepareBindings into a live slot
+	// is caught rather than silently overwriting bindings the current draw still refers to.
+	bool in_use = false;
+
+	// Returns the object to its default state while keeping every vector's capacity, so reusing a
+	// slot costs no allocation. Seven heap-allocating members were reconstructed per stage per
+	// draw before this existed.
+	void Recycle() {
+		resources.buffers.clear();
+		resources.images.clear();
+		resources.samplers.clear();
+		resources.addresses.clear();
+		resources.gds           = {};
+		resources.flattened_srt = {};
+		resources.user_data     = {};
+		buffer_ids.clear();
+		address_ids.clear();
+		flattened_srt.clear();
+		user_data.clear();
+		program   = nullptr;
+		snapshot  = nullptr;
+		committed = false;
+	}
 };
 
 [[nodiscard]] vk::DescriptorType

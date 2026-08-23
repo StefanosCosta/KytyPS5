@@ -22,6 +22,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
+#include "common/syncStats.h"
 #include "common/systemInfo.h"
 #include "common/threads.h"
 #include "common/timer.h"
@@ -47,6 +48,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <vulkan/vk_platform.h>
 
@@ -118,6 +120,7 @@ public:
 	}
 
 	Presenter::Frame* Acquire() {
+		Common::SyncStats::Scope stats(Common::SyncStats::Site::FramePoolAcquire);
 		m_mutex.Lock();
 		if (m_frames.empty()) {
 			EXIT("prepared-frame pool was used before swapchain initialization\n");
@@ -400,6 +403,42 @@ struct Presenter::Impl {
 	std::atomic<uint64_t> presented_ime_revision {0};
 };
 
+// TEMPORARY DIAGNOSTIC (KYTY_PRESENT_MODE) - default is unchanged.
+//
+// FIFO quantises the frame rate to 60/N: a frame that misses the 16.67 ms vblank budget by any
+// margin waits for the next one, so 17 ms of work presents at 30 fps and every CPU-side saving
+// short of crossing the boundary is invisible. Subnautica sits at exactly 29.999/23.994/19.998 fps
+// underwater with the GPU at 33 %, which is that signature. This makes the mode selectable so the
+// quantisation can be separated from the real frame cost; it does not change what the emulator does
+// unless KYTY_PRESENT_MODE is set.
+static vk::PresentModeKHR SelectPresentMode(const std::vector<vk::PresentModeKHR>& supported) {
+	const char* requested = std::getenv("KYTY_PRESENT_MODE"); // NOLINT(concurrency-mt-unsafe)
+	if (requested == nullptr) {
+		return vk::PresentModeKHR::eFifo;
+	}
+
+	const std::string_view name {requested};
+	vk::PresentModeKHR     wanted = vk::PresentModeKHR::eFifo;
+	if (name == "mailbox") {
+		wanted = vk::PresentModeKHR::eMailbox;
+	} else if (name == "immediate") {
+		wanted = vk::PresentModeKHR::eImmediate;
+	} else if (name == "relaxed") {
+		wanted = vk::PresentModeKHR::eFifoRelaxed;
+	} else if (name != "fifo") {
+		fprintf(stderr, "KYTY_PRESENT_MODE: unknown mode '%s', using fifo\n", requested);
+		return vk::PresentModeKHR::eFifo;
+	}
+
+	if (std::find(supported.begin(), supported.end(), wanted) == supported.end()) {
+		fprintf(stderr, "KYTY_PRESENT_MODE: '%s' is not supported by this surface, using fifo\n",
+		        requested);
+		return vk::PresentModeKHR::eFifo;
+	}
+	fprintf(stderr, "KYTY_PRESENT_MODE: using %s\n", requested);
+	return wanted;
+}
+
 void Swapchain::Create() {
 	auto& graphics = m_window.graphic_ctx;
 	EXIT_IF(graphics.screen_width == 0);
@@ -465,7 +504,7 @@ void Swapchain::Create() {
 	create_info.imageSharingMode = vk::SharingMode::eExclusive;
 	create_info.preTransform     = transform;
 	create_info.compositeAlpha   = composite;
-	create_info.presentMode      = vk::PresentModeKHR::eFifo;
+	create_info.presentMode      = SelectPresentMode(surface.present_modes);
 	create_info.clipped          = VK_TRUE;
 	RequireVulkanSuccess(graphics.device.createSwapchainKHR(&create_info, nullptr, &m_handle),
 	                     "vkCreateSwapchainKHR");
@@ -843,7 +882,11 @@ void Presenter::Present(Frame& frame, bool reuse) {
 	const auto ime_visual = GetImeVisualState();
 	auto&      swapchain  = m_impl->swapchain;
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
-		auto status = swapchain.AcquireNextImage();
+		Swapchain::Status status = Swapchain::Status::Success;
+		{
+			Common::SyncStats::Scope stats(Common::SyncStats::Site::PresentAcquireImage);
+			status = swapchain.AcquireNextImage();
+		}
 		if (status != Swapchain::Status::Success) {
 			m_impl->RecoverSwapchain(status);
 			continue;
@@ -852,6 +895,7 @@ void Presenter::Present(Frame& frame, bool reuse) {
 			frame.present_commands = std::make_unique<CommandBuffer>(m_impl->present_scheduler);
 		}
 		{
+			Common::SyncStats::Scope stats(Common::SyncStats::Site::PresentRenderMutex);
 			Common::LockGuard render_lock(m_impl->renderer.GetMutex());
 			frame.present_commands->WaitForFenceAndReset();
 			auto&      command          = *frame.present_commands;
@@ -866,6 +910,7 @@ void Presenter::Present(Frame& frame, bool reuse) {
 		}
 
 		m_impl->presented_ime_revision.store(ime_visual.revision, std::memory_order_release);
+		Common::SyncStats::CountEvent(Common::SyncStats::Event::Present);
 		window.UpdateTitle();
 		m_impl->frames.Release(&frame, true);
 		return;

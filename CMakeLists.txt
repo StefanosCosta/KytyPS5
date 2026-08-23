@@ -415,6 +415,13 @@ add_executable(shader_vertex_metadata_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(shader_vertex_metadata_tests PRIVATE ${inc_headers})
 
+add_executable(shader_vertex_buffers_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ShaderVertexBuffersTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/shaderVertexBuffers.cpp"
+)
+target_link_libraries(shader_vertex_buffers_tests fmt::fmt common)
+target_include_directories(shader_vertex_buffers_tests PRIVATE ${inc_headers})
+
 add_executable(shader_stage_runtime_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ShaderStageRuntimeTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
@@ -522,6 +529,7 @@ if(BUILD_TESTING)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
+	add_test(NAME shader_vertex_buffers COMMAND $<TARGET_FILE:shader_vertex_buffers_tests>)
 	add_test(NAME shader_stage_runtime COMMAND $<TARGET_FILE:shader_stage_runtime_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
 	add_test(NAME event_queue_lifetime COMMAND $<TARGET_FILE:event_queue_lifetime_tests>)

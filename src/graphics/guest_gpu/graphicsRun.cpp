@@ -5,6 +5,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
+#include "common/syncStats.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
@@ -47,7 +48,10 @@ public:
 			EXIT("recursive GPU mutex acquisition\n");
 		}
 		g_gpu_mutex_owned = true;
-		m_mutex.Lock();
+		{
+			Common::SyncStats::Scope stats(Common::SyncStats::Site::SubmissionMutex, 2);
+			m_mutex.Lock();
+		}
 	}
 	~GpuMutexLock() {
 		if (!g_gpu_mutex_owned) {
@@ -196,12 +200,16 @@ void GuestGpu::SubmitFlipPreparation(uint64_t request_id) {
 }
 
 void GuestGpu::Done() {
+	Common::SyncStats::Scope stats(Common::SyncStats::Site::FrameDoneTotal);
+
 	GpuMutexLock lock(m_submission_mutex);
 	if (!IsGpuThread()) {
+		Common::SyncStats::Scope drain(Common::SyncStats::Site::FrameDoneQueueDrain);
 		WaitForIdle();
 	}
 	m_graphics_done = true;
 	m_done_num++;
+	Common::SyncStats::CountEvent(Common::SyncStats::Event::GuestFrame);
 }
 
 int GuestGpu::GetFrameNum() const {
@@ -500,6 +508,8 @@ void GuestGpu::ThreadRun(void* data) {
 				}
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
+					Common::SyncStats::CountEvent(Common::SyncStats::Event::CpBlockedRound);
+					Common::SyncStats::Scope stats(Common::SyncStats::Site::CpBlockedPoll);
 					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {
@@ -839,6 +849,7 @@ void CommandProcessor::SetNumInstances(uint32_t num_instances) {
 void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t wait_op,
                                       const volatile void* address, uint32_t count_in_dwords) {
 	if (wait_op != 0) {
+		Common::SyncStats::Scope stats(Common::SyncStats::Site::PredicationGpuWait);
 		BufferFlushAndWait();
 	}
 
@@ -1275,7 +1286,10 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 			if constexpr (sizeof(T) == sizeof(uint32_t)) {
 				if (eop_event_type == 0x2f && cache_action == 0x00 && event_index == 0x06) {
 					auto* dst = static_cast<uint32_t*>(dst_gpu_addr);
-					SynchronizeGpu();
+					{
+						Common::SyncStats::Scope stats(Common::SyncStats::Site::GdsReadGpuWait);
+						SynchronizeGpu();
+					}
 					Sync::ReadGds(*m_renderer.GetBufferCache().GetGdsBuffer(), dst, value & 0xffffu,
 					              value >> 16u);
 					Sync::WriteAtEndOfPipeGds32(m_submit_id, CurrentBuffer(), dst, value & 0xffffu,

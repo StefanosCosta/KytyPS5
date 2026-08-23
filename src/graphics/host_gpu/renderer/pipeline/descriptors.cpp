@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -924,6 +925,10 @@ void RenderExecutor::BindRenderTarget(ImageId id) {
 }
 
 void RenderExecutor::ResetBindings() {
+	for (auto* slot: {&m_prepared_vertex, &m_prepared_pixel, &m_prepared_compute}) {
+		slot->Recycle();
+		slot->in_use = false;
+	}
 	for (const auto id: m_bound_images) {
 		if (auto* image = m_context.GetTextureCache().m_slot_images.try_get(id); image != nullptr) {
 			image->binding = {};
@@ -932,17 +937,29 @@ void RenderExecutor::ResetBindings() {
 	m_bound_images.clear();
 }
 
-PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime) {
+void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& out) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(!runtime);
 	const auto& program  = *runtime.program;
 	const auto& snapshot = *runtime.resources;
-	std::string error;
-	if (!ShaderRecompiler::IR::ValidateResourceSpecialization(program, snapshot, &error)) {
-		EXIT("invalid native shader runtime snapshot: %s\n", error.c_str());
+	// ShaderMaterializeStageRuntime already validated this exact (program, snapshot) pair when it
+	// built the stage, and `resources` is a shared_ptr<const> that cannot have changed since.
+	// Re-checking it costs a full specialization validation per stage per draw on the hot path, so
+	// keep it as a corruption guard under --shader-validation rather than always.
+	if (Config::ShaderValidationEnabled()) {
+		std::string error;
+		if (!ShaderRecompiler::IR::ValidateResourceSpecialization(program, snapshot, &error)) {
+			EXIT("invalid native shader runtime snapshot: %s\n", error.c_str());
+		}
 	}
 
-	PreparedBindings prepared;
+	if (out.in_use) {
+		EXIT("prepared binding slot reused while still live\n");
+	}
+	out.Recycle();
+	out.in_use = true;
+
+	auto& prepared    = out;
 	prepared.program  = runtime.program.get();
 	prepared.snapshot = runtime.resources.get();
 	auto& descriptors = prepared.resources;
@@ -972,7 +989,6 @@ PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runti
 	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::Gds) != nullptr) {
 		descriptors.gds.buffer = m_context.GetBufferCache().GetGdsBuffer()->Handle();
 	}
-	return prepared;
 }
 
 void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
@@ -1119,22 +1135,23 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 RenderExecutor::GraphicsBindings
 RenderExecutor::PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
                                         const ShaderStageRuntime& pixel, bool pixel_active) {
-	GraphicsBindings bindings {
-	    .vertex = PrepareBindings(vertex),
-	};
+	GraphicsBindings bindings {};
+	PrepareBindings(vertex, m_prepared_vertex);
+	bindings.vertex = &m_prepared_vertex;
 	if (pixel_active) {
-		bindings.pixel.emplace(PrepareBindings(pixel));
+		PrepareBindings(pixel, m_prepared_pixel);
+		bindings.pixel = &m_prepared_pixel;
 	}
-	FindBuffers(bindings.vertex);
-	if (bindings.pixel) {
+	FindBuffers(*bindings.vertex);
+	if (bindings.pixel != nullptr) {
 		FindBuffers(*bindings.pixel);
 	}
-	RebindBuffers(bindings.vertex);
-	if (bindings.pixel) {
+	RebindBuffers(*bindings.vertex);
+	if (bindings.pixel != nullptr) {
 		RebindBuffers(*bindings.pixel);
 	}
-	RebindImages(bindings.vertex);
-	if (bindings.pixel) {
+	RebindImages(*bindings.vertex);
+	if (bindings.pixel != nullptr) {
 		RebindImages(*bindings.pixel);
 	}
 	return bindings;

@@ -335,7 +335,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, RenderCommandBuffer& buf
 	buffer.EndRendering();
 	auto& pipeline =
 	    m_context.GetPipelineCache().CreateComputePipeline(input_info, sh_ctx.GetCs(), cs_shader);
-	auto bindings = PrepareBindings(input_info.stage);
+	auto& bindings = m_prepared_compute;
+	PrepareBindings(input_info.stage, bindings);
 	FindBuffers(bindings);
 	RebindBuffers(bindings);
 	RebindImages(bindings);

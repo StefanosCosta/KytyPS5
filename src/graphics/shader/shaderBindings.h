@@ -169,16 +169,18 @@ struct ShaderSamplerResource {
 	}
 };
 
+// The attribute list itself lives in the owning ShaderVertexInputInfo, as the half-open range
+// [attr_first, attr_first + attr_num) of its attr_indices / attr_offsets arrays. Every attribute
+// belongs to exactly one buffer, so one array of ShaderVertexInputInfo::RES_MAX entries covers all
+// of them; giving each of the 32 buffers its own 32-entry arrays made this struct 280 bytes and the
+// owning info 10 KB, all of which was zeroed twice per draw.
 struct ShaderVertexInputBuffer {
-	static constexpr int ATTR_MAX = 32;
-
-	uint64_t addr                   = 0;
-	uint32_t stride                 = 0;
-	uint32_t num_records            = 0;
-	uint32_t fetch_index            = 0;
-	int      attr_num               = 0;
-	int      attr_indices[ATTR_MAX] = {0};
-	uint32_t attr_offsets[ATTR_MAX] = {0};
+	uint64_t addr        = 0;
+	uint32_t stride      = 0;
+	uint32_t num_records = 0;
+	uint32_t fetch_index = 0;
+	int      attr_num    = 0;
+	int      attr_first  = 0;
 };
 
 struct ShaderVertexDestination {

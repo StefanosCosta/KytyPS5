@@ -24,15 +24,11 @@ void RemoveBlock(Profiler::ScopedBlock* block) {
 
 namespace Profiler {
 
-ScopedBlock::ScopedBlock(const tracy::SourceLocationData* source_location) {
-	if (tracy::ProfilerAvailable()) {
-		m_zone.emplace(source_location, TRACY_CALLSTACK, true);
-		g_block_stack.push_back(this);
-	}
-}
-
-ScopedBlock::~ScopedBlock() {
-	End();
+void ScopedBlock::Begin(const tracy::SourceLocationData* source_location) {
+	// Only reached with the client running, so the push_back and its allocation are off the path
+	// taken when profiling is disabled.
+	m_zone.emplace(source_location, TRACY_CALLSTACK, true);
+	g_block_stack.push_back(this);
 }
 
 void ScopedBlock::End() {
@@ -59,6 +55,7 @@ void Initialize() {
 		case Config::ProfilerDirection::Network:
 			if (!tracy::ProfilerAvailable()) {
 				tracy::StartupProfiler();
+				g_enabled = true;
 				TracySetProgramName("KytyPS5");
 				::printf("Tracy profiler enabled: client %d.%d.%d, protocol %u, "
 				         "broadcast %u, connect to 127.0.0.1:8086\n",
@@ -73,6 +70,7 @@ void Initialize() {
 
 void Shutdown() {
 	if (tracy::ProfilerAvailable()) {
+		g_enabled = false;
 		tracy::ShutdownProfiler();
 	}
 }

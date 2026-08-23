@@ -23,18 +23,39 @@ inline constexpr uint32_t DeepOrangeA200 = 0xff6e40;
 
 namespace Profiler {
 
+// Set once when the subsystem starts the Tracy client, and read once per instrumented scope.
+//
+// It lives in the header on purpose. With the constructor and destructor defined out of line, every
+// one of the ~100 instrumentation sites paid two cross-translation-unit calls and a full stack frame
+// to ask a question that is false for the entire run unless --profiler-direction Network was passed.
+// Forty-nine of those sites are one per PM4 packet handler, so the command-processor thread carried
+// it: ~1% of its time, profiling nothing.
+inline bool g_enabled = false;
+
 class ScopedBlock {
 public:
-	explicit ScopedBlock(const tracy::SourceLocationData* source_location);
+	explicit ScopedBlock(const tracy::SourceLocationData* source_location) {
+		if (g_enabled) {
+			Begin(source_location);
+		}
+	}
 	ScopedBlock(const ScopedBlock&)            = delete;
 	ScopedBlock& operator=(const ScopedBlock&) = delete;
 	ScopedBlock(ScopedBlock&&)                 = delete;
 	ScopedBlock& operator=(ScopedBlock&&)      = delete;
-	~ScopedBlock();
+
+	~ScopedBlock() {
+		// Empty unless this block was actually opened, so the disabled path never leaves the header.
+		if (m_zone.has_value()) {
+			End();
+		}
+	}
 
 	void End();
 
 private:
+	void Begin(const tracy::SourceLocationData* source_location);
+
 	std::optional<tracy::ScopedZone> m_zone;
 };
 

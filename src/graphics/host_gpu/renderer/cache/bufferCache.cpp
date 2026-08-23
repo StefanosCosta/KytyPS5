@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/syncStats.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
@@ -338,7 +339,8 @@ void BufferCache::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		    });
 	}
 	if (!copies.empty()) {
-		auto downloads = RecordDownloads(copies);
+		auto                     downloads = RecordDownloads(copies);
+		Common::SyncStats::Scope stats(Common::SyncStats::Site::ReadbackGpuWait);
 		m_scheduler.FinishCurrent();
 		PublishDownloads(downloads);
 	} else if (!retired_buffers.empty()) {
@@ -428,6 +430,7 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 		DeleteBuffer(overlap);
 	}
 	m_total_used_memory += buffer.Size();
+	Common::SyncStats::SetGauge(Common::SyncStats::Gauge::BufferCacheEntries, m_buffers.size());
 	const auto [it, inserted] = m_buffers.emplace(begin, id);
 	(void)it;
 	EXIT_IF(!inserted);
