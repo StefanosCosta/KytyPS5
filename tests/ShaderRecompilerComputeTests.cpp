@@ -1369,6 +1369,15 @@ std::array<u32, 64> MakeSampledTextureData(Prospero::BufferFormat format) {
   return MakeStorageTextureData(format);
 }
 
+// A descriptor that can alias a real depth target: depth tiling plus one of the two guest formats
+// with a host depth policy. Prospero::SupportsDepthCompareSampling accepts exactly this shape, so
+// comparison samples against it keep the hardware Dref lowering.
+std::array<u32, 64> MakeSampledDepthTextureData(Prospero::BufferFormat format) {
+  auto data = MakeStorageTextureData(format);
+  data[3] |= static_cast<uint32_t>(Prospero::TileMode::kDepth) << 20u;
+  return data;
+}
+
 namespace TestSpv {
 
 enum : u32 {
@@ -18640,7 +18649,185 @@ TestCase ImageSampleA16CompareBiasRdna2AddressOrder() {
   test.code = code;
   test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
+  // A depth-capable descriptor, so this keeps exercising the hardware Dref lowering. Without one
+  // the comparison is emulated in the shader (Vulkan forbids Dref on a colour format), and this
+  // test is about A16 address ordering, not about which lowering is chosen.
+  test.user_data = MakeSampledDepthTextureData(Prospero::BufferFormat::k32Float);
+  test.has_user_data = true;
   test.required_spirv = {"OpImageSampleDrefExplicitLod", "UnpackHalf2x16"};
+  test.compile_only = true;
+  return test;
+}
+
+// Runs the emulated comparison on the GPU and checks the value against the definition Vulkan gives
+// for depth comparison: the result is (Dref op texel), 1.0 on pass and 0.0 on fail.
+//
+// The texture's red channel is 0.5 and the other channels are deliberately different, so comparing
+// the wrong component would change the answer. The compare function comes from the sampler
+// descriptor's DEPTH_COMPARE_FUNC field (S# bits 14:12, ISA doc 70648 p. 76), which is what the
+// lowering has to bake into the shader -- a mistake in that mapping is exactly what this catches.
+//
+// Note what this does NOT do: the harness binds a plain nearest sampler and a colour image, so it
+// cannot execute a hardware Dref sample for a side-by-side comparison. This validates the emulated
+// arithmetic against the specified semantics, not against the hardware itself.
+TestCase CompareEmulationCase(const char *name, u32 compare_func, u32 reference,
+                              u32 expected) {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 20, reference);    // PCF reference
+  AppendVMovLiteral(&code, 21, 0x3f000000u);  // x = 0.5
+  AppendVMovLiteral(&code, 22, 0x3f000000u);  // y = 0.5
+  code.push_back(EncodeMimg0(0x2f, 0x1));     // image_sample_c_lz
+  code.push_back(EncodeMimg1(0, 20));
+  AppendStoreVgpr(&code, 0, 0);
+  AppendEnd(&code);
+
+  auto image = MakeRgbaImage(4, 4);
+  for (u32 y = 0; y < 4u; y++) {
+    for (u32 x = 0; x < 4u; x++) {
+      // red 0.5, and green/blue/alpha distinct so a wrong-channel compare shows up
+      SetRgbaPixel(&image, 4, x, y, 0x3f000000u, 0x3f800000u, 0x40000000u,
+                   0x40400000u);
+    }
+  }
+
+  TestCase test;
+  test.name = name;
+  test.code = code;
+  test.expected = {expected};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.sampled_image_rgba = image;
+  // Colour descriptor with standard tiling: not depth-capable, so this takes the emulated path.
+  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k8_8_8_8Srgb);
+  test.user_data[0] = (test.user_data[0] & ~(0x7u << 12u)) | (compare_func << 12u);
+  test.has_user_data = true;
+  test.forbidden_spirv = {"OpImageSampleDref"};
+  return test;
+}
+
+// texel red = 0.5; expected = (reference op 0.5) ? 1.0 : 0.0
+TestCase CompareEmulationNever() {
+  return CompareEmulationCase("CompareEmulationNever", 0u, 0x3e800000u, 0u);
+}
+TestCase CompareEmulationLessTrue() {
+  return CompareEmulationCase("CompareEmulationLessTrue", 1u, 0x3e800000u,
+                              0x3f800000u); // 0.25 < 0.5
+}
+TestCase CompareEmulationLessFalse() {
+  return CompareEmulationCase("CompareEmulationLessFalse", 1u, 0x3f400000u,
+                              0u); // 0.75 < 0.5 is false
+}
+TestCase CompareEmulationEqual() {
+  return CompareEmulationCase("CompareEmulationEqual", 2u, 0x3f000000u,
+                              0x3f800000u); // 0.5 == 0.5
+}
+TestCase CompareEmulationLessEqual() {
+  return CompareEmulationCase("CompareEmulationLessEqual", 3u, 0x3f000000u,
+                              0x3f800000u); // 0.5 <= 0.5
+}
+TestCase CompareEmulationGreater() {
+  return CompareEmulationCase("CompareEmulationGreater", 4u, 0x3f400000u,
+                              0x3f800000u); // 0.75 > 0.5
+}
+TestCase CompareEmulationNotEqual() {
+  return CompareEmulationCase("CompareEmulationNotEqual", 5u, 0x3f000000u,
+                              0u); // 0.5 != 0.5 is false
+}
+TestCase CompareEmulationGreaterEqual() {
+  return CompareEmulationCase("CompareEmulationGreaterEqual", 6u, 0x3e800000u,
+                              0u); // 0.25 >= 0.5 is false
+}
+TestCase CompareEmulationAlways() {
+  return CompareEmulationCase("CompareEmulationAlways", 7u, 0x3e800000u,
+                              0x3f800000u);
+}
+
+// A comparison sample against a descriptor that cannot alias a depth image. Vulkan forbids Dref
+// sampling there -- doing it anyway hangs the GPU (VUID-vkCmdDraw-None-06479), which is what stalled
+// Subnautica -- so the comparison must be lowered into the shader instead. The default fixture
+// descriptor is colour with linear tiling, and its S# yields compare func 1 (Less).
+TestCase ImageSampleCompareEmulatesColorSurface() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 20, 0x3f000000u); // PCF reference = 0.5
+  AppendVMovLiteral(&code, 21, 0x3f200000u); // x
+  AppendVMovLiteral(&code, 22, 0x3ec00000u); // y
+  code.push_back(EncodeMimg0(0x2f, 0x1));    // image_sample_c_lz
+  code.push_back(EncodeMimg1(0, 20));
+  AppendStoreVgpr(&code, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "ImageSampleCompareEmulatesColorSurface";
+  test.code = code;
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  // Subnautica's actual pairing: an sRGB colour texture with standard tiling.
+  test.user_data =
+      MakeSampledTextureData(Prospero::BufferFormat::k8_8_8_8Srgb);
+  test.has_user_data = true;
+  test.required_spirv = {"OpImageSampleExplicitLod", "OpFOrdLessThan",
+                         "OpSelect"};
+  test.forbidden_spirv = {"OpImageSampleDref"};
+  test.compile_only = true;
+  return test;
+}
+
+// The same shader against a depth-capable descriptor keeps the hardware lowering. This is the
+// regression lock: if the predicate ever widens, real shadow maps silently lose hardware PCF and
+// this fails.
+TestCase ImageSampleCompareKeepsHardwareDrefOnDepthSurface() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 20, 0x3f000000u);
+  AppendVMovLiteral(&code, 21, 0x3f200000u);
+  AppendVMovLiteral(&code, 22, 0x3ec00000u);
+  code.push_back(EncodeMimg0(0x2f, 0x1));
+  code.push_back(EncodeMimg1(0, 20));
+  AppendStoreVgpr(&code, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "ImageSampleCompareKeepsHardwareDrefOnDepthSurface";
+  test.code = code;
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.user_data = MakeSampledDepthTextureData(Prospero::BufferFormat::k32Float);
+  test.has_user_data = true;
+  test.required_spirv = {"OpImageSampleDrefExplicitLod"};
+  test.forbidden_spirv = {"OpImageSampleExplicitLod"};
+  test.compile_only = true;
+  return test;
+}
+
+// image_gather4_c against a colour descriptor: four independent comparisons, matching the four
+// results OpImageDrefGather would have produced.
+TestCase ImageGather4CompareEmulatesColorSurface() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 20, 0x3f000000u);
+  AppendVMovLiteral(&code, 21, 0x3f200000u);
+  AppendVMovLiteral(&code, 22, 0x3ec00000u);
+  code.push_back(EncodeMimg0(0x4f, 0x1));    // image_gather4_c_lz
+  code.push_back(EncodeMimg1(0, 20));
+  AppendStoreVgpr(&code, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "ImageGather4CompareEmulatesColorSurface";
+  test.code = code;
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_GATHER4_C_LZ, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.user_data =
+      MakeSampledTextureData(Prospero::BufferFormat::k8_8_8_8Srgb);
+  test.has_user_data = true;
+  test.required_spirv = {"OpImageGather", "OpFOrdLessThan", "OpSelect"};
+  test.forbidden_spirv = {"OpImageDrefGather"};
   test.compile_only = true;
   return test;
 }
@@ -18684,6 +18871,10 @@ TestCase ImageGatherCompareOpcodes() {
       O::V_MOV_B32,         O::IMAGE_GATHER4_C,      O::IMAGE_GATHER4_C_LZ,
       O::IMAGE_GATHER4_C_O, O::IMAGE_GATHER4_C_LZ_O, O::BUFFER_STORE_DWORD,
       O::S_ENDPGM};
+  // Depth-capable descriptor, so the four _C gather opcodes keep the hardware OpImageDrefGather
+  // lowering; this test is about opcode decoding and offset handling, not about which lowering.
+  test.user_data = MakeSampledDepthTextureData(Prospero::BufferFormat::k32Float);
+  test.has_user_data = true;
   test.required_spirv = {"OpImageDrefGather", "OpBitFieldSExtract"};
   test.compile_only = true;
   return test;
@@ -19863,6 +20054,18 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageSampleOpcodeAliasUsesNormalCoords);
   AddCase(ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu);
   AddCase(ImageSampleA16CompareBiasRdna2AddressOrder);
+  AddCase(CompareEmulationNever);
+  AddCase(CompareEmulationLessTrue);
+  AddCase(CompareEmulationLessFalse);
+  AddCase(CompareEmulationEqual);
+  AddCase(CompareEmulationLessEqual);
+  AddCase(CompareEmulationGreater);
+  AddCase(CompareEmulationNotEqual);
+  AddCase(CompareEmulationGreaterEqual);
+  AddCase(CompareEmulationAlways);
+  AddCase(ImageSampleCompareEmulatesColorSurface);
+  AddCase(ImageSampleCompareKeepsHardwareDrefOnDepthSurface);
+  AddCase(ImageGather4CompareEmulatesColorSurface);
   AddCase(ImageGatherCompareOpcodes);
   AddCase(ImageStoreVariants);
   AddCase(ImageD16StoreUnpacksHalfPairs);
@@ -22059,6 +22262,111 @@ void CheckImageSpecializationId() {
               mixed_sampler_snapshot.samplers.size() == 2u,
           "a shared native/bit-packed sampler was not split into point and "
           "native variants");
+
+  // A sampler shared between a genuine shadow map and a colour texture that is nevertheless
+  // comparison-sampled. Subnautica's real pairing: k32Float/kDepth alongside k8_8_8_8Srgb at
+  // kStandard4KB. The colour one cannot use Vulkan Dref (it hangs the GPU), so it has to take the
+  // emulated lowering -- which means its own sampler variant, since compareEnable is per sampler.
+  ShaderRecompiler::IR::Program compare_split_program;
+  compare_split_program.values =
+      std::make_shared<ShaderRecompiler::IR::ValueProgram>();
+  compare_split_program.resource_tracking_complete = true;
+  auto compare_image = sampled_image;
+  compare_image.depth_compare = true;
+  compare_split_program.info.images = {compare_image, compare_image};
+  compare_split_program.info.samplers.push_back({0u, 4u});
+  compare_split_program.info.sampled_pairs = {{0u, 0u, 8u}, {1u, 0u, 12u}};
+
+  auto depth_capable_descriptor = native_image_descriptor;
+  depth_capable_descriptor.dwords[1] =
+      static_cast<uint32_t>(Prospero::BufferFormat::k32Float) << 20u;
+  depth_capable_descriptor.dwords[3] |=
+      static_cast<uint32_t>(Prospero::TileMode::kDepth) << 20u;
+  auto colour_descriptor = native_image_descriptor;
+  colour_descriptor.dwords[0] = 0x2000u;
+  colour_descriptor.dwords[1] =
+      static_cast<uint32_t>(Prospero::BufferFormat::k8_8_8_8Srgb) << 20u;
+  colour_descriptor.dwords[3] |=
+      static_cast<uint32_t>(Prospero::TileMode::kStandard4KB) << 20u;
+
+  ShaderRecompiler::IR::ResourceSnapshot compare_split_snapshot;
+  compare_split_snapshot.images = {depth_capable_descriptor, colour_descriptor};
+  ShaderRecompiler::IR::DescriptorValue compare_sampler_descriptor{};
+  compare_sampler_descriptor.dword_count = 4;
+  compare_sampler_descriptor.dwords[0] = 3u << 12u; // DEPTH_COMPARE_FUNC = LessEqual
+  compare_split_snapshot.samplers.push_back(compare_sampler_descriptor);
+  std::string compare_split_error;
+  Require("ImageSpecializationId", "compare sampler specialization",
+          ShaderRecompiler::IR::SpecializeResources(
+              compare_split_program, compare_split_snapshot,
+              &compare_split_error),
+          compare_split_error);
+  Require(
+      "ImageSpecializationId", "compare sampler variant",
+      compare_split_program.info.images.size() == 2u &&
+          !compare_split_program.info.images[0].emulated_depth_compare &&
+          compare_split_program.info.images[1].emulated_depth_compare &&
+          compare_split_program.info.samplers.size() == 2u &&
+          compare_split_program.info.samplers[0].emulated_compare_op ==
+              ShaderRecompiler::IR::ShaderNoDepthCompareOp &&
+          !compare_split_program.info.samplers[0].force_point_filtering &&
+          compare_split_program.info.samplers[1].emulated_compare_op == 3u &&
+          compare_split_program.info.samplers[1].force_point_filtering &&
+          compare_split_program.info.sampled_pairs[0].sampler == 0u &&
+          compare_split_program.info.sampled_pairs[1].sampler == 1u &&
+          compare_split_snapshot.samplers.size() == 2u,
+      "a sampler shared between a depth-capable and a colour comparison sample "
+      "was not split into hardware and emulated variants");
+
+  // The specialization must be rejected when either half of it drifts, or a stale permutation
+  // would be reused for a descriptor it was not compiled for.
+  std::string compare_validate_error;
+  Require("ImageSpecializationId", "compare specialization round-trip",
+          ShaderRecompiler::IR::ValidateResourceSpecialization(
+              compare_split_program, compare_split_snapshot,
+              &compare_validate_error),
+          compare_validate_error);
+
+  auto changed_op_snapshot = compare_split_snapshot;
+  changed_op_snapshot.samplers[1].dwords[0] = 4u << 12u; // Greater
+  Require("ImageSpecializationId", "compare function drift rejected",
+          !ShaderRecompiler::IR::ValidateResourceSpecialization(
+              compare_split_program, changed_op_snapshot,
+              &compare_validate_error),
+          "a changed sampler comparison function reused a stale permutation");
+
+  auto changed_tile_snapshot = compare_split_snapshot;
+  changed_tile_snapshot.images[1].dwords[3] =
+      (changed_tile_snapshot.images[1].dwords[3] & ~(0x1fu << 20u)) |
+      (static_cast<uint32_t>(Prospero::TileMode::kDepth) << 20u);
+  changed_tile_snapshot.images[1].dwords[1] =
+      static_cast<uint32_t>(Prospero::BufferFormat::k32Float) << 20u;
+  Require("ImageSpecializationId", "depth capability drift rejected",
+          !ShaderRecompiler::IR::ValidateResourceSpecialization(
+              compare_split_program, changed_tile_snapshot,
+              &compare_validate_error),
+          "a descriptor that became depth-capable reused the emulated "
+          "permutation");
+
+  // Drift guard: the compile-time predicate must stay in step with the host depth-format policies
+  // it approximates. Adding a Z format without updating the predicate fails here.
+  Require("ImageSpecializationId", "depth compare predicate",
+          Prospero::SupportsDepthCompareSampling(
+              Prospero::BufferFormat::k16UNorm, Prospero::TileMode::kDepth) &&
+              Prospero::SupportsDepthCompareSampling(
+                  Prospero::BufferFormat::k32Float,
+                  Prospero::TileMode::kDepth) &&
+              !Prospero::SupportsDepthCompareSampling(
+                  Prospero::BufferFormat::k8_8_8_8Srgb,
+                  Prospero::TileMode::kDepth) &&
+              !Prospero::SupportsDepthCompareSampling(
+                  Prospero::BufferFormat::k32Float,
+                  Prospero::TileMode::kStandard4KB) &&
+              !Prospero::SupportsDepthCompareSampling(
+                  Prospero::BufferFormat::k32Float,
+                  Prospero::TileMode::kLinear),
+          "the depth-compare predicate no longer matches the host depth format "
+          "policies");
 
   ShaderRecompiler::IR::Program packed_atomic_program;
   packed_atomic_program.values =

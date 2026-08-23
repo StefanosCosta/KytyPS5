@@ -82,6 +82,18 @@ Prospero::BufferFormat ImageConversionFormat(Prospero::BufferFormat format) {
 	                                                     : Prospero::BufferFormat::kInvalid;
 }
 
+// Whether this descriptor can resolve to a depth-capable host image. See
+// Prospero::SupportsDepthCompareSampling for why the decision has to be made from the descriptor
+// alone rather than from the resolved image.
+bool DescriptorSupportsDepthCompare(const DescriptorValue& descriptor) {
+	if (NullImageDescriptor(descriptor)) {
+		return false;
+	}
+	return Prospero::SupportsDepthCompareSampling(
+	    static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu),
+	    static_cast<Prospero::TileMode>((descriptor.dwords[3] >> 20u) & 0x1fu));
+}
+
 bool DescriptorIsCube(const DescriptorValue& descriptor) {
 	return static_cast<Prospero::ImageType>((descriptor.dwords[3] >> 28u) & 0xfu) ==
 	       Prospero::ImageType::kCube;
@@ -435,6 +447,8 @@ bool ValidateResourceSpecialization(const Program& program, const ResourceSnapsh
 				    program.info.images[root].mip_count != image.mip_count ||
 				    program.info.images[root].conversion_format != image.conversion_format ||
 				    program.info.images[root].shader_swizzle != image.shader_swizzle ||
+				    program.info.images[root].emulated_depth_compare !=
+				        image.emulated_depth_compare ||
 				    program.info.images[root].cube != image.cube) {
 					if (error != nullptr) {
 						*error = fmt::format(
@@ -450,7 +464,7 @@ bool ValidateResourceSpecialization(const Program& program, const ResourceSnapsh
 				canonical_kind = image.kind == ResourceKind::StorageImageUint;
 			}
 			if (image.dimension != Decoder::ImageDimension::Dim2D || image.cube ||
-			    !canonical_kind) {
+			    !canonical_kind || image.emulated_depth_compare != image.depth_compare) {
 				if (error != nullptr) {
 					*error = fmt::format(
 					    "image descriptor {} no longer matches canonical null specialization", i);
@@ -494,6 +508,14 @@ bool ValidateResourceSpecialization(const Program& program, const ResourceSnapsh
 				}
 				return false;
 			}
+			if (image.emulated_depth_compare !=
+			    (image.depth_compare && !DescriptorSupportsDepthCompare(descriptor))) {
+				if (error != nullptr) {
+					*error = fmt::format(
+					    "image descriptor {} changed depth-comparison capability", i);
+				}
+				return false;
+			}
 			if ((storage || conversion_format != Prospero::BufferFormat::kInvalid) &&
 			    image.shader_swizzle != DescriptorImageSwizzle(descriptor)) {
 				if (error != nullptr) {
@@ -525,6 +547,28 @@ bool ValidateResourceSpecialization(const Program& program, const ResourceSnapsh
 				}
 				return false;
 			}
+		}
+	}
+	// Only samplers that actually bake a compare function are checked, so a title toggling the
+	// (otherwise ignored) compare bits of an ordinary sampler does not force a recompile.
+	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
+		const auto& sampler = program.info.samplers[i];
+		if (sampler.emulated_compare_op == ShaderNoDepthCompareOp) {
+			continue;
+		}
+		if (i >= snapshot.samplers.size()) {
+			if (error != nullptr) {
+				*error = fmt::format("sampler descriptor {} is missing from the snapshot", i);
+			}
+			return false;
+		}
+		const auto compare_op =
+		    static_cast<uint8_t>((snapshot.samplers[i].dwords[0] >> 12u) & 0x7u);
+		if (sampler.emulated_compare_op != compare_op) {
+			if (error != nullptr) {
+				*error = fmt::format("sampler descriptor {} changed depth comparison function", i);
+			}
+			return false;
 		}
 	}
 	for (uint32_t i = 0; i < program.info.addresses.size(); i++) {
@@ -818,6 +862,9 @@ bool SpecializeResources(Program& program, ResourceSnapshot& snapshot, std::stri
 					break;
 				default: break;
 			}
+			// The canonical null texture is a colour image (NullTextureSpec yields eR32Sfloat), so
+			// comparison-sampling one is exactly the illegal case and has to be emulated.
+			image.emulated_depth_compare = image.depth_compare;
 			continue;
 		}
 		const auto descriptor_dimension = DescriptorDimension(descriptor, image.dimension);
@@ -847,6 +894,8 @@ bool SpecializeResources(Program& program, ResourceSnapshot& snapshot, std::stri
 		const bool storage = image.kind == ResourceKind::StorageImage ||
 		                     image.kind == ResourceKind::StorageImageUint;
 		image.conversion_format = ImageConversionFormat(format);
+		image.emulated_depth_compare =
+		    image.depth_compare && !DescriptorSupportsDepthCompare(descriptor);
 		if (storage || image.conversion_format != Prospero::BufferFormat::kInvalid) {
 			image.shader_swizzle = DescriptorImageSwizzle(descriptor);
 		}
@@ -908,13 +957,19 @@ bool SpecializeResources(Program& program, ResourceSnapshot& snapshot, std::stri
 				image.conversion_format = image_class.conversion_format;
 				image.shader_swizzle    = image_class.shader_swizzle;
 				image.cube              = image_class.cube;
+				// A null candidate would otherwise be forced to emulate by the null branch above
+				// and then fail its own conformance check against a real depth exemplar.
+				image.emulated_depth_compare = image_class.emulated_depth_compare;
 			}
+			// One SPIR-V path serves the whole table, so a table mixing depth-capable and colour
+			// descriptors under one compare-sample cannot be lowered at all.
 			if (image.kind != image_class.kind || image.dimension != image_class.dimension ||
 			    image.mip_mode != image_class.mip_mode ||
 			    image.mip_count != image_class.mip_count ||
 			    image.conversion_format != image_class.conversion_format ||
 			    image.shader_swizzle != image_class.shader_swizzle ||
 			    image.depth_compare != image_class.depth_compare ||
+			    image.emulated_depth_compare != image_class.emulated_depth_compare ||
 			    image.cube != image_class.cube) {
 				if (error != nullptr) {
 					*error = fmt::format(
@@ -933,11 +988,34 @@ bool SpecializeResources(Program& program, ResourceSnapshot& snapshot, std::stri
 	}
 	auto memory_info = program.values->memory_info;
 
-	struct SamplerUsage {
-		bool native     = false;
-		bool point_only = false;
+	// A single guest sampler may have to become several host samplers: one per distinct combination
+	// of (baked compare function, forced point filtering). Packed-uint images need point filtering
+	// because the shader unpacks texels itself; emulated compare-samples need it because PCF is
+	// compare-then-filter, and with one texel that is identical to filter-then-compare. They also
+	// need the guest compare function baked in, since an emulated comparison cannot read the
+	// sampler object.
+	struct SamplerVariant {
+		uint8_t compare_op      = ShaderNoDepthCompareOp;
+		bool    point_filtering = false;
+
+		bool operator==(const SamplerVariant& other) const = default;
 	};
-	std::vector<SamplerUsage> sampler_usage(next.samplers.size());
+	const auto original_sampler_count = static_cast<uint32_t>(next.samplers.size());
+	auto       pair_variant = [&](const ImageResource& image, uint32_t sampler_index) {
+        SamplerVariant variant;
+        if (image.conversion_format != Prospero::BufferFormat::kInvalid) {
+            variant.point_filtering = true;
+        }
+        if (image.emulated_depth_compare) {
+            variant.point_filtering = true;
+            variant.compare_op      = static_cast<uint8_t>(
+                (next_snapshot.samplers[sampler_index].dwords[0] >> 12u) & 0x7u);
+        }
+        return variant;
+	};
+
+	std::vector<std::vector<std::pair<SamplerVariant, uint32_t>>> sampler_variants(
+	    original_sampler_count);
 	for (const auto& pair: next.sampled_pairs) {
 		if (pair.image >= next.images.size() || pair.sampler >= next.samplers.size()) {
 			if (error != nullptr) {
@@ -946,39 +1024,61 @@ bool SpecializeResources(Program& program, ResourceSnapshot& snapshot, std::stri
 			}
 			return false;
 		}
-		auto& usage = sampler_usage[pair.sampler];
-		if (next.images[pair.image].conversion_format != Prospero::BufferFormat::kInvalid) {
-			usage.point_only = true;
-		} else {
-			usage.native = true;
+		const auto variant = pair_variant(next.images[pair.image], pair.sampler);
+		auto&      entries = sampler_variants[pair.sampler];
+		if (std::none_of(entries.begin(), entries.end(),
+		                 [&](const auto& entry) { return entry.first == variant; })) {
+			entries.emplace_back(variant, UINT32_MAX);
 		}
 	}
-	std::vector<uint32_t> point_sampler(next.samplers.size(), UINT32_MAX);
-	for (uint32_t i = 0; i < sampler_usage.size(); i++) {
-		if (!sampler_usage[i].point_only) {
-			continue;
-		}
-		if (!sampler_usage[i].native) {
-			next.samplers[i].force_point_filtering = true;
-			point_sampler[i]                       = i;
-			continue;
-		}
-		if (next.samplers.size() >= ShaderInfo::MaxSamplers) {
-			if (error != nullptr) {
-				*error = "point-filter sampler variants exceed the dense sampler resource limit";
+
+	for (uint32_t i = 0; i < original_sampler_count; i++) {
+		auto&      entries = sampler_variants[i];
+		const bool has_identity =
+		    std::any_of(entries.begin(), entries.end(),
+		                [](const auto& entry) { return entry.first == SamplerVariant {}; });
+		bool reused = false;
+		for (auto& [variant, index]: entries) {
+			if (variant == SamplerVariant {}) {
+				index = i;
+				continue;
 			}
-			return false;
+			// The original slot is free to repurpose when nothing uses this sampler plainly.
+			if (!has_identity && !reused) {
+				next.samplers[i].emulated_compare_op   = variant.compare_op;
+				next.samplers[i].force_point_filtering = variant.point_filtering;
+				index                                  = i;
+				reused                                 = true;
+				continue;
+			}
+			if (next.samplers.size() >= ShaderInfo::MaxSamplers) {
+				if (error != nullptr) {
+					*error = "sampler variants exceed the dense sampler resource limit";
+				}
+				return false;
+			}
+			index                         = static_cast<uint32_t>(next.samplers.size());
+			auto sampler                  = next.samplers[i];
+			sampler.emulated_compare_op   = variant.compare_op;
+			sampler.force_point_filtering = variant.point_filtering;
+			next.samplers.push_back(sampler);
+			next_snapshot.samplers.push_back(next_snapshot.samplers[i]);
 		}
-		point_sampler[i]              = static_cast<uint32_t>(next.samplers.size());
-		auto sampler                  = next.samplers[i];
-		sampler.force_point_filtering = true;
-		next.samplers.push_back(sampler);
-		next_snapshot.samplers.push_back(next_snapshot.samplers[i]);
 	}
-	for (auto& pair: next.sampled_pairs) {
-		if (next.images[pair.image].conversion_format != Prospero::BufferFormat::kInvalid) {
-			pair.sampler = point_sampler[pair.sampler];
+
+	auto resolve_sampler = [&](const ImageResource& image, uint32_t sampler_index) {
+		const auto  variant = pair_variant(image, sampler_index);
+		const auto& entries = sampler_variants[sampler_index];
+		for (const auto& [candidate, index]: entries) {
+			if (candidate == variant) {
+				return index;
+			}
 		}
+		return sampler_index;
+	};
+
+	for (auto& pair: next.sampled_pairs) {
+		pair.sampler = resolve_sampler(next.images[pair.image], pair.sampler);
 	}
 	for (const auto* block: program.values->blocks) {
 		for (const auto& inst: *block) {
@@ -1003,10 +1103,9 @@ bool SpecializeResources(Program& program, ResourceSnapshot& snapshot, std::stri
 				return false;
 			}
 			const auto& image = next.images[memory.resource];
-			if (image_opcode.needs_sampler &&
-			    image.conversion_format != Prospero::BufferFormat::kInvalid &&
-			    memory.sampler < point_sampler.size()) {
-				memory.sampler = point_sampler[memory.sampler];
+			// Guarded by the original count so an already-rewired index is left alone.
+			if (image_opcode.needs_sampler && memory.sampler < original_sampler_count) {
+				memory.sampler = resolve_sampler(image, memory.sampler);
 			}
 			if (image.indirect_root == memory.resource &&
 			    inst.GetOpcode() != ValueOpcode::ImageSampleRaw) {

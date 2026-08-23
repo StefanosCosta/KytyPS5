@@ -1035,12 +1035,25 @@ static void ShaderAppendNativeSpecialization(std::vector<uint32_t>&             
 		ids.push_back(static_cast<uint32_t>(image.mip_mode));
 		ids.push_back(image.mip_count);
 		ids.push_back(static_cast<uint32_t>(image.conversion_format));
+		// depth_compare is static (it comes from the opcode) and adds no entropy, but including it
+		// keeps the key self-describing. emulated_depth_compare is descriptor-derived and MUST be
+		// here, or a permutation compiled for one lowering could be reused for the other.
+		ids.push_back(static_cast<uint32_t>(image.depth_compare));
+		ids.push_back(static_cast<uint32_t>(image.emulated_depth_compare));
 		ids.push_back(image.shader_swizzle);
 		ids.push_back(image.indirect_root);
 		ids.push_back(image.indirect_mapping_offset);
 		ids.push_back(image.indirect_mapping_capacity);
 		ids.push_back(static_cast<uint32_t>(image.indirect_resources.size()));
 		ids.insert(ids.end(), image.indirect_resources.begin(), image.indirect_resources.end());
+	}
+	// Sampler variants are no longer implied by the image plan alone: the baked compare function
+	// comes from the sampler descriptor, so it has to be keyed explicitly. Every entry is the
+	// sentinel for shaders that never emulate, so the common case adds no entropy.
+	ids.push_back(static_cast<uint32_t>(program.info.samplers.size()));
+	for (const auto& sampler: program.info.samplers) {
+		ids.push_back(sampler.emulated_compare_op);
+		ids.push_back(static_cast<uint32_t>(sampler.force_point_filtering));
 	}
 	ids.push_back(static_cast<uint32_t>(program.info.addresses.size()));
 	for (const auto& address: program.info.addresses) {

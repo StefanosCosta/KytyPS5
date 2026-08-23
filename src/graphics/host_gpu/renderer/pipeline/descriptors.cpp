@@ -863,6 +863,19 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	} else if (storage) {
 		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
 	} else {
+		// The shader decided at compile time, from the descriptor alone, whether this comparison
+		// sample could reach a depth-capable image. If it chose the hardware path and the cache
+		// nevertheless produced a colour image, the draw would sample a colour view with
+		// compareEnable -- undefined behaviour that hangs the GPU (VUID-vkCmdDraw-None-06479).
+		// Fail loudly instead: silently binding it is what produced the Subnautica stall.
+		if (resource.depth_compare && !resource.emulated_depth_compare) {
+			EXIT("comparison-sampled depth texture resolved to a colour image: guest_format=%u "
+			     "tile=%u image_format=%d view_format=%d addr=0x%016" PRIx64 "\n",
+			     static_cast<uint32_t>(descriptor.Format()),
+			     static_cast<uint32_t>(descriptor.TileMode()),
+			     static_cast<int>(image->info.pixel_format), static_cast<int>(view_format),
+			     address);
+		}
 		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
 		                             descriptor.DstSelXYZW());
 	}
@@ -874,12 +887,18 @@ static vk::Sampler NativeSampler(RenderContext&                       context,
                                  const ShaderRecompiler::IR::DescriptorValue& value) {
 	ShaderSamplerResource descriptor;
 	CopyNativeDescriptor(value, descriptor.fields);
-	const bool depth_compare = std::any_of(program.info.sampled_pairs.begin(),
-	                                       program.info.sampled_pairs.end(), [&](const auto& pair) {
-		                                       return pair.sampler == index &&
-		                                              pair.image < program.info.images.size() &&
-		                                              program.info.images[pair.image].depth_compare;
-	                                       });
+	// Emulated pairs must not keep compareEnable: the shader does the comparison itself, and asking
+	// Vulkan to depth-compare a colour image is the undefined behaviour that hangs the GPU
+	// (VUID-vkCmdDraw-None-06479). SpecializeResources gives them their own sampler variant, so the
+	// hardware-Dref pairs that share the guest sampler are unaffected.
+	const bool depth_compare =
+	    std::any_of(program.info.sampled_pairs.begin(), program.info.sampled_pairs.end(),
+	                [&](const auto& pair) {
+		                return pair.sampler == index &&
+		                       pair.image < program.info.images.size() &&
+		                       program.info.images[pair.image].depth_compare &&
+		                       !program.info.images[pair.image].emulated_depth_compare;
+	                });
 	if (!depth_compare) {
 		descriptor.fields[0] &= ~(0x7u << 12u);
 	}

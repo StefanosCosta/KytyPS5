@@ -229,6 +229,11 @@ struct ImageResource {
 	bool                    written                   = false;
 	bool                    atomic                    = false;
 	bool                    depth_compare             = false;
+	// Set when depth_compare targets a descriptor that cannot resolve to a depth-capable image
+	// (Prospero::SupportsDepthCompareSampling is false). Vulkan forbids Dref sampling there and the
+	// GPU hangs if we try, so the comparison is lowered into the shader instead. Derived from the
+	// guest descriptor, so it must be revalidated per draw and carried in the pipeline key.
+	bool                    emulated_depth_compare    = false;
 	bool                    cube                      = false;
 	bool                    r128                      = false;
 	uint32_t                indirect_root             = NoIndirectImage;
@@ -239,9 +244,18 @@ struct ImageResource {
 	bool operator==(const ImageResource& other) const = default;
 };
 
+// Sentinel for SamplerResource::emulated_compare_op: this sampler serves no emulated compare-sample,
+// so it contributes nothing to the pipeline key. Chosen so the common case adds no key entropy.
+constexpr uint8_t ShaderNoDepthCompareOp = 0xffu;
+
 struct SamplerResource {
-	uint32_t source                = 0;
-	uint32_t first_use_pc          = 0;
+	uint32_t source       = 0;
+	uint32_t first_use_pc = 0;
+	// The guest DEPTH_COMPARE_FUNC (S# bits 14:12, ISA doc 70648 p. 76), values 0..7 in vk::CompareOp
+	// order. It normally reaches Vulkan only through the sampler object, so an emulated comparison
+	// has no way to see it -- it has to be baked into the compiled shader. Deliberately a raw
+	// uint8_t: the IR must not depend on Vulkan types.
+	uint8_t  emulated_compare_op   = ShaderNoDepthCompareOp;
 	bool     force_point_filtering = false;
 
 	bool operator==(const SamplerResource& other) const = default;

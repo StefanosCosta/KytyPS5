@@ -125,6 +125,41 @@ uint32_t ZeroF32(EmitterState& state) {
 	return ConstantF32(state, 0);
 }
 
+// Guest DEPTH_COMPARE_FUNC (S# bits 14:12, ISA doc 70648 p. 76) -> SPIR-V float comparison.
+// 0 (Never) and 7 (Always) are constant-folded by the caller and never reach here.
+uint32_t DepthCompareOpcode(uint8_t func) {
+	switch (func) {
+		case 1: return OpFOrdLessThan;
+		case 2: return OpFOrdEqual;
+		case 3: return OpFOrdLessThanEqual;
+		case 4: return OpFOrdGreaterThan;
+		// Ordered, so a NaN texel compares false. The ISA does not settle NaN behaviour; ordered
+		// matches the hardware sampler on well-formed depth data.
+		case 5: return OpFOrdNotEqual;
+		case 6: return OpFOrdGreaterThanEqual;
+		default: return 0;
+	}
+}
+
+// The comparison Vulkan would have done inside the sampler: (reference op texel) -> 1.0 / 0.0.
+// Used where the bound descriptor cannot resolve to a depth-capable image, which makes hardware
+// Dref sampling undefined behaviour (and hangs the GPU).
+uint32_t EmulateDepthCompare(EmitterState& state, uint8_t func, uint32_t reference,
+                             uint32_t texel) {
+	if (func == 0u) {
+		return ConstantF32Value(state, 0.0f);
+	}
+	if (func == 7u) {
+		return ConstantF32Value(state, 1.0f);
+	}
+	const auto condition =
+	    Binary(state, DepthCompareOpcode(func), TypeBool(state), reference, texel);
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction({OpSelect, TypeF32(state), result, condition,
+	                           ConstantF32Value(state, 1.0f), ConstantF32Value(state, 0.0f)});
+	return result;
+}
+
 uint32_t CubeAxis(EmitterState& state, uint32_t value) {
 	return Binary(state, OpFSub, TypeF32(state), value, ConstantF32(state, 0x3f800000u));
 }
@@ -604,19 +639,33 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto view    = SampledImageViewKind(state, mem, pc);
 		const auto layout  = Layout(mem, view);
 		const bool integer = mem.kind == IR::ResourceKind::ImageUint;
-		const bool dref    = HasFlag(mem, Decoder::ImageSampleFlagCompare);
-		if (dref && state.program.info.images[mem.resource].conversion_format !=
-		                Prospero::BufferFormat::kInvalid) {
+		const bool  dref      = HasFlag(mem, Decoder::ImageSampleFlagCompare);
+		const auto& image_res = state.program.info.images[mem.resource];
+		if (dref && image_res.conversion_format != Prospero::BufferFormat::kInvalid) {
 			ctx.Fail(inst, "uses depth comparison with a packed integer image");
 			return true;
 		}
+		// Vulkan Dref sampling is legal only on depth-capable formats. Where the descriptor is not
+		// one, do the comparison in the shader instead -- passing it to the hardware is undefined
+		// behaviour and hangs the GPU.
+		const bool emulate_compare = dref && image_res.emulated_depth_compare;
+		if (emulate_compare &&
+		    (integer || mem.sampler >= state.program.info.samplers.size() ||
+		     state.program.info.samplers[mem.sampler].emulated_compare_op ==
+		         IR::ShaderNoDepthCompareOp)) {
+			ctx.Fail(inst, "emulates depth comparison without a specialized compare function");
+			return true;
+		}
+		const uint8_t compare_op =
+		    emulate_compare ? state.program.info.samplers[mem.sampler].emulated_compare_op : 0u;
+		const bool hardware_dref = dref && !emulate_compare;
 		const auto coord =
 		    CoordF32(ctx, mem, *address, layout.coord, ImageViewCoordinateComponents(view));
 		if (op == IR::ValueOpcode::ImageGatherRaw) {
 			const auto            sampled = MakeSampledImage(state, mem, pc, view);
 			const auto            sample  = state.builder.AllocateId();
 			std::vector<uint32_t> words =
-			    dref ? std::vector<uint32_t> {OpImageDrefGather,
+			    hardware_dref ? std::vector<uint32_t> {OpImageDrefGather,
 			                                  TypeF32Vector(state, 4),
 			                                  sample,
 			                                  sampled,
@@ -624,16 +673,21 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			                                  layout.dref != NoImageComponent
 			                                      ? AddressF32(ctx, mem, *address, layout.dref)
 			                                      : ZeroF32(state)}
-			         : std::vector<uint32_t> {
-			               OpImageGather,
-			               integer ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4),
-			               sample,
-			               sampled,
-			               coord,
-			               ConstantU32(state, ImageConversionFormat(state, mem).format ==
-			                                          Prospero::BufferFormat::kInvalid
-			                                      ? ImageGatherComponent(mem.dmask)
-			                                      : 0u)};
+			                  : std::vector<uint32_t> {
+			                        OpImageGather,
+			                        (integer && !emulate_compare) ? TypeU32Vector(state, 4)
+			                                                      : TypeF32Vector(state, 4),
+			                        sample,
+			                        sampled,
+			                        coord,
+			                        // OpImageDrefGather always compares the first component and
+			                        // ignores dmask, so the emulation must gather component 0 too.
+			                        ConstantU32(state,
+			                                    (emulate_compare ||
+			                                     ImageConversionFormat(state, mem).format !=
+			                                         Prospero::BufferFormat::kInvalid)
+			                                        ? 0u
+			                                        : ImageGatherComponent(mem.dmask))};
 			if (HasFlag(mem, Decoder::ImageSampleFlagGatherHorizontal)) {
 				words.push_back(ImageOperandsConstOffsetsMask);
 				words.push_back(HorizontalOffsets(state, view));
@@ -642,19 +696,40 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				words.push_back(PackedOffset(ctx, mem, *address, layout, view));
 			}
 			state.builder.AddFunction(words);
-			ctx.Define(inst, ResultVector(ctx, UnpackImageGather(ctx, mem, sample),
-			                              integer && !dref, false, mem, true));
+			auto gathered = UnpackImageGather(ctx, mem, sample);
+			if (emulate_compare) {
+				// Four independent comparisons, matching OpImageDrefGather's four results.
+				const auto reference = layout.dref != NoImageComponent
+				                           ? AddressF32(ctx, mem, *address, layout.dref)
+				                           : ZeroF32(state);
+				std::vector<uint32_t> compared {OpCompositeConstruct, TypeF32Vector(state, 4),
+				                                state.builder.AllocateId()};
+				for (uint32_t lane = 0; lane < 4u; lane++) {
+					const auto texel = state.builder.AllocateId();
+					state.builder.AddFunction(
+					    {OpCompositeExtract, TypeF32(state), texel, gathered, lane});
+					compared.push_back(EmulateDepthCompare(state, compare_op, reference, texel));
+				}
+				gathered = compared[2];
+				state.builder.AddFunction(compared);
+			}
+			ctx.Define(inst,
+			           ResultVector(ctx, gathered, integer && !dref, false, mem, true));
 			return true;
 		}
 		const bool explicit_lod = HasFlag(mem, Decoder::ImageSampleFlagDerivative) ||
 		                          HasFlag(mem, Decoder::ImageSampleFlagLod) ||
 		                          HasFlag(mem, Decoder::ImageSampleFlagLevelZero) ||
 		                          state.stage != ShaderType::Pixel;
-		const auto opcode = explicit_lod
-		                        ? (dref ? OpImageSampleDrefExplicitLod : OpImageSampleExplicitLod)
-		                        : (dref ? OpImageSampleDrefImplicitLod : OpImageSampleImplicitLod);
-		const auto result_type =
-		    dref ? TypeF32(state) : (integer ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4));
+		const auto opcode =
+		    explicit_lod
+		        ? (hardware_dref ? OpImageSampleDrefExplicitLod : OpImageSampleExplicitLod)
+		        : (hardware_dref ? OpImageSampleDrefImplicitLod : OpImageSampleImplicitLod);
+		// Under emulation this is a plain vec4 sample; the Grad/Lod/Bias operands below are
+		// untouched, so it stays mip-correct.
+		const auto result_type = hardware_dref
+		                             ? TypeF32(state)
+		                             : (integer ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4));
 		const auto dref_value =
 		    dref ? (layout.dref != NoImageComponent ? AddressF32(ctx, mem, *address, layout.dref)
 		                                            : ZeroF32(state))
@@ -681,7 +756,7 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			const auto            sampled = MakeSampledImage(state, mem, pc, view, resource);
 			const auto            sample  = state.builder.AllocateId();
 			std::vector<uint32_t> words {opcode, result_type, sample, sampled, coord};
-			if (dref) {
+			if (hardware_dref) {
 				words.push_back(dref_value);
 			}
 			if (operand_mask != 0u) {
@@ -691,11 +766,27 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			state.builder.AddFunction(words);
 			return sample;
 		};
-		const auto& image = state.program.info.images[mem.resource];
-		if (image.indirect_root != mem.resource) {
-			const auto sample = EmitSample(mem.resource);
+		// Shared by the direct and indirect tails so the two lowerings cannot drift apart.
+		const auto DefineSampleResult = [&](uint32_t sample) {
+			if (emulate_compare) {
+				// Component 0 is the post-swizzle red channel -- the same lane the hardware
+				// comparison reads.
+				const auto texel = state.builder.AllocateId();
+				state.builder.AddFunction(
+				    {OpCompositeExtract, TypeF32(state), texel, sample, 0u});
+				const auto compared =
+				    EmulateDepthCompare(state, compare_op, dref_value, texel);
+				// dref=true puts the scalar in lane 0, which the frontend broadcasts to every
+				// destination VGPR -- exactly what the hardware Dref path produces.
+				ctx.Define(inst, ResultVector(ctx, compared, false, true, mem));
+				return;
+			}
 			ctx.Define(inst, ResultVector(ctx, dref ? sample : UnpackImageTexel(ctx, mem, sample),
 			                              integer, dref, mem));
+		};
+		const auto& image = state.program.info.images[mem.resource];
+		if (image.indirect_root != mem.resource) {
+			DefineSampleResult(EmitSample(mem.resource));
 			return true;
 		}
 		const auto* handle = image_arg.ResolveInstruction();
@@ -786,9 +877,8 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		}
 		EmitLabel(state, merge_label);
 		state.builder.AddFunction(phi_words);
-		ctx.Define(inst,
-		           ResultVector(ctx, dref ? phi_words[2] : UnpackImageTexel(ctx, mem, phi_words[2]),
-		                        integer, dref, mem));
+		// Compare once after the merge: the phi stays typed result_type on every incoming edge.
+		DefineSampleResult(phi_words[2]);
 		return true;
 	}
 	const auto atomic_opcode = ImageAtomicOpcode(op);

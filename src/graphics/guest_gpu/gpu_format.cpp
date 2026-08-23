@@ -220,4 +220,12 @@ BufferFormat RemapTextureFormat(BufferFormat format) {
 	return format == BufferFormat::k11_11_10UInt ? BufferFormat::k32UInt : format;
 }
 
+bool SupportsDepthCompareSampling(BufferFormat format, TileMode tile) {
+	// A depth surface sampled as a texture is always depth-tiled, and only these two guest formats
+	// have a depth policy on the host side (Z16 -> D16Unorm, Z32F -> D32Sfloat). Anything else --
+	// Subnautica's k8_8_8_8Srgb at kStandard4KB, for instance -- cannot alias a depth image.
+	return tile == TileMode::kDepth &&
+	       (format == BufferFormat::k16UNorm || format == BufferFormat::k32Float);
+}
+
 } // namespace Libs::Graphics::Prospero
