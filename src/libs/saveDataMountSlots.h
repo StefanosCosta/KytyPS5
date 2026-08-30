@@ -45,6 +45,15 @@ public:
 		return FULL;
 	}
 
+	// The directory name a slot is mounted from, so callers can reach the save's own files
+	// (its sce_sys metadata) rather than only its mount point.
+	[[nodiscard]] std::optional<std::string> Directory(size_t slot) const {
+		if (slot >= m_directories.size()) {
+			return std::nullopt;
+		}
+		return m_directories[slot];
+	}
+
 	[[nodiscard]] static std::string MountPoint(size_t slot) {
 		return "/savedata" + std::to_string(slot);
 	}

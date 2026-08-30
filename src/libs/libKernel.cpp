@@ -983,6 +983,22 @@ static void HostSignalDispatchHandler(int /*host_signal*/, siginfo_t* /*info*/,
 	}
 
 	auto* host_ctx = static_cast<ucontext_t*>(native_context);
+	auto  ctx      = CreateSignalUcontextFromHost(host_ctx);
+
+	// Only run a guest handler when the interrupted frame is guest code.
+	//
+	// A guest exception handler may block for an unbounded time -- IL2CPP's collector parks every
+	// managed thread in one until the collection completes. If this thread was interrupted inside
+	// a host wait, running the handler here means that wait never unwinds: it keeps the condition
+	// variable reference it is holding, and the next broadcast on that variable blocks forever
+	// waiting for the reference to drain. That is a deadlock the whole guest piles up behind.
+	//
+	// Leaving the signal queued costs nothing: the sender does not depend on synchronous delivery
+	// (WaitForSignalDispatch gives up after 2ms regardless), and it already nudges this thread out
+	// of its wait, where the safe-point dispatchers deliver the signal with no host frame pinned.
+	if (!IsGuestCodeAddress(ctx.uc_mcontext.mc_rip)) {
+		return;
+	}
 
 	for (int signum = 0; signum < static_cast<int>(std::size(g_exception_handlers)); signum++) {
 		if (!TakePendingSignal(current, signum)) {
@@ -992,15 +1008,8 @@ static void HostSignalDispatchHandler(int /*host_signal*/, siginfo_t* /*info*/,
 		auto* handler = reinterpret_cast<exception_handler_func_t>(g_exception_handlers[signum]);
 		if (handler != nullptr) {
 			SignalDispatchScope scope;
-			auto                ctx = CreateSignalUcontextFromHost(host_ctx);
-			if (IsGuestCodeAddress(ctx.uc_mcontext.mc_rip)) {
-				handler(signum, &ctx);
-				ApplySignalUcontextToHost(host_ctx, ctx);
-			} else {
-				// Do not expose or restore a host frame.
-				SanitizeNonGuestSignalUcontext(&ctx, current);
-				handler(signum, &ctx);
-			}
+			handler(signum, &ctx);
+			ApplySignalUcontextToHost(host_ctx, ctx);
 		}
 		return;
 	}

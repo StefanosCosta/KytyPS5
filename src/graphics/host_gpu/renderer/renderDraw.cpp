@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
 
 #include "common/assert.h"
@@ -1130,9 +1131,11 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 		case Prospero::PrimitiveType::kTriStrip:
 		case Prospero::PrimitiveType::kRectList:
 			if (emit.indexed) {
+				Libs::Graphics::WorkLog::NoteDraw();
 				vk_buffer.drawIndexed(draw.index_count, draw.instance_count, 0, emit.vertex_offset,
 				                      draw.first_instance);
 			} else {
+				Libs::Graphics::WorkLog::NoteDraw();
 				vk_buffer.draw(draw.index_count, draw.instance_count, emit.first_vertex,
 				               draw.first_instance);
 			}
@@ -1143,15 +1146,18 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 			}
 			// Sarah
 			EXIT_NOT_IMPLEMENTED(!(draw.index_count == 3 && vs_input_info.buffers_num == 0));
+			Libs::Graphics::WorkLog::NoteDraw();
 			vk_buffer.draw(4, draw.instance_count, emit.first_vertex, draw.first_instance);
 			break;
 		case Prospero::PrimitiveType::kQuadListLegacy:
 			EXIT_NOT_IMPLEMENTED((draw.index_count & 0x3u) != 0);
 			for (uint32_t i = 0; i < draw.index_count; i += 4) {
 				if (emit.indexed) {
+					Libs::Graphics::WorkLog::NoteDraw();
 					vk_buffer.drawIndexed(4, draw.instance_count, i, emit.vertex_offset,
 					                      draw.first_instance);
 				} else {
+					Libs::Graphics::WorkLog::NoteDraw();
 					vk_buffer.draw(4, draw.instance_count, i + emit.first_vertex,
 					               draw.first_instance);
 				}
@@ -1223,6 +1229,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, RenderCommandBuffer
 	if (set_auto_debug) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
+	WorkLog::NoteDrawDetail(m_context.GetCommandScheduler().CurrentTick(),
+	                        reinterpret_cast<uint64_t>(static_cast<VkPipeline>(pipeline.pipeline)),
+	                        state.vs_shader.data(),
+	                        static_cast<uint32_t>(state.vs_shader.size()), state.ps_shader.data(),
+	                        static_cast<uint32_t>(state.ps_shader.size()), draw.index_count,
+	                        draw.instance_count);
 	EmitDrawPrimitives(ucfg, vk_buffer, state.vs_input_info, draw, emit);
 
 	if (set_auto_debug) {

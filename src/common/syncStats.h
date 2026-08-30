@@ -36,6 +36,7 @@ enum class Site : uint32_t
 	PresentAcquireImage,  // vkAcquireNextImageKHR
 	PresentRenderMutex,   // present thread holding the renderer mutex
 	SubmissionMutex,      // GpuMutexLock, level 2
+	PriorityOpWait,       // priority-operations thread blocked in MasterSemaphore::Wait
 	Count
 };
 
@@ -52,10 +53,36 @@ enum class Event : uint32_t
 	Count
 };
 
+// Summed magnitudes -- "how much", where Event answers "how many times". Reported as a
+// per-second rate over the interval, like the Event lines.
+enum class Counter : uint32_t
+{
+	TilerDetilePasses = 0,      // TileManager::Detile
+	TilerTilePasses,            // TileManager::TileImage
+	TilerConvertD16Passes,      // TileManager::ConvertD16
+	TilerSwapBgraPasses,        // TileManager::SwapBgra16
+	TilerDispatches,            // individual vkCmdDispatch issued by the tiler
+	TilerInvocations,           // width * height * depth, summed over those dispatches
+	TilerAtomicInvocations,     // ... of which take the sub-dword path: 2 device atomics each
+	TilerScratchBytes,          // AllocateScratch, i.e. fresh vmaCreateBuffer per pass
+	TilerClearBytes,            // fillBuffer(target, .., 0) preceding a pass
+	ImageUploadBytes,           // guest surface bytes re-uploaded by TextureCache::UploadImage
+	ImageUploadCpuDirty,        // ... because the whole surface was marked m_cpu_dirty
+	ImageUploadMaybeCpuDirty,   // ... because of a page-range overlap (m_maybe_cpu_dirty)
+	ImageUploadBufferModified,  // ... because the buffer cache reported a GPU write
+	Count
+};
+
 // Sampled maxima.
 enum class Gauge : uint32_t
 {
 	BufferCacheEntries = 0,
+	TilerMaxInvocations,        // largest single tiler dispatch seen in the interval
+	// Timeline state, sampled from the vblank pacer so it keeps updating after every
+	// other thread has gone quiet. Ticks are monotonic, so a max-gauge is the latest value.
+	GpuTickKnown,               // MasterSemaphore::KnownGpuTick after a fresh Refresh
+	GpuTickCurrent,             // MasterSemaphore::CurrentTick, i.e. ticks handed out
+	PriorityWaitTick,           // tick the priority thread is currently blocked on, +1
 	Count
 };
 
@@ -72,6 +99,7 @@ extern const uint32_t g_level;
 void Start();
 
 void CountEvent(Event event) noexcept;
+void AddCounter(Counter counter, uint64_t amount) noexcept;
 void Record(Site site, uint64_t ticks) noexcept;
 void SetGauge(Gauge gauge, uint64_t value) noexcept;
 

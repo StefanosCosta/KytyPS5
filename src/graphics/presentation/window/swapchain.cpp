@@ -401,6 +401,7 @@ struct Presenter::Impl {
 	CommandScheduler      present_scheduler;
 	FramePool             frames;
 	std::atomic<uint64_t> presented_ime_revision {0};
+	std::atomic<CommandBuffer*> last_present_command {nullptr};
 };
 
 // TEMPORARY DIAGNOSTIC (KYTY_PRESENT_MODE) - default is unchanged.
@@ -902,6 +903,7 @@ void Presenter::Present(Frame& frame, bool reuse) {
 			const bool draw_ime_overlay = ime_visual.active && swapchain.PrepareImeOverlay();
 			swapchain.RecordPresentCommands(command, frame.image, draw_ime_overlay);
 			swapchain.Submit(command);
+			m_impl->last_present_command.store(&command, std::memory_order_release);
 		}
 		status = swapchain.Present();
 		if (status != Swapchain::Status::Success) {
@@ -917,6 +919,11 @@ void Presenter::Present(Frame& frame, bool reuse) {
 	}
 	LOGF("Vulkan presentation retry exhausted; dropping frame\n");
 	m_impl->frames.Release(&frame, reuse);
+}
+
+bool Presenter::PresentSubmissionOutstanding() const noexcept {
+	auto* command = m_impl->last_present_command.load(std::memory_order_acquire);
+	return command != nullptr && command->IsSubmissionOutstanding();
 }
 
 void Presenter::Discard(Frame& frame) {

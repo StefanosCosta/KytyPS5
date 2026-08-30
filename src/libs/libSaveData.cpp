@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <ctime>
 #include <deque>
 #include <vector>
 
@@ -247,6 +248,95 @@ static std::string get_title_id() {
 	return title_id;
 }
 
+// Save parameters live beside the save's payload, in the sce_sys directory the real console uses.
+//
+// Two on-disk layouts exist. Current builds write the raw SaveDataParam; older ones wrapped the same
+// struct in a 16-byte "KYPS" header. Both are read so that saves written by either build keep their
+// titles -- a slot whose parameters cannot be read comes back blank, and a blank title with a zero
+// timestamp is what a game's load menu renders as a damaged save.
+static constexpr char     SAVE_PARAM_FILE[]        = "param.bin";
+static constexpr char     SAVE_PARAM_LEGACY_FILE[] = "kyty_param.bin";
+static constexpr char     SAVE_PARAM_SYS_DIR[]     = "sce_sys";
+static constexpr char     SAVE_PARAM_LEGACY_MAGIC[] = {'K', 'Y', 'P', 'S'};
+static constexpr uint32_t SAVE_PARAM_LEGACY_HEADER  = 16;
+
+static std::string save_data_dir(std::string_view dir_name) {
+	return std::string(SAVE_DATA_DIR) + "/" + get_title_id() + "/" + std::string(dir_name);
+}
+
+static std::string save_param_path(std::string_view dir_name, const char* file) {
+	return save_data_dir(dir_name) + "/" + SAVE_PARAM_SYS_DIR + "/" + file;
+}
+
+static bool read_save_param_file(const std::string& path, bool legacy, SaveDataParam* out) {
+	Common::File file;
+	if (!file.Open(path, Common::File::Mode::Read)) {
+		return false;
+	}
+	const auto expected =
+	    sizeof(SaveDataParam) + (legacy ? static_cast<size_t>(SAVE_PARAM_LEGACY_HEADER) : 0u);
+	if (file.Size() < expected) {
+		file.Close();
+		return false;
+	}
+	if (legacy) {
+		char header[SAVE_PARAM_LEGACY_HEADER] = {};
+		file.Read(header, sizeof(header));
+		if (std::memcmp(header, SAVE_PARAM_LEGACY_MAGIC, sizeof(SAVE_PARAM_LEGACY_MAGIC)) != 0) {
+			file.Close();
+			return false;
+		}
+	}
+	file.Read(out, sizeof(SaveDataParam));
+	file.Close();
+	return true;
+}
+
+// Reads a save's parameters, preferring the current layout. Returns false when the save has none,
+// which is not an error: a save written before parameters were persisted simply has no title.
+static bool read_save_param(std::string_view dir_name, SaveDataParam* out) {
+	if (dir_name.empty() || out == nullptr) {
+		return false;
+	}
+	*out = {};
+	if (read_save_param_file(save_param_path(dir_name, SAVE_PARAM_FILE), false, out)) {
+		return true;
+	}
+	return read_save_param_file(save_param_path(dir_name, SAVE_PARAM_LEGACY_FILE), true, out);
+}
+
+static bool write_save_param(std::string_view dir_name, const SaveDataParam& param) {
+	if (dir_name.empty()) {
+		return false;
+	}
+	const auto sys_dir = save_data_dir(dir_name) + "/" + SAVE_PARAM_SYS_DIR;
+	if (!Common::File::IsDirectoryExisting(sys_dir)) {
+		Common::File::CreateDirectories(sys_dir);
+	}
+	Common::File file;
+	// Always the current layout; the legacy header is read for compatibility, never written.
+	if (!file.Open(save_param_path(dir_name, SAVE_PARAM_FILE), Common::File::Mode::Write)) {
+		return false;
+	}
+	file.Write(&param, sizeof(param));
+	file.Close();
+	return true;
+}
+
+// The directory a mount point currently refers to, or empty when it is not mounted.
+static std::string mounted_dir_name(const SaveDataMountPoint* mount_point) {
+	if (mount_point == nullptr) {
+		return {};
+	}
+	Common::LockGuard lock(g_mount_mutex);
+	const auto        slot = g_mount_slots.Find(mount_point->data);
+	if (slot < 0) {
+		return {};
+	}
+	const auto directory = g_mount_slots.Directory(static_cast<size_t>(slot));
+	return directory.has_value() ? *directory : std::string {};
+}
+
 static void queue_save_data_event(uint32_t type, int32_t user_id,
                                   const SceSaveDataTitleId* title_id,
                                   const SceSaveDataDirName* dir_name, int32_t error_code = OK) {
@@ -386,29 +476,48 @@ int KYTY_SYSV_ABI SaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
 		}
 	}
 
-	std::sort(dir_list.begin(), dir_list.end(), [](const std::string& a, const std::string& b) {
-		return std::strcmp(a.c_str(), b.c_str()) < 0;
+	// Read each save's stored parameters before sorting: the caller can order by them, and a
+	// blank title with a zero timestamp is exactly what a load menu paints as a damaged save.
+	std::vector<SaveDataParam> param_list(dir_list.size());
+	for (size_t i = 0; i < dir_list.size(); i++) {
+		read_save_param(dir_list[i], &param_list[i]);
+	}
+
+	// Names and parameters are parallel arrays and must be reordered together.
+	std::vector<size_t> order(dir_list.size());
+	for (size_t i = 0; i < order.size(); i++) {
+		order[i] = i;
+	}
+	std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+		switch (cond->key) {
+			case SaveDataSortKey::UserParam:
+				return param_list[a].user_param < param_list[b].user_param;
+			case SaveDataSortKey::Mtime: return param_list[a].mtime < param_list[b].mtime;
+			// Every save reports the same canned block count, so ordering by it would be
+			// arbitrary; fall back to the name, which is at least stable.
+			case SaveDataSortKey::Blocks:
+			case SaveDataSortKey::FreeBlocks:
+			case SaveDataSortKey::DirName:
+			default: return std::strcmp(dir_list[a].c_str(), dir_list[b].c_str()) < 0;
+		}
 	});
 
 	if (cond->order == SaveDataSortOrder::Descent) {
-		std::vector<std::string> reversed;
-		for (size_t i = dir_list.size(); i > 0; i--) {
-			reversed.push_back(dir_list[i - 1]);
-		}
-		dir_list = reversed;
+		std::reverse(order.begin(), order.end());
 	}
 
 	auto max_count =
-	    (result->dir_names_num < dir_list.size() ? result->dir_names_num : dir_list.size());
+	    (result->dir_names_num < order.size() ? result->dir_names_num : order.size());
 
-	result->hit_num = static_cast<uint32_t>(dir_list.size());
+	result->hit_num = static_cast<uint32_t>(order.size());
 	result->set_num = static_cast<uint32_t>(max_count);
 
 	for (size_t i = 0; i < max_count; i++) {
+		const auto index = order[i];
 		std::snprintf(result->dir_names[i].data, sizeof(result->dir_names[i].data), "%s",
-		              dir_list[i].c_str());
+		              dir_list[index].c_str());
 		if (result->params != nullptr) {
-			result->params[i] = {};
+			result->params[i] = param_list[index];
 		}
 		if (result->infos != nullptr) {
 			result->infos[i]             = {};
@@ -710,17 +819,26 @@ int KYTY_SYSV_ABI SaveDataGetParam(const SaveDataMountPoint* mount_point, uint32
 	     "\t param_buf_size = %" PRIu64 "\n",
 	     mount_point->data, param_type, param_buf_size);
 
+	SaveDataParam param    = {};
+	const auto    dir_name = mounted_dir_name(mount_point);
+	const bool    have     = !dir_name.empty() && read_save_param(dir_name, &param);
+
 	if (param_type == 0) {
 		if (param_buf_size < sizeof(SaveDataParam)) {
 			return SAVE_DATA_ERROR_PARAMETER;
 		}
-		std::memset(param_buf, 0, sizeof(SaveDataParam));
+		std::memcpy(param_buf, &param, sizeof(SaveDataParam));
 		if (got_size != nullptr) {
 			*got_size = sizeof(SaveDataParam);
 		}
 		return OK;
 	}
 
+	// Requests for a single field are still zero-filled. The numbering that selects which field a
+	// param_type asks for is not established anywhere in this codebase, and guessing it would
+	// return the wrong field -- worse than returning nothing. Titles do not go through here:
+	// the whole-struct form above is what a load menu uses.
+	(void)have;
 	std::memset(param_buf, 0, param_buf_size);
 	if (got_size != nullptr) {
 		*got_size = param_buf_size;
@@ -829,16 +947,34 @@ int KYTY_SYSV_ABI SaveDataSetParam(const SaveDataMountPoint* mount_point, uint32
 	     "\t param_buf_size = %" PRIu64 "\n",
 	     mount_point->data, param_type, param_buf_size);
 
-	if (param_type == 0) {
-		const auto* p = static_cast<const SaveDataParam*>(param_buf);
-
-		LOGF("\t title      = %s\n"
-		     "\t sub_title  = %s\n"
-		     "\t detail     = %s\n"
-		     "\t user_param = %u\n",
-		     p->title, p->sub_title, p->detail, p->user_param);
-	} else {
+	if (param_type != 0) {
 		LOGF("\t unsupported param_type, accepting as no-op\n");
+		return OK;
+	}
+
+	if (param_buf == nullptr || param_buf_size < sizeof(SaveDataParam)) {
+		return SAVE_DATA_ERROR_PARAMETER;
+	}
+
+	const auto* p = static_cast<const SaveDataParam*>(param_buf);
+	LOGF("\t title      = %s\n"
+	     "\t sub_title  = %s\n"
+	     "\t detail     = %s\n"
+	     "\t user_param = %u\n",
+	     p->title, p->sub_title, p->detail, p->user_param);
+
+	const auto dir_name = mounted_dir_name(mount_point);
+	if (dir_name.empty()) {
+		LOGF("\t mount point is not mounted, parameters not stored\n");
+		return OK;
+	}
+
+	// The guest leaves mtime for the system to fill in, and a zero timestamp is one of the two
+	// things that makes a save look damaged in a load menu.
+	auto stored  = *p;
+	stored.mtime = static_cast<int64_t>(std::time(nullptr));
+	if (!write_save_param(dir_name, stored)) {
+		LOGF("\t failed to store save parameters for %s\n", dir_name.c_str());
 	}
 
 	return OK;

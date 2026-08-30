@@ -20,7 +20,8 @@ constexpr uint32_t REPORT_INTERVAL = 5;
 
 constexpr auto SITE_COUNT  = static_cast<uint32_t>(Site::Count);
 constexpr auto EVENT_COUNT = static_cast<uint32_t>(Event::Count);
-constexpr auto GAUGE_COUNT = static_cast<uint32_t>(Gauge::Count);
+constexpr auto GAUGE_COUNT   = static_cast<uint32_t>(Gauge::Count);
+constexpr auto COUNTER_COUNT = static_cast<uint32_t>(Counter::Count);
 
 // One row per (thread slot, site). Threads never share a row, so there is no
 // contention and no false sharing; the reporter sums the column.
@@ -41,12 +42,23 @@ constexpr SiteInfo SITE_INFO[SITE_COUNT] = {
     {"FrameDoneTotal", 0},      {"FrameDoneQueueDrain", 1}, {"PredicationGpuWait", 0},
     {"GdsReadGpuWait", 0},      {"ReadbackGpuWait", 0},     {"CpBlockedPoll", 0},
     {"FramePoolAcquire", 0},    {"SubmitSlotWait", 0},      {"PresentAcquireImage", 0},
-    {"PresentRenderMutex", 0},  {"SubmissionMutex", 0},
+    {"PresentRenderMutex", 0},  {"SubmissionMutex", 0},    {"PriorityOpWait", 0},
 };
 
 Row                   g_rows[THREAD_SLOTS][SITE_COUNT];
 std::atomic<uint64_t> g_events[EVENT_COUNT];
 std::atomic<uint64_t> g_gauges[GAUGE_COUNT];
+std::atomic<uint64_t> g_counters[COUNTER_COUNT];
+
+// Order must match the Counter enum. Suffix convention: the reporter prints a per-second
+// rate, so the name is the quantity, not the rate.
+constexpr const char* COUNTER_NAME[COUNTER_COUNT] = {
+    "tiler_detile_passes", "tiler_tile_passes",      "tiler_convert_d16_passes",
+    "tiler_swap_bgra_passes", "tiler_dispatches",    "tiler_invocations",
+    "tiler_atomic_invocations",
+    "tiler_scratch_bytes", "tiler_clear_bytes",      "image_upload_bytes",
+    "image_upload_cpu_dirty", "image_upload_maybe_cpu_dirty", "image_upload_buffer_modified",
+};
 
 uint32_t ReadLevel() {
 	const char* value = std::getenv("KYTY_GPU_SYNC_STATS"); // NOLINT(concurrency-mt-unsafe)
@@ -60,6 +72,7 @@ uint32_t ReadLevel() {
 // Snapshot of everything the reporter needs to produce one interval.
 struct Snapshot {
 	uint64_t events[EVENT_COUNT] {};
+	uint64_t counters[COUNTER_COUNT] {};
 	uint64_t calls[SITE_COUNT] {};
 	uint64_t ticks[SITE_COUNT] {};
 };
@@ -101,6 +114,9 @@ void Report() {
 		}
 		for (uint32_t event = 0; event < EVENT_COUNT; event++) {
 			current.events[event] = g_events[event].load(std::memory_order_relaxed);
+		}
+		for (uint32_t counter = 0; counter < COUNTER_COUNT; counter++) {
+			current.counters[counter] = g_counters[counter].load(std::memory_order_relaxed);
 		}
 
 		const auto now     = Now();
@@ -165,6 +181,43 @@ void Report() {
 			             static_cast<unsigned long long>(
 			                 g_gauges[static_cast<uint32_t>(Gauge::BufferCacheEntries)].load(
 			                     std::memory_order_relaxed)));
+
+			auto gauge = [](Gauge g) {
+				return static_cast<unsigned long long>(
+				    g_gauges[static_cast<uint32_t>(g)].load(std::memory_order_relaxed));
+			};
+			const auto wait_tick = gauge(Gauge::PriorityWaitTick);
+			std::fprintf(stderr,
+			             "  timeline gpu_tick=%llu  issued=%llu  backlog=%lld  "
+			             "priority_waiting_on=%lld\n",
+			             gauge(Gauge::GpuTickKnown), gauge(Gauge::GpuTickCurrent),
+			             static_cast<long long>(gauge(Gauge::GpuTickCurrent)) -
+			                 static_cast<long long>(gauge(Gauge::GpuTickKnown)),
+			             wait_tick == 0 ? -1LL : static_cast<long long>(wait_tick) - 1);
+
+			// Reset so the reported maximum is per-interval, matching the site max_us column.
+			const auto tiler_max =
+			    g_gauges[static_cast<uint32_t>(Gauge::TilerMaxInvocations)].exchange(
+			        0, std::memory_order_relaxed);
+
+			bool any = false;
+			for (uint32_t counter = 0; counter < COUNTER_COUNT; counter++) {
+				const auto delta = current.counters[counter] - previous.counters[counter];
+				if (delta == 0) {
+					continue;
+				}
+				if (!any) {
+					std::fprintf(stderr, "  %-30s %16s %14s\n", "counter", "total", "per second");
+					any = true;
+				}
+				std::fprintf(stderr, "  %-30s %16llu %14.1f\n", COUNTER_NAME[counter],
+				             static_cast<unsigned long long>(delta),
+				             static_cast<double>(delta) / seconds);
+			}
+			if (tiler_max != 0) {
+				std::fprintf(stderr, "  %-30s %16llu\n", "tiler_max_invocations_1pass",
+				             static_cast<unsigned long long>(tiler_max));
+			}
 		}
 
 		previous = current;
@@ -197,6 +250,13 @@ void CountEvent(Event event) noexcept {
 		return;
 	}
 	g_events[static_cast<uint32_t>(event)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void AddCounter(Counter counter, uint64_t amount) noexcept {
+	if (!Enabled(2)) {
+		return;
+	}
+	g_counters[static_cast<uint32_t>(counter)].fetch_add(amount, std::memory_order_relaxed);
 }
 
 void SetGauge(Gauge gauge, uint64_t value) noexcept {

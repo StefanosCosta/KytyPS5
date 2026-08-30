@@ -25,6 +25,11 @@ struct VulkanInstance {
 	VmaAllocator                       allocator                         = nullptr;
 	bool                               memory_budget_ext_enabled         = false;
 	bool                               rt_extensions_enabled             = false;
+	// Post-mortem device-loss diagnostics. Both are optional: checkpoints name the last command the
+	// GPU reached, device-fault reports the faulting address. Without them a VK_ERROR_DEVICE_LOST
+	// only tells us which fence we happened to wait on, which is rarely the culprit.
+	bool                               diagnostic_checkpoints_enabled    = false;
+	bool                               device_fault_enabled              = false;
 	bool                               compute_subgroup_size_control_enabled = false;
 	bool                               compute_wave64_supported          = false;
 	bool                               sample_rate_shading_enabled       = false;

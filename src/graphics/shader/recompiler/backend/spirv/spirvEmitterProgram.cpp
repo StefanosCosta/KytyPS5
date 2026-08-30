@@ -307,6 +307,13 @@ void EmitStructuredFunction(ValueEmitContext& ctx) {
 	}
 }
 
+// Maximum state transitions one invocation may make inside the dispatcher loop before it is
+// forced out. Only shaders that already fell back to the dispatcher are affected; structured
+// shaders never reach this code. An invocation making this many transitions is a recompiler bug,
+// not a legitimate guest loop, so the bound is chosen to be far above any real shader while still
+// bounding worst-case execution time.
+constexpr uint32_t DispatcherIterationLimit = 65536;
+
 void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher) {
 	auto&       state = ctx.state;
 	const auto* entry = ctx.program.blocks.front();
@@ -327,13 +334,39 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 	const auto next_pc = state.builder.AllocateId();
 	state.builder.AddFunction({OpPhi, TypeU32(state), pc, initial_pc, initial_parent, next_pc,
 	                           dispatcher.continue_label});
+
+	// Bounded iteration.
+	//
+	// Nothing else stops this loop. A block's next state always comes from
+	// EmitDispatcherNextPc, and an out-of-range state lands on the OpSwitch default, whose phi
+	// edge is the UINT32_MAX sentinel -- so a bogus state exits. What does not exit is a genuine
+	// cycle whose data-dependent OpSelect conditions never steer towards a Return block, and a
+	// pixel shader that never returns hangs the GPU hard enough to take the desktop down with it.
+	//
+	// A counter folded into the existing exit test turns that into one wrong invocation. The
+	// counter is defined in the header, which dominates the continue block, so it is a legal phi
+	// operand and no extra blocks are needed. Both phis must stay ahead of every non-phi
+	// instruction in this block.
+	const auto iteration      = state.builder.AllocateId();
+	const auto next_iteration = state.builder.AllocateId();
+	state.builder.AddFunction({OpPhi, TypeU32(state), iteration, ConstantU32(state, 0),
+	                           initial_parent, next_iteration, dispatcher.continue_label});
+
 	const auto done = state.builder.AllocateId();
 	state.builder.AddFunction(
 	    {OpIEqual, TypeBool(state), done, pc, ConstantU32(ctx.state, UINT32_MAX)});
 	state.builder.AddFunction(
+	    {OpIAdd, TypeU32(state), next_iteration, iteration, ConstantU32(state, 1)});
+	const auto exhausted = state.builder.AllocateId();
+	state.builder.AddFunction({OpUGreaterThanEqual, TypeBool(state), exhausted, iteration,
+	                           ConstantU32(state, DispatcherIterationLimit)});
+	const auto stop = state.builder.AllocateId();
+	state.builder.AddFunction({OpLogicalOr, TypeBool(state), stop, done, exhausted});
+
+	state.builder.AddFunction(
 	    {OpLoopMerge, dispatcher.merge_label, dispatcher.continue_label, LoopControlNone});
 	state.builder.AddFunction(
-	    {OpBranchConditional, done, dispatcher.merge_label, dispatcher.select_label});
+	    {OpBranchConditional, stop, dispatcher.merge_label, dispatcher.select_label});
 
 	EmitLabel(state, dispatcher.select_label);
 	state.builder.AddFunction(

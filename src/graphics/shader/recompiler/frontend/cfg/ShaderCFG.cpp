@@ -1037,6 +1037,98 @@ uint32_t MoveBlockBefore(Graph& graph, uint32_t block_id, uint32_t before_id) {
 	return RemapId(block_id, id_map);
 }
 
+// Splice blocks that were appended at the tail into their proper position.
+//
+// A structured emitter walks graph.blocks in order and SPIR-V forbids branching to an earlier
+// block outside a loop, so a newly appended block must be moved to where the structure expects it.
+// Appended blocks are assumed to occupy [original_block_count, blocks.size()).
+// Rewrite graph.blocks into the given order, which must be a permutation of every block id.
+// Ids double as indices throughout the recompiler, so reordering means renumbering: every edge,
+// dominator set and terminator target is remapped to match.
+void ReorderBlocks(Graph& graph, const std::vector<uint32_t>& order) {
+	std::vector<BasicBlock> old_blocks = std::move(graph.blocks);
+	std::vector<BasicBlock> new_blocks;
+	new_blocks.reserve(old_blocks.size());
+	for (const auto block_id: order) {
+		new_blocks.push_back(std::move(old_blocks[block_id]));
+	}
+
+	std::vector<uint32_t> id_map(new_blocks.size(), UINT32_MAX);
+	for (uint32_t block_id = 0; block_id < new_blocks.size(); block_id++) {
+		id_map[new_blocks[block_id].id] = block_id;
+	}
+
+	graph.blocks      = std::move(new_blocks);
+	graph.entry_block = RemapId(graph.entry_block, id_map);
+	for (auto& block: graph.blocks) {
+		block.id = RemapId(block.id, id_map);
+		RemapIds(block.predecessors, id_map);
+		RemapIds(block.successors, id_map);
+		RemapIds(block.dominators, id_map);
+		RemapIds(block.post_dominators, id_map);
+		block.terminator.true_block     = RemapId(block.terminator.true_block, id_map);
+		block.terminator.false_block    = RemapId(block.terminator.false_block, id_map);
+		block.terminator.merge_block    = RemapId(block.terminator.merge_block, id_map);
+		block.terminator.continue_block = RemapId(block.terminator.continue_block, id_map);
+	}
+}
+
+void PlaceAppendedBlocks(Graph& graph, uint32_t original_block_count,
+                         const std::vector<uint32_t>& appended, uint32_t before) {
+	std::vector<uint32_t> order;
+	order.reserve(graph.blocks.size());
+	for (uint32_t block_id = 0; block_id < original_block_count; block_id++) {
+		if (block_id == before) {
+			order.insert(order.end(), appended.begin(), appended.end());
+		}
+		order.push_back(block_id);
+	}
+	ReorderBlocks(graph, order);
+}
+
+// Reverse postorder of the CFG from the entry block.
+//
+// A dominator always precedes what it dominates in reverse postorder, which is exactly SPIR-V's
+// requirement on the physical block order. Cloning appends copies at the tail, where they are
+// generally out of position, so the order is recomputed rather than reasoned about.
+//
+// Unreachable blocks keep their relative order at the end so the result stays a permutation;
+// PruneUnreachableBlocks removes them separately.
+std::vector<uint32_t> ReversePostorder(const Graph& graph) {
+	const auto            block_count = static_cast<uint32_t>(graph.blocks.size());
+	std::vector<uint32_t> postorder;
+	postorder.reserve(block_count);
+	std::vector<bool>                          visited(block_count, false);
+	std::vector<std::pair<uint32_t, uint32_t>> stack;
+	if (graph.entry_block < block_count) {
+		stack.emplace_back(graph.entry_block, 0u);
+		visited[graph.entry_block] = true;
+	}
+	while (!stack.empty()) {
+		auto& [block_id, next] = stack.back();
+		const auto* block      = graph.FindBlock(block_id);
+		if (block == nullptr || next >= block->successors.size()) {
+			postorder.push_back(block_id);
+			stack.pop_back();
+			continue;
+		}
+		// successors are sorted and unique, so the walk is deterministic.
+		const auto successor = block->successors[next++];
+		if (successor < block_count && !visited[successor]) {
+			visited[successor] = true;
+			stack.emplace_back(successor, 0u);
+		}
+	}
+
+	std::vector<uint32_t> order(postorder.rbegin(), postorder.rend());
+	for (uint32_t block_id = 0; block_id < block_count; block_id++) {
+		if (!visited[block_id]) {
+			order.push_back(block_id);
+		}
+	}
+	return order;
+}
+
 std::vector<uint32_t> DominatedBlocks(const Graph& graph, uint32_t header,
                                       uint32_t stop_block = UINT32_MAX) {
 	std::vector<uint32_t> blocks;
@@ -1084,6 +1176,68 @@ uint32_t AppendSyntheticBranchBlock(Graph& graph, uint32_t target) {
 	block.terminator.true_block = target;
 	graph.blocks.push_back(std::move(block));
 	return graph.blocks.back().id;
+}
+
+// Duplicate a block, instructions and all.
+//
+// Every other rewrite in this file inserts empty control blocks so that guest semantic blocks stay
+// unique. This one deliberately does not: it is the node-splitting primitive used to give an
+// externally entered selection region a single entry, and it only runs once structurization has
+// otherwise failed.
+uint32_t CloneBlock(Graph& graph, uint32_t source_id) {
+	const auto* source = graph.FindBlock(source_id);
+	if (source == nullptr) {
+		return UINT32_MAX;
+	}
+
+	BasicBlock block;
+	block.id         = static_cast<uint32_t>(graph.blocks.size());
+	block.start_pc   = source->start_pc;
+	block.end_pc     = source->end_pc;
+	block.inst_begin = source->inst_begin;
+	block.inst_end   = source->inst_end;
+	block.successors = source->successors;
+	block.terminator = source->terminator;
+	// predecessors/dominators are derived: RebuildPredecessors and RecomputeAnalyses fill them.
+	graph.blocks.push_back(std::move(block));
+	return graph.blocks.back().id;
+}
+
+bool BelongsToCyclicComponent(const Graph& graph, uint32_t block_id) {
+	const auto* block = graph.FindBlock(block_id);
+	for (const auto& component: graph.components) {
+		if (!Contains(component.blocks, block_id)) {
+			continue;
+		}
+		return component.blocks.size() > 1u ||
+		       (block != nullptr && Contains(block->successors, block_id));
+	}
+	return false;
+}
+
+bool BelongsToNaturalLoop(const Graph& graph, uint32_t block_id) {
+	return std::ranges::any_of(graph.natural_loops, [&](const NaturalLoop& loop) {
+		return loop.header == block_id || loop.latch == block_id || loop.merge == block_id ||
+		       loop.continue_block == block_id || Contains(loop.body_blocks, block_id);
+	});
+}
+
+// A guest block may exist at most twice. Without this, cloning has no fixed point: each clone
+// group can itself become an externally entered region one construct further out, and the graph
+// grows until the split budget trips. Block ids are renumbered by MoveBlockBefore, so the guard
+// is expressed in terms of the instruction range, which is stable.
+//
+// Empty blocks are exempt: AppendSyntheticBranchBlock copies start_pc/inst_begin from its target,
+// so every synthetic control block already looks like a duplicate of a real one.
+bool HasSemanticDuplicate(const Graph& graph, uint32_t block_id) {
+	const auto* block = graph.FindBlock(block_id);
+	if (block == nullptr || block->inst_begin == block->inst_end) {
+		return false;
+	}
+	return std::ranges::any_of(graph.blocks, [&](const BasicBlock& other) {
+		return other.id != block_id && other.start_pc == block->start_pc &&
+		       other.inst_begin == block->inst_begin && other.inst_end == block->inst_end;
+	});
 }
 
 bool IsolateSemanticLoopHeader(Graph& graph, uint32_t old_header) {
@@ -1453,7 +1607,180 @@ std::vector<uint32_t> SelectionRegion(const Graph& graph, const BasicBlock& head
 	return region;
 }
 
-bool SplitOneSelectionMerge(Graph& graph, std::string* error) {
+// Which region blocks are entered from outside the selection construct.
+std::vector<uint32_t> ExternallyEnteredRegionBlocks(const Graph& graph, uint32_t header,
+                                                    const std::vector<uint32_t>& region) {
+	std::vector<uint32_t> entered;
+	for (const auto member: region) {
+		const auto* member_block = graph.FindBlock(member);
+		if (member_block != nullptr &&
+		    std::ranges::any_of(member_block->predecessors, [&](uint32_t predecessor) {
+			    return predecessor != header && !Contains(region, predecessor);
+		    })) {
+			entered.push_back(member);
+		}
+	}
+	return entered;
+}
+
+// Everything the externally entered blocks can reach without leaving the region.
+//
+// The set has to be successor-closed, or a cloned edge would re-enter the original region and
+// recreate the very entry SPIR-V forbids. Seeding from every externally entered block at once --
+// rather than one at a time -- matters: blocks reachable from two of them would otherwise be
+// copied once per round.
+//
+// The result is topologically ordered. Clones are appended at the end of the block list, and
+// SPIR-V requires a block to precede everything it dominates; within the clone group dominance
+// follows the induced subgraph, so a topological order is what makes appending legal. Failure to
+// order means the set contains a cycle, which cannot be reproduced without a second entry into
+// the copy, so it is refused.
+bool OrderedSelectionCloneSet(const Graph& graph, const std::vector<uint32_t>& region,
+                              const std::vector<uint32_t>& entered,
+                              std::vector<uint32_t>&       ordered) {
+	std::vector<uint32_t> members;
+	std::vector<uint32_t> pending = entered;
+	while (!pending.empty()) {
+		const auto block_id = pending.back();
+		pending.pop_back();
+		if (Contains(members, block_id)) {
+			continue;
+		}
+		const auto* block = graph.FindBlock(block_id);
+		if (block == nullptr) {
+			return false;
+		}
+		members.push_back(block_id);
+		for (const auto successor: block->successors) {
+			if (Contains(region, successor)) {
+				pending.push_back(successor);
+			}
+		}
+	}
+	SortUnique(members);
+
+	ordered.clear();
+	ordered.reserve(members.size());
+	std::vector<uint32_t> remaining = members;
+	while (!remaining.empty()) {
+		const auto ready = std::find_if(remaining.begin(), remaining.end(), [&](uint32_t member) {
+			const auto* block = graph.FindBlock(member);
+			return block != nullptr &&
+			       std::ranges::none_of(block->predecessors, [&](uint32_t predecessor) {
+				       return predecessor != member && Contains(remaining, predecessor);
+			       });
+		});
+		if (ready == remaining.end()) {
+			return false;
+		}
+		ordered.push_back(*ready);
+		remaining.erase(ready);
+	}
+	return true;
+}
+
+// Blocks this rewrite must not touch.
+bool CanCloneSelectionRegion(const Graph& graph, uint32_t header,
+                             const std::vector<uint32_t>& region,
+                             const std::vector<uint32_t>& ordered) {
+	return std::ranges::all_of(ordered, [&](uint32_t member) {
+		const auto* block = graph.FindBlock(member);
+		if (block == nullptr || member == graph.entry_block ||
+		    BelongsToCyclicComponent(graph, member) || BelongsToNaturalLoop(graph, member) ||
+		    HasSemanticDuplicate(graph, member) ||
+		    block->terminator.kind == TerminatorKind::IndirectBranch) {
+			return false;
+		}
+		// Every original has to keep an entry from the header side. SelectionRegion deliberately
+		// drops blocks (enclosing linear exits, terminals), so a member whose only path from the
+		// header runs through a dropped block would have all of its predecessors treated as external
+		// and redirected, leaving the original unreachable. Its successors would then be dominated
+		// by the copy, and since copies are appended last they would precede their own dominator --
+		// which is what spirv-val rejects.
+		if (std::ranges::none_of(block->predecessors, [&](uint32_t predecessor) {
+			    return predecessor == header || Contains(region, predecessor);
+		    })) {
+			return false;
+		}
+		// ReplaceTerminatorTarget only rewrites true/false targets, and ReplaceValue would sort an
+		// indirect jump table out of step with indirect_target_pcs, so an indirect predecessor
+		// cannot be redirected to the copy.
+		return std::ranges::none_of(block->predecessors, [&](uint32_t predecessor) {
+			const auto* predecessor_block = graph.FindBlock(predecessor);
+			return predecessor_block != nullptr && !Contains(region, predecessor) &&
+			       predecessor_block->terminator.kind == TerminatorKind::IndirectBranch;
+		});
+	});
+}
+
+// Give an externally entered selection region a single entry by duplicating the affected blocks.
+//
+// SPIR-V allows a selection construct to be entered only through its header, so guest code that
+// jumps straight into an arm cannot be structured. Node splitting resolves it: the original keeps
+// the header as its only entry and every other entry lands on a private copy. A BasicBlock only
+// names a range in the shared decoded program, so a copy plus edge fixup is a complete duplicate --
+// no IR is involved, and SSA construction inserts the phis at the new joins by itself.
+bool CloneExternallyEnteredRegion(Graph& graph, uint32_t header_id,
+                                  const std::vector<uint32_t>& region,
+                                  const std::vector<uint32_t>& ordered, uint32_t clone_ceiling) {
+	if (ordered.empty() ||
+	    static_cast<uint64_t>(graph.blocks.size()) + ordered.size() > clone_ceiling) {
+		return false;
+	}
+
+	std::vector<uint32_t> clones;
+	clones.reserve(ordered.size());
+	for (const auto member: ordered) {
+		// Do not hold a BasicBlock* across this call: push_back invalidates it.
+		const auto clone = CloneBlock(graph, member);
+		if (clone == UINT32_MAX) {
+			return false;
+		}
+		clones.push_back(clone);
+	}
+
+	// Edges that stay inside the set follow the copy; edges that leave it -- the selection merge,
+	// enclosing exits -- keep pointing at the shared original.
+	for (uint32_t index = 0; index < ordered.size(); index++) {
+		auto* clone = graph.FindBlock(clones[index]);
+		if (clone == nullptr) {
+			continue;
+		}
+		for (uint32_t other = 0; other < ordered.size(); other++) {
+			ReplaceValue(clone->successors, ordered[other], clones[other]);
+			ReplaceTerminatorTarget(clone->terminator, ordered[other], clones[other]);
+		}
+	}
+
+	// Send every entry that does not come through the header to the copy. The predecessor lists are
+	// the pre-clone ones, which is exactly what is needed here; RebuildPredecessors runs afterwards.
+	for (uint32_t index = 0; index < ordered.size(); index++) {
+		const auto* member = graph.FindBlock(ordered[index]);
+		if (member == nullptr) {
+			continue;
+		}
+		const auto predecessors = member->predecessors;
+		for (const auto predecessor: predecessors) {
+			if (predecessor == header_id || Contains(region, predecessor)) {
+				continue;
+			}
+			auto* predecessor_block = graph.FindBlock(predecessor);
+			if (predecessor_block != nullptr) {
+				ReplaceValue(predecessor_block->successors, ordered[index], clones[index]);
+				ReplaceTerminatorTarget(predecessor_block->terminator, ordered[index], clones[index]);
+			}
+		}
+	}
+
+	// Deliberately left appended at the tail. Every original precedes every clone, so an external
+	// predecessor that dominates a clone precedes it; and no clone dominates an original, because
+	// each out-of-set successor keeps its original edge and so retains a non-clone predecessor.
+	// Repositioning next to the source would break the first of those.
+	return true;
+}
+
+bool SplitOneSelectionMerge(Graph& graph, std::string* error, bool allow_cloning,
+                            uint32_t clone_ceiling) {
 	std::vector<uint32_t> loop_headers;
 	loop_headers.reserve(graph.natural_loops.size());
 	for (const auto& loop: graph.natural_loops) {
@@ -1488,20 +1815,35 @@ bool SplitOneSelectionMerge(Graph& graph, std::string* error) {
 		if (merge == UINT32_MAX || graph.FindBlock(merge) == nullptr) {
 			continue;
 		}
-		const auto region   = SelectionRegion(graph, *block, merge);
-		const auto external = std::find_if(region.begin(), region.end(), [&](uint32_t member) {
-			const auto* member_block = graph.FindBlock(member);
-			return member_block != nullptr &&
-			       std::ranges::any_of(member_block->predecessors, [&](uint32_t predecessor) {
-				       return predecessor != block_id && !Contains(region, predecessor);
-			       });
-		});
-		if (external != region.end()) {
+		const auto region  = SelectionRegion(graph, *block, merge);
+		const auto entered = ExternallyEnteredRegionBlocks(graph, block_id, region);
+		if (!entered.empty()) {
+			std::vector<uint32_t> ordered;
+			if (allow_cloning && OrderedSelectionCloneSet(graph, region, entered, ordered) &&
+			    CanCloneSelectionRegion(graph, block_id, region, ordered)) {
+				Graph snapshot = graph;
+				if (CloneExternallyEnteredRegion(graph, block_id, region, ordered, clone_ceiling)) {
+					RebuildPredecessors(graph);
+					// Redirecting every entry into an original leaves it unreachable, and an
+					// unreachable block that still branches into a construct confuses the structured
+					// emitter. Nothing else prunes during structurization -- BuildGraph is the only
+					// other caller.
+					PruneUnreachableBlocks(graph);
+					// Copies were appended at the tail, which is generally the wrong place. Reverse
+					// postorder puts every dominator ahead of what it dominates, which is the rule
+					// SPIR-V imposes on the physical block order.
+					ReorderBlocks(graph, ReversePostorder(graph));
+					RebuildPredecessors(graph);
+					return true;
+				}
+				graph = std::move(snapshot);
+			}
 			SetFailure(
 			    graph, FailureKind::StructuredControlFlow, block_id,
 			    fmt::format("selection header block {} has externally entered region block {}; "
-			                "semantic block cloning is disabled",
-			                block_id, *external),
+			                "semantic block cloning {}",
+			                block_id, entered.front(),
+			                allow_cloning ? "could not make the region single-entry" : "is disabled"),
 			    error);
 			return false;
 		}
@@ -1514,11 +1856,15 @@ bool SplitOneSelectionMerge(Graph& graph, std::string* error) {
 	return false;
 }
 
-bool SplitSharedMergeBlocks(Graph& graph, std::string* error) {
+bool SplitSharedMergeBlocks(Graph& graph, std::string* error, bool allow_cloning) {
 	const auto original_block_count = static_cast<uint32_t>(graph.blocks.size());
-	const auto split_budget         = std::max<uint32_t>(16u, original_block_count * 4u);
+	const auto split_budget         = std::max<uint32_t>(16u, original_block_count * 8u);
+	// Node splitting is worst-case exponential, so cap total growth. Each successful clone adds at
+	// least one block, so this ceiling is also what guarantees the loop below terminates.
+	const auto clone_ceiling = std::max<uint32_t>(64u, original_block_count * 4u);
 	for (uint32_t splits = 0; splits < split_budget; splits++) {
-		if (!SplitOneLoopMerge(graph) && !SplitOneSelectionMerge(graph, error)) {
+		if (!SplitOneLoopMerge(graph) &&
+		    !SplitOneSelectionMerge(graph, error, allow_cloning, clone_ceiling)) {
 			return !graph.unsupported;
 		}
 		RebuildPredecessors(graph);
@@ -1531,6 +1877,21 @@ bool SplitSharedMergeBlocks(Graph& graph, std::string* error) {
 	                       split_budget),
 	           error);
 	return false;
+}
+
+// SPIR-V requires a block to appear before every block it dominates, and the structured emitter
+// walks graph.blocks in order, so the block list itself has to satisfy that rule. Block ids are
+// their own indices, so a dominator with a higher id is a block that comes later.
+//
+// Cloning appends copies at the end, which is only a valid order when no copy dominates anything
+// that precedes it. Whether that holds depends on the whole graph, so it is verified rather than
+// assumed: a shader whose order comes out wrong falls back instead of emitting invalid SPIR-V.
+bool IsDominanceOrdered(const Graph& graph) {
+	return std::ranges::all_of(graph.blocks, [](const BasicBlock& block) {
+		return std::ranges::none_of(block.dominators, [&](uint32_t dominator) {
+			return dominator != block.id && dominator > block.id;
+		});
+	});
 }
 
 void ClearStructuredTerminators(Graph& graph) {
@@ -1625,36 +1986,7 @@ struct GotoRouteBlocks {
 
 void PlaceGotoRouteBlocks(Graph& graph, uint32_t original_block_count,
                           const GotoRouteBlocks& route) {
-	std::vector<BasicBlock> old_blocks = std::move(graph.blocks);
-	std::vector<BasicBlock> new_blocks;
-	new_blocks.reserve(old_blocks.size());
-	for (uint32_t block_id = 0; block_id < original_block_count; block_id++) {
-		if (block_id == route.before) {
-			for (const auto route_block: route.blocks) {
-				new_blocks.push_back(std::move(old_blocks[route_block]));
-			}
-		}
-		new_blocks.push_back(std::move(old_blocks[block_id]));
-	}
-
-	std::vector<uint32_t> id_map(new_blocks.size(), UINT32_MAX);
-	for (uint32_t block_id = 0; block_id < new_blocks.size(); block_id++) {
-		id_map[new_blocks[block_id].id] = block_id;
-	}
-
-	graph.blocks      = std::move(new_blocks);
-	graph.entry_block = RemapId(graph.entry_block, id_map);
-	for (auto& block: graph.blocks) {
-		block.id = RemapId(block.id, id_map);
-		RemapIds(block.predecessors, id_map);
-		RemapIds(block.successors, id_map);
-		RemapIds(block.dominators, id_map);
-		RemapIds(block.post_dominators, id_map);
-		block.terminator.true_block     = RemapId(block.terminator.true_block, id_map);
-		block.terminator.false_block    = RemapId(block.terminator.false_block, id_map);
-		block.terminator.merge_block    = RemapId(block.terminator.merge_block, id_map);
-		block.terminator.continue_block = RemapId(block.terminator.continue_block, id_map);
-	}
+	PlaceAppendedBlocks(graph, original_block_count, route.blocks, route.before);
 }
 
 uint32_t AppendGotoSelectBlock(Graph& graph, uint32_t route_variable, uint32_t true_target,
@@ -2136,7 +2468,7 @@ bool BuildGraph(const Decoder::Program& program, Graph& graph, std::string* erro
 
 namespace {
 
-bool StructurizeImpl(Graph& graph, std::string* error) {
+bool StructurizeImpl(Graph& graph, std::string* error, bool allow_cloning) {
 	if (graph.unsupported || graph.irreducible) {
 		if (graph.unsupported_reason.empty()) {
 			graph.unsupported_reason = "unsupported CFG";
@@ -2148,7 +2480,7 @@ bool StructurizeImpl(Graph& graph, std::string* error) {
 	if (!CanonicalizeNaturalLoops(graph, error)) {
 		return false;
 	}
-	if (!SplitSharedMergeBlocks(graph, error)) {
+	if (!SplitSharedMergeBlocks(graph, error, allow_cloning)) {
 		return false;
 	}
 	if (!IsolateSemanticLoopHeaders(graph, error)) {
@@ -2226,7 +2558,7 @@ bool StructurizeImpl(Graph& graph, std::string* error) {
 
 bool Structurize(Graph& graph, std::string* error) {
 	Graph original = graph;
-	if (StructurizeImpl(graph, error)) {
+	if (StructurizeImpl(graph, error, false)) {
 		return true;
 	}
 
@@ -2244,11 +2576,36 @@ bool Structurize(Graph& graph, std::string* error) {
 		if (error != nullptr) {
 			error->clear();
 		}
-		if (StructurizeImpl(routed, error)) {
+		if (StructurizeImpl(routed, error, false)) {
 			graph = std::move(routed);
 			return true;
 		}
 	}
+
+	// Last resort: allow node splitting. Duplicating guest blocks is worse than routing through
+	// typed goto state, so it is only worth it against the alternative -- the dispatcher fallback,
+	// whose unbounded state machine is slower still. Everything reachable by routing has already
+	// been tried above, so shaders that structurize today keep their unique semantic blocks.
+	{
+		Graph cloned = graph;
+		if (error != nullptr) {
+			error->clear();
+		}
+		if (StructurizeImpl(cloned, error, true)) {
+			if (IsDominanceOrdered(cloned)) {
+				graph = std::move(cloned);
+				return true;
+			}
+			failed_error = fmt::format(
+			    "semantic block cloning structurized but produced a block order in which a block "
+			    "precedes its dominator; falling back");
+		} else if (error != nullptr && !error->empty()) {
+			// The cloning attempt got further than the first pass, so its failure is the more
+			// informative one to report.
+			failed_error = *error;
+		}
+	}
+
 	graph = std::move(failed_graph);
 	if (error != nullptr) {
 		*error = std::move(failed_error);

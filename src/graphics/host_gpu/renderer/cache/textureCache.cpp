@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 
 #include "common/assert.h"
+#include "common/syncStats.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -1078,6 +1079,19 @@ void TextureCache::RefreshImage(ImageId id, const ImageDesc& desc) {
 	if (!cpu_dirty) {
 		return;
 	}
+	// Attribute the re-upload. These are not exclusive; each reason is counted so a run can
+	// be read as "which invalidation source is driving the traffic".
+	if (image.IsBufferModified()) {
+		Common::SyncStats::AddCounter(Common::SyncStats::Counter::ImageUploadBufferModified, 1);
+	}
+	if (image.IsDefinitelyCpuDirty()) {
+		Common::SyncStats::AddCounter(Common::SyncStats::Counter::ImageUploadCpuDirty, 1);
+	}
+	if (image.IsMaybeCpuDirty()) {
+		Common::SyncStats::AddCounter(Common::SyncStats::Counter::ImageUploadMaybeCpuDirty, 1);
+	}
+	Common::SyncStats::AddCounter(Common::SyncStats::Counter::ImageUploadBytes,
+	                              image.info.data.size);
 	InitializeImage(id, desc);
 }
 

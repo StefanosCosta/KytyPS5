@@ -14,6 +14,8 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
+#include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/presenter.h"
@@ -23,6 +25,7 @@
 #include "libs/libs.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <array>
 #include <list>
 #include <thread>
@@ -809,6 +812,38 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 		}
 
 		Common::SyncStats::CountEvent(Common::SyncStats::Event::FlipTick);
+		if (Common::SyncStats::Enabled(2)) {
+			// Sampled here because the pacer keeps running at 60 Hz after every other thread
+			// has gone quiet -- which is exactly the state being diagnosed. Refresh() is a
+			// vkGetSemaphoreCounterValue, so KnownGpuTick is fresh rather than last-observed.
+			auto& master = Renderer().GetCommandScheduler().GetMasterSemaphore();
+			master.Refresh();
+			const auto known  = master.KnownGpuTick();
+			const auto issued = master.CurrentTick();
+			Common::SyncStats::SetGauge(Common::SyncStats::Gauge::GpuTickKnown, known);
+			Common::SyncStats::SetGauge(Common::SyncStats::Gauge::GpuTickCurrent, issued);
+
+			// Stall detection. The next tick to complete is `known + 1`; if it has not moved
+			// while work is outstanding, that submission is the one that never finishes.
+			// Latched so a permanent stall reports once, not 60 times a second.
+			static uint64_t last_known      = 0;
+			static uint32_t stalled_vblanks = 0;
+			static bool     stall_reported  = false;
+			if (known != last_known) {
+				last_known      = known;
+				stalled_vblanks = 0;
+				stall_reported  = false;
+			} else if (issued > known + 1 && !stall_reported && ++stalled_vblanks >= 180) {
+				stall_reported = true;
+				Graphics::WorkLog::DumpStuck(known + 1, known, issued);
+				std::fprintf(stderr,
+				             "  present submission outstanding: %s  (the only submission that "
+				             "carries a wait semaphore)\n",
+				             m_presenter.PresentSubmissionOutstanding() ? "YES" : "no");
+				std::fflush(stderr);
+				Renderer().GetCommandScheduler().DumpOutstanding(known);
+			}
+		}
 		VblankBegin();
 		bool presented = m_flip_queue.Flip(0);
 		if (!presented && m_presenter.NeedsImeRefresh()) {

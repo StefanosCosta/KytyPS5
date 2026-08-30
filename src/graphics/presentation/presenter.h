@@ -27,6 +27,11 @@ public:
 	[[nodiscard]] bool           IsGuestPaused() const noexcept;
 	[[nodiscard]] bool           NeedsImeRefresh() const noexcept;
 	[[nodiscard]] RenderContext& Renderer() const noexcept;
+
+	// Diagnostic: true when the most recent presentation submission has not completed. A present
+	// submission is the only one in the renderer that carries a wait semaphore, so if it never
+	// completes it blocks the shared queue and everything submitted behind it.
+	[[nodiscard]] bool PresentSubmissionOutstanding() const noexcept;
 	void                         Present(Frame& frame, bool reuse = false);
 	void                         Discard(Frame& frame);
 

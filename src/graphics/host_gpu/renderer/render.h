@@ -95,6 +95,10 @@ public:
 	void WaitForFence();
 	void WaitForFenceAndReset();
 
+	// Non-blocking: true when this buffer was submitted and its fence has not signalled yet.
+	// Diagnostic use only -- vkGetFenceStatus is a poll, not a synchronization point.
+	[[nodiscard]] bool IsSubmissionOutstanding() const;
+
 	[[nodiscard]] vk::CommandBuffer Handle() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }

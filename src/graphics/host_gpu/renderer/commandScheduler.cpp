@@ -1,6 +1,10 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
 #include "common/assert.h"
+#include "common/syncStats.h"
+
+#include <cstdio>
+#include <cstdlib>
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
@@ -319,7 +323,15 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 			m_priority_active      = true;
 			m_priority_active_tick = operation.tick;
 		}
-		m_master.Wait(operation.tick);
+		// +1 so that "never waited" (0) is distinguishable from "waiting on tick 0".
+		Common::SyncStats::SetGauge(Common::SyncStats::Gauge::PriorityWaitTick,
+		                            operation.tick + 1);
+		{
+			// The wait is vkWaitSemaphores with UINT64_MAX: if this tick is never signalled
+			// the thread parks here forever and every later flip completion queues behind it.
+			Common::SyncStats::Scope wait_scope(Common::SyncStats::Site::PriorityOpWait);
+			m_master.Wait(operation.tick);
+		}
 		if (!stop.stop_requested()) {
 			RunOperation(std::move(operation.callback));
 		}
@@ -394,6 +406,8 @@ CommandBuffer& CommandScheduler::SubmitCurrent(SubmitInfo& submit) {
 	auto& submitted = Current();
 	submitted.End();
 	const auto signal_tick = m_master.NextTick();
+	WorkLog::RecordSubmission(signal_tick, static_cast<uint32_t>(m_current),
+	                          m_submit_sequence.load(std::memory_order_relaxed));
 	submit.AddSignal(m_master.Handle(), signal_tick);
 	submitted.Execute(submit);
 	m_buffer_ticks[static_cast<size_t>(m_current)] = signal_tick;
@@ -411,6 +425,45 @@ int CommandScheduler::FindReusableBuffer(uint64_t gpu_tick) const {
 		}
 	}
 	return -1;
+}
+
+void CommandScheduler::DumpOutstanding(uint64_t known_gpu_tick) const {
+	std::fprintf(stderr, "  scheduler: %zu command buffers, current=%d\n", m_buffers.size(),
+	             m_current);
+	uint32_t ahead = 0;
+	uint32_t pending = 0;
+	// Report by tick order, not buffer index: the interesting one is the lowest outstanding
+	// tick -- the submission the whole timeline is waiting on.
+	for (uint64_t tick = known_gpu_tick + 1; tick <= known_gpu_tick + 4; ++tick) {
+		bool found = false;
+		for (size_t i = 0; i < m_buffers.size() && i < m_buffer_ticks.size(); ++i) {
+			if (m_buffer_ticks[i] != tick) {
+				continue;
+			}
+			found = true;
+			std::fprintf(stderr, "    tick=%llu -> buffer[%zu] fence=%s\n",
+			             static_cast<unsigned long long>(tick), i,
+			             m_buffers[i]->IsSubmissionOutstanding() ? "PENDING" : "signalled");
+		}
+		if (!found) {
+			std::fprintf(stderr,
+			             "    tick=%llu -> NO BUFFER HOLDS THIS TICK (it was handed out but the "
+			             "slot was reused or never submitted)\n",
+			             static_cast<unsigned long long>(tick));
+		}
+	}
+	for (size_t i = 0; i < m_buffers.size() && i < m_buffer_ticks.size(); ++i) {
+		if (m_buffer_ticks[i] <= known_gpu_tick) {
+			continue;
+		}
+		ahead++;
+		if (m_buffers[i]->IsSubmissionOutstanding()) {
+			pending++;
+		}
+	}
+	std::fprintf(stderr, "  %u buffers ahead of the GPU, %u with a pending fence\n", ahead,
+	             pending);
+	std::fflush(stderr);
 }
 
 size_t CommandScheduler::GrowCommandBuffers() {
@@ -443,5 +496,171 @@ void CommandScheduler::BeginNext() {
 	Current().Begin();
 	m_recording = true;
 }
+
+
+namespace WorkLog {
+
+namespace {
+
+struct Record {
+	std::atomic<uint64_t> tick {0}; // 0 = never written
+	uint64_t              submit_seq        = 0;
+	uint32_t              slot              = 0;
+	uint32_t              draws             = 0;
+	uint32_t              dispatches        = 0;
+	uint32_t              tiler_dispatches  = 0;
+	uint64_t              tiler_invocations = 0;
+};
+
+// Ticks are dense and the backlog observed at a stall is ~68, so 1024 is ample history.
+constexpr uint64_t RING = 1024;
+Record             g_ring[RING];
+
+struct DrawDetail {
+	std::atomic<uint64_t> tick {0};
+	uint64_t              pipeline       = 0;
+	const uint32_t*       vs_spirv       = nullptr;
+	uint32_t              vs_words       = 0;
+	const uint32_t*       ps_spirv       = nullptr;
+	uint32_t              ps_words       = 0;
+	uint32_t              index_count    = 0;
+	uint32_t              instance_count = 0;
+};
+
+// A stalled buffer held 25 draws, so 512 covers many buffers of history.
+constexpr size_t      DRAW_RING = 512;
+DrawDetail            g_draw_ring[DRAW_RING];
+std::atomic<size_t>   g_draw_ring_next {0};
+
+std::atomic<uint32_t> g_draws {0};
+std::atomic<uint32_t> g_dispatches {0};
+std::atomic<uint32_t> g_tiler_dispatches {0};
+std::atomic<uint64_t> g_tiler_invocations {0};
+
+} // namespace
+
+void NoteDraw() noexcept {
+	g_draws.fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteDispatch() noexcept {
+	g_dispatches.fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteDrawDetail(uint64_t tick, uint64_t pipeline, const uint32_t* vs_spirv, uint32_t vs_words,
+                    const uint32_t* ps_spirv, uint32_t ps_words, uint32_t index_count,
+                    uint32_t instance_count) noexcept {
+	if (!Common::SyncStats::Enabled(2)) {
+		return;
+	}
+	auto& entry = g_draw_ring[g_draw_ring_next.fetch_add(1, std::memory_order_relaxed) % DRAW_RING];
+	entry.pipeline       = pipeline;
+	entry.vs_spirv       = vs_spirv;
+	entry.vs_words       = vs_words;
+	entry.ps_spirv       = ps_spirv;
+	entry.ps_words       = ps_words;
+	entry.index_count    = index_count;
+	entry.instance_count = instance_count;
+	entry.tick.store(tick, std::memory_order_release);
+}
+
+void NoteTilerDispatch(uint64_t invocations) noexcept {
+	g_tiler_dispatches.fetch_add(1, std::memory_order_relaxed);
+	g_tiler_invocations.fetch_add(invocations, std::memory_order_relaxed);
+}
+
+void RecordSubmission(uint64_t tick, uint32_t slot, uint64_t submit_seq) noexcept {
+	if (!Common::SyncStats::Enabled(2)) {
+		return;
+	}
+	// Exchange rather than load: each field becomes "what this submission added".
+	auto& record             = g_ring[tick % RING];
+	record.submit_seq        = submit_seq;
+	record.slot              = slot;
+	record.draws             = g_draws.exchange(0, std::memory_order_relaxed);
+	record.dispatches        = g_dispatches.exchange(0, std::memory_order_relaxed);
+	record.tiler_dispatches  = g_tiler_dispatches.exchange(0, std::memory_order_relaxed);
+	record.tiler_invocations = g_tiler_invocations.exchange(0, std::memory_order_relaxed);
+	// Published last: a reader that sees the tick sees the fields above it.
+	record.tick.store(tick, std::memory_order_release);
+}
+
+bool DumpStuck(uint64_t tick, uint64_t known_gpu_tick, uint64_t issued_tick) noexcept {
+	const auto& record = g_ring[tick % RING];
+	if (record.tick.load(std::memory_order_acquire) != tick) {
+		std::fprintf(stderr,
+		             "\n[gpu-stall] tick %llu never completed; its record was overwritten "
+		             "(gpu_tick=%llu issued=%llu)\n",
+		             static_cast<unsigned long long>(tick),
+		             static_cast<unsigned long long>(known_gpu_tick),
+		             static_cast<unsigned long long>(issued_tick));
+		return false;
+	}
+	std::fprintf(stderr,
+	             "\n[gpu-stall] tick %llu never completed (gpu_tick=%llu issued=%llu backlog=%lld)\n"
+	             "  slot=%u submit_seq=%llu  draws=%u  dispatches=%u  "
+	             "tiler_dispatches=%u  tiler_invocations=%llu\n",
+	             static_cast<unsigned long long>(tick),
+	             static_cast<unsigned long long>(known_gpu_tick),
+	             static_cast<unsigned long long>(issued_tick),
+	             static_cast<long long>(issued_tick) - static_cast<long long>(known_gpu_tick),
+	             record.slot, static_cast<unsigned long long>(record.submit_seq), record.draws,
+	             record.dispatches, record.tiler_dispatches,
+	             static_cast<unsigned long long>(record.tiler_invocations));
+
+	// The neighbours put it in context: an empty stuck buffer next to busy ones means the
+	// stall is not about this buffer's contents.
+	for (uint64_t probe = (tick > 2 ? tick - 2 : 0); probe <= tick + 2; probe++) {
+		const auto& other = g_ring[probe % RING];
+		if (other.tick.load(std::memory_order_acquire) != probe) {
+			continue;
+		}
+		std::fprintf(stderr, "    tick %llu%s draws=%u dispatches=%u tiler=%u\n",
+		             static_cast<unsigned long long>(probe), probe == tick ? " <-- stuck" : "",
+		             other.draws, other.dispatches, other.tiler_dispatches);
+	}
+
+	std::fprintf(stderr, "  draws recorded for tick %llu:\n",
+	             static_cast<unsigned long long>(tick));
+	uint32_t index = 0;
+	for (const auto& entry: g_draw_ring) {
+		if (entry.tick.load(std::memory_order_acquire) != tick) {
+			continue;
+		}
+		std::fprintf(stderr,
+		             "    [%2u] pipeline=0x%016llx vs_words=%u ps_words=%u  indices=%u "
+		             "instances=%u\n",
+		             index++, static_cast<unsigned long long>(entry.pipeline), entry.vs_words,
+		             entry.ps_words, entry.index_count, entry.instance_count);
+		if (index > 1) {
+			continue; // all 25 draws share a pipeline; one dump is enough
+		}
+		// The SPIR-V is owned by the pipeline cache and outlives the draw, so it is safe to
+		// write out here. This is the module the GPU wedged on.
+		const char* dir = std::getenv("KYTY_STALL_DUMP_DIR");
+		if (dir == nullptr) {
+			continue;
+		}
+		for (int which = 0; which < 2; ++which) {
+			const uint32_t* code  = which == 0 ? entry.vs_spirv : entry.ps_spirv;
+			const uint32_t  words = which == 0 ? entry.vs_words : entry.ps_words;
+			if (code == nullptr || words == 0) {
+				continue;
+			}
+			char path[512];
+			std::snprintf(path, sizeof(path), "%s/stall_%s_%llu.spv", dir,
+			              which == 0 ? "vs" : "ps", static_cast<unsigned long long>(tick));
+			if (auto* out = std::fopen(path, "wb"); out != nullptr) {
+				std::fwrite(code, sizeof(uint32_t), words, out);
+				std::fclose(out);
+				std::fprintf(stderr, "    wrote %s (%u words)\n", path, words);
+			}
+		}
+	}
+	std::fflush(stderr);
+	return true;
+}
+
+} // namespace WorkLog
 
 } // namespace Libs::Graphics

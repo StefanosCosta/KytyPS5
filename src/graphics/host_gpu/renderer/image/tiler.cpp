@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
 #include "common/assert.h"
+#include "common/syncStats.h"
 #include "gpu_tiler_shaders/gpu_tiler_demote_d16_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_depth_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_promote_d16_spv.h"
@@ -91,6 +92,7 @@ TileManager::~TileManager() {
 
 TileManager::Scratch TileManager::AllocateScratch(uint64_t size) {
 	EXIT_IF(size == 0);
+	Common::SyncStats::AddCounter(Common::SyncStats::Counter::TilerScratchBytes, size);
 	vk::BufferCreateInfo create {};
 	create.sType = vk::StructureType::eBufferCreateInfo;
 	create.size  = size;
@@ -212,6 +214,13 @@ void TileManager::Prepare(bool tile, uint64_t tiled_capacity, uint64_t linear_ca
 		dispatch.push.width            = info.width;
 		dispatch.push.height           = info.height;
 		dispatch.push.depth            = info.depth;
+		if (info.bytes_per_element < 4) {
+			// gpu_tiler_common.inc copies these with atomicAnd + atomicOr, two device-memory
+			// read-modify-writes per element, rather than a dword load/store.
+			Common::SyncStats::AddCounter(
+			    Common::SyncStats::Counter::TilerAtomicInvocations,
+			    uint64_t {info.width} * info.height * std::max(info.depth, 1u));
+		}
 		dispatch.push.surface_z        = info.surface_z;
 		dispatch.push.pitch_bytes      = static_cast<uint32_t>(pitch_bytes);
 		dispatch.push.slice_bytes      = static_cast<uint32_t>(slice_bytes);
@@ -335,6 +344,8 @@ void TileManager::Record(bool tile, vk::Buffer source, uint64_t source_offset,
 	    vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer, {}, 0,
 	    nullptr, 3, barriers, 0, nullptr);
 	if (clear_target) {
+		Common::SyncStats::AddCounter(Common::SyncStats::Counter::TilerClearBytes,
+		                              target_capacity);
 		command.fillBuffer(target, target_offset, target_capacity, 0);
 		barriers[1].srcAccessMask = vk::AccessFlagBits::eTransferWrite;
 		barriers[1].dstAccessMask =
@@ -362,6 +373,13 @@ void TileManager::Record(bool tile, vk::Buffer source, uint64_t source_offset,
 		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0,
 		                             static_cast<uint32_t>(writes.size()), writes.data());
 		command.bindPipeline(vk::PipelineBindPoint::eCompute, GetPipeline(dispatch.pipeline_slot));
+		// One invocation per element: gpu_tiler_common.inc early-outs only the ragged edge.
+		const uint64_t invocations = uint64_t {dispatch.push.width} * dispatch.push.height *
+		                             std::max(dispatch.push.depth, 1u);
+		Common::SyncStats::AddCounter(Common::SyncStats::Counter::TilerDispatches, 1);
+		Common::SyncStats::AddCounter(Common::SyncStats::Counter::TilerInvocations, invocations);
+		Common::SyncStats::SetGauge(Common::SyncStats::Gauge::TilerMaxInvocations, invocations);
+		WorkLog::NoteTilerDispatch(invocations);
 		command.dispatch((dispatch.push.width + 7u) / 8u, (dispatch.push.height + 7u) / 8u,
 		                 dispatch.push.depth);
 	}
@@ -376,6 +394,7 @@ void TileManager::Record(bool tile, vk::Buffer source, uint64_t source_offset,
 TileManager::Result TileManager::Detile(vk::Buffer tiled, uint64_t tiled_offset,
                                         uint64_t tiled_capacity, uint64_t linear_capacity,
                                         std::span<const GpuTileInfo> infos) {
+	Common::SyncStats::AddCounter(Common::SyncStats::Counter::TilerDetilePasses, 1);
 	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	const uint64_t descriptor_alignment =
 	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
@@ -392,6 +411,7 @@ TileManager::Result TileManager::Detile(vk::Buffer tiled, uint64_t tiled_offset,
 void TileManager::Tile(vk::Buffer linear, uint64_t linear_offset, uint64_t linear_capacity,
                        vk::Buffer tiled, uint64_t tiled_offset, uint64_t tiled_capacity,
                        std::span<const GpuTileInfo> infos) {
+	Common::SyncStats::AddCounter(Common::SyncStats::Counter::TilerTilePasses, 1);
 	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	const uint64_t descriptor_alignment =
 	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
@@ -407,6 +427,7 @@ void TileManager::TileImage(Image& image, std::span<const vk::BufferImageCopy> r
                             vk::Buffer tiled, uint64_t tiled_offset, uint64_t tiled_capacity,
                             uint64_t linear_capacity, std::span<const GpuTileInfo> infos,
                             ColorTransform transform) {
+	Common::SyncStats::AddCounter(Common::SyncStats::Counter::TilerTilePasses, 1);
 	EXIT_IF(regions.empty());
 	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	const uint64_t descriptor_alignment =
@@ -461,6 +482,7 @@ uint32_t TileManager::ConversionRows(uint64_t offset, uint64_t row_stride, uint6
 
 void TileManager::ConvertD16(Result source, Result target, D16Direction direction, bool d32,
                              const D16Layout& layout) {
+	Common::SyncStats::AddCounter(Common::SyncStats::Counter::TilerConvertD16Passes, 1);
 	vk::Pipeline* pipeline_pointer = nullptr;
 	if (direction == D16Direction::Promote) {
 		pipeline_pointer = d32 ? &m_d16_to_d32 : &m_d16_to_d24;
@@ -625,6 +647,7 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 }
 
 void TileManager::SwapBgra16(Result input, Result output, uint32_t pixels) {
+	Common::SyncStats::AddCounter(Common::SyncStats::Counter::TilerSwapBgraPasses, 1);
 	if (m_swap_bgra16 == nullptr) {
 		vk::ShaderModuleCreateInfo module_info {};
 		module_info.sType       = vk::StructureType::eShaderModuleCreateInfo;

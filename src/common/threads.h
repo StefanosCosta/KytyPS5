@@ -83,7 +83,9 @@ public:
 	KYTY_CLASS_NO_COPY(CondVar);
 
 private:
-	std::unique_ptr<CondVarPrivate> m_cond_var;
+	// Shared rather than unique: the waiter registry keeps a reference for the duration of a wake,
+	// so a condition variable cannot be destroyed out from under a wake that is already in flight.
+	std::shared_ptr<CondVarPrivate> m_cond_var;
 };
 
 class LockGuard {

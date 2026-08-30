@@ -15,16 +15,116 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 namespace Libs::Graphics {
 
 namespace {
 
+// GPU breadcrumbs. VK_ERROR_DEVICE_LOST is sticky, so the call that reports it is almost never the
+// one that killed the device; a checkpoint marker records what the GPU itself last reached.
+struct GpuCheckpoint {
+	uint64_t magic         = 0;   // identifies a marker that is really ours
+	uint32_t op            = 0;
+	uint64_t submit_id     = 0;
+	uint64_t submit_seq    = 0;
+	uint32_t slot          = 0;
+	uint32_t args[4]       = {};
+	uint64_t arg4          = 0;
+};
+
+// Stable storage: vkCmdSetCheckpointNV keeps only the pointer, so the slot must outlive the
+// submission. A ring is enough -- only the newest entries matter after a hang.
+constexpr size_t              CheckpointRingSize = 4096;
+GpuCheckpoint                 g_checkpoints[CheckpointRingSize];
+std::atomic<size_t>           g_checkpoint_next {0};
+
+const char* DebugOpName(uint32_t op) {
+	switch (static_cast<CommandBufferDebugOp>(op)) {
+		case CommandBufferDebugOp::DispatchDirect: return "DispatchDirect";
+		case CommandBufferDebugOp::DrawIndex: return "DrawIndex";
+		case CommandBufferDebugOp::DrawIndexAuto: return "DrawIndexAuto";
+		case CommandBufferDebugOp::EopWrite: return "EopWrite";
+		case CommandBufferDebugOp::EopInterrupt: return "EopInterrupt";
+		case CommandBufferDebugOp::EopWriteBack: return "EopWriteBack";
+		case CommandBufferDebugOp::EopFlip: return "EopFlip";
+		case CommandBufferDebugOp::EopWriteBackFlip: return "EopWriteBackFlip";
+		case CommandBufferDebugOp::EopOnlyFlip: return "EopOnlyFlip";
+		default: return "Unknown";
+	}
+}
+
+// Ask the driver which checkpoints the GPU actually passed. Anything reported at a "top of pipe"
+// stage was reached but not finished -- that is the command that hung.
+void DumpGpuCheckpoints(GraphicContext& graphics) {
+	if (!graphics.diagnostic_checkpoints_enabled ||
+	    VULKAN_HPP_DEFAULT_DISPATCHER.vkGetQueueCheckpointDataNV == nullptr) {
+		return;
+	}
+	uint32_t count = 0;
+	graphics.queue.getCheckpointDataNV(&count, nullptr);
+	if (count == 0) {
+		std::printf("gpu checkpoints: none reported\n");
+		std::fflush(stdout);
+		return;
+	}
+	std::vector<vk::CheckpointDataNV> data(count);
+	graphics.queue.getCheckpointDataNV(&count, data.data());
+	std::printf("gpu checkpoints: %u reported (the GPU's last known position)\n", count);
+	for (const auto& entry: data) {
+		const auto* cp = static_cast<const GpuCheckpoint*>(entry.pCheckpointMarker);
+		const bool  ours =
+		    cp != nullptr && cp >= std::begin(g_checkpoints) && cp < std::end(g_checkpoints) &&
+		    cp->magic == 0x4b595459434b5054ull;
+		if (!ours) {
+			std::printf("  stage=0x%08x  <marker %p is not ours>\n",
+			            static_cast<uint32_t>(entry.stage), entry.pCheckpointMarker);
+			continue;
+		}
+		std::printf("  stage=0x%08x  %s slot=%u submit_seq=%" PRIu64 " submit_id=%" PRIu64
+		            " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
+		            static_cast<uint32_t>(entry.stage), DebugOpName(cp->op), cp->slot,
+		            cp->submit_seq, cp->submit_id, cp->args[0], cp->args[1], cp->args[2],
+		            cp->args[3], cp->arg4);
+	}
+	std::fflush(stdout);
+}
+
+// The faulting address and fault type, when the driver can supply them.
+void DumpDeviceFault(GraphicContext& graphics) {
+	if (!graphics.device_fault_enabled ||
+	    VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceFaultInfoEXT == nullptr) {
+		return;
+	}
+	vk::DeviceFaultCountsEXT counts {};
+	if (graphics.device.getFaultInfoEXT(&counts, nullptr) != vk::Result::eSuccess) {
+		return;
+	}
+	std::vector<vk::DeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
+	std::vector<vk::DeviceFaultVendorInfoEXT>  vendor(counts.vendorInfoCount);
+	vk::DeviceFaultInfoEXT                     info {};
+	info.pAddressInfos = addresses.data();
+	info.pVendorInfos  = vendor.data();
+	if (graphics.device.getFaultInfoEXT(&counts, &info) != vk::Result::eSuccess) {
+		return;
+	}
+	std::printf("device fault: %s\n", info.description.data());
+	for (uint32_t i = 0; i < counts.addressInfoCount; i++) {
+		std::printf("  addr=0x%016" PRIx64 " precision=0x%" PRIx64 " type=%u\n",
+		            static_cast<uint64_t>(addresses[i].reportedAddress),
+		            static_cast<uint64_t>(addresses[i].addressPrecision),
+		            static_cast<uint32_t>(addresses[i].addressType));
+	}
+	std::fflush(stdout);
+}
+
 void ReportVulkanFatal(const char* what, vk::Result result, uint32_t slot, uint64_t submit_seq,
                        uint32_t debug_op, uint64_t debug_submit, uint32_t arg0, uint32_t arg1,
-                       uint32_t arg2, uint32_t arg3, uint64_t arg4) {
+                       uint32_t arg2, uint32_t arg3, uint64_t arg4,
+                       GraphicContext* graphics = nullptr) {
 	LOGF("%s failed: %s (%d), slot=%u submit_seq=%" PRIu64 " debug_op=%u debug_submit=%" PRIu64
 	     " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
 	     what, VulkanToString(result).c_str(), static_cast<int>(result), slot, submit_seq, debug_op,
@@ -34,6 +134,11 @@ void ReportVulkanFatal(const char* what, vk::Result result, uint32_t slot, uint6
 	            what, VulkanToString(result).c_str(), static_cast<int>(result), slot, submit_seq,
 	            debug_op, debug_submit, arg0, arg1, arg2, arg3, arg4);
 	std::fflush(stdout);
+	if (result == vk::Result::eErrorDeviceLost && graphics != nullptr) {
+		// The reporting call is rarely the culprit: ask the GPU where it actually stopped.
+		DumpGpuCheckpoints(*graphics);
+		DumpDeviceFault(*graphics);
+	}
 }
 
 } // namespace
@@ -105,6 +210,23 @@ void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0,
 	m_debug_arg2      = arg2;
 	m_debug_arg3      = arg3;
 	m_debug_arg4      = arg4;
+
+	if (m_graphics.diagnostic_checkpoints_enabled &&
+	    VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdSetCheckpointNV != nullptr && !IsInvalid()) {
+		auto& slot = g_checkpoints[g_checkpoint_next.fetch_add(1, std::memory_order_relaxed) %
+		                           CheckpointRingSize];
+		slot.magic      = 0x4b595459434b5054ull; // "KYTYCKPT"
+		slot.op         = op;
+		slot.submit_id  = submit_id;
+		slot.submit_seq = m_submit_seq;
+		slot.slot       = m_slot->id;
+		slot.args[0]    = arg0;
+		slot.args[1]    = arg1;
+		slot.args[2]    = arg2;
+		slot.args[3]    = arg3;
+		slot.arg4       = arg4;
+		Handle().setCheckpointNV(&slot);
+	}
 }
 
 void CommandBuffer::Execute(const SubmitInfo& submit) {
@@ -141,7 +263,7 @@ void CommandBuffer::Execute(const SubmitInfo& submit) {
 	if (result != vk::Result::eSuccess) {
 		ReportVulkanFatal("vkResetFences (before submit)", result, m_slot->id, m_submit_seq,
 		                  m_debug_op, m_debug_submit_id, m_debug_arg0, m_debug_arg1, m_debug_arg2,
-		                  m_debug_arg3, m_debug_arg4);
+		                  m_debug_arg3, m_debug_arg4, &m_graphics);
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
@@ -165,7 +287,7 @@ void CommandBuffer::Execute(const SubmitInfo& submit) {
 	if (result != vk::Result::eSuccess) {
 		ReportVulkanFatal("vkQueueSubmit", result, m_slot->id, m_submit_seq, m_debug_op,
 		                  m_debug_submit_id, m_debug_arg0, m_debug_arg1, m_debug_arg2, m_debug_arg3,
-		                  m_debug_arg4);
+		                  m_debug_arg4, &m_graphics);
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 }
@@ -184,10 +306,17 @@ void CommandBuffer::WaitForFenceOnly() {
 	if (result != vk::Result::eSuccess) {
 		ReportVulkanFatal("vkWaitForFences", result, m_slot->id, m_submit_seq, m_debug_op,
 		                  m_debug_submit_id, m_debug_arg0, m_debug_arg1, m_debug_arg2, m_debug_arg3,
-		                  m_debug_arg4);
+		                  m_debug_arg4, &m_graphics);
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	m_fence_waited = true;
+}
+
+bool CommandBuffer::IsSubmissionOutstanding() const {
+	if (IsInvalid() || !m_execute || m_fence_waited) {
+		return false;
+	}
+	return m_graphics.device.getFenceStatus(m_slot->fence) == vk::Result::eNotReady;
 }
 
 void CommandBuffer::WaitForFenceAndReset() {

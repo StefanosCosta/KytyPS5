@@ -199,7 +199,7 @@ struct CondVarPrivate {
 };
 
 static std::recursive_mutex                         g_cond_waiters_mutex;
-static std::vector<std::pair<int, CondVarPrivate*>> g_cond_waiters;
+static std::vector<std::pair<int, std::shared_ptr<CondVarPrivate>>> g_cond_waiters;
 static wait_poll_func_t                             g_cond_wait_poll_callback = nullptr;
 
 static void WakeCondVar(CondVarPrivate* cond_var) {
@@ -212,18 +212,19 @@ static void WakeCondVar(CondVarPrivate* cond_var) {
 #endif
 }
 
-static void RegisterCondWaiter(CondVarPrivate* cond_var) {
+static void RegisterCondWaiter(const std::shared_ptr<CondVarPrivate>& cond_var) {
 	std::lock_guard lock(g_cond_waiters_mutex);
 	g_cond_waiters.emplace_back(Thread::GetThreadIdUnique(), cond_var);
 }
 
-static void UnregisterCondWaiter(CondVarPrivate* cond_var) {
+static void UnregisterCondWaiter(const CondVarPrivate* cond_var) {
 	const auto      thread_id = Thread::GetThreadIdUnique();
 	std::lock_guard lock(g_cond_waiters_mutex);
 
 	const auto it = std::find_if(g_cond_waiters.begin(), g_cond_waiters.end(),
 	                             [thread_id, cond_var](const auto& waiter) {
-		                             return waiter.first == thread_id && waiter.second == cond_var;
+		                             return waiter.first == thread_id &&
+		                                    waiter.second.get() == cond_var;
 	                             });
 	if (it != g_cond_waiters.end()) {
 		g_cond_waiters.erase(it);
@@ -359,14 +360,14 @@ bool Mutex::TryLock() {
 #endif
 }
 
-CondVar::CondVar(): m_cond_var(std::make_unique<CondVarPrivate>()) {}
+CondVar::CondVar(): m_cond_var(std::make_shared<CondVarPrivate>()) {}
 
 CondVar::~CondVar() {
 	m_cond_var.reset();
 }
 
 void CondVar::Wait(Mutex* mutex) {
-	RegisterCondWaiter(m_cond_var.get());
+	RegisterCondWaiter(m_cond_var);
 #ifndef KYTY_WIN_CS
 	std::unique_lock<std::recursive_mutex> cpp_lock(mutex->m_mutex->m_mutex, std::adopt_lock_t());
 #endif
@@ -416,7 +417,7 @@ void CondVar::SetWaitPollCallback(wait_poll_func_t callback) {
 
 bool CondVar::WaitFor(Mutex* mutex, uint32_t micros) {
 	bool ok = false;
-	RegisterCondWaiter(m_cond_var.get());
+	RegisterCondWaiter(m_cond_var);
 #ifndef KYTY_WIN_CS
 	std::unique_lock<std::recursive_mutex> cpp_lock(mutex->m_mutex->m_mutex, std::adopt_lock_t());
 #endif
@@ -427,8 +428,37 @@ bool CondVar::WaitFor(Mutex* mutex, uint32_t micros) {
 	           0 &&
 	       GetLastError() == ERROR_TIMEOUT);
 #else
-	ok = (m_cond_var->m_cv.wait_for(cpp_lock, std::chrono::microseconds(micros)) ==
-	      std::cv_status::no_timeout);
+	if (g_cond_wait_poll_callback == nullptr) {
+		ok = (m_cond_var->m_cv.wait_for(cpp_lock, std::chrono::microseconds(micros)) ==
+		      std::cv_status::no_timeout);
+	} else {
+		// A timed wait is a safe point too. Wait in slices so a signal queued for this thread is
+		// delivered while it is parked here rather than only when the whole timeout expires --
+		// guest code parks in timed waits for seconds at a time, and a deferred signal that waits
+		// that long is indistinguishable from one that never arrives.
+		//
+		// The callback runs with the guest mutex released, matching Wait().
+		constexpr uint32_t POLL_MICROS = 10000;
+		uint32_t           remaining   = micros;
+		for (;;) {
+			const auto slice = remaining < POLL_MICROS ? remaining : POLL_MICROS;
+			if (m_cond_var->m_cv.wait_for(cpp_lock, std::chrono::microseconds(slice)) ==
+			    std::cv_status::no_timeout) {
+				ok = true;
+				break;
+			}
+			remaining -= slice;
+			auto* callback = g_cond_wait_poll_callback;
+			if (callback != nullptr) {
+				cpp_lock.unlock();
+				callback();
+				cpp_lock.lock();
+			}
+			if (remaining == 0) {
+				break;
+			}
+		}
+	}
 	cpp_lock.release();
 #endif
 	UnregisterCondWaiter(m_cond_var.get());
@@ -450,11 +480,27 @@ void CondVar::SignalAll() {
 }
 
 void CondVar::SignalThread(int thread_id) {
-	std::lock_guard lock(g_cond_waiters_mutex);
-	for (const auto& waiter: g_cond_waiters) {
-		if (waiter.first == thread_id) {
-			WakeCondVar(waiter.second);
+	// Collect under the registry lock, wake with it released.
+	//
+	// Waking is not guaranteed non-blocking: a broadcast can block until the waiters it is
+	// retiring have left the variable, and they leave through UnregisterCondWaiter, which needs
+	// this same mutex. Waking while holding it deadlocks the waker against the very waiters it is
+	// trying to wake. Signal() and SignalAll() already wake without it.
+	//
+	// Holding a reference to each target across the wake is what makes releasing the lock safe:
+	// otherwise a waiter could return, unregister, and have its condition variable destroyed
+	// before the wake reached it.
+	std::vector<std::shared_ptr<CondVarPrivate>> targets;
+	{
+		std::lock_guard lock(g_cond_waiters_mutex);
+		for (const auto& waiter: g_cond_waiters) {
+			if (waiter.first == thread_id) {
+				targets.push_back(waiter.second);
+			}
 		}
+	}
+	for (const auto& target: targets) {
+		WakeCondVar(target.get());
 	}
 }
 

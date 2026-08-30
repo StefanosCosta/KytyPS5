@@ -61,6 +61,11 @@ public:
 	[[nodiscard]] uint64_t         CurrentTick() const noexcept { return m_master.CurrentTick(); }
 	[[nodiscard]] bool             IsFree(uint64_t tick);
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
+
+	// Diagnostic: print every buffer whose signalled tick is still ahead of the GPU, with its
+	// fence state. A pending fence means the submission never ran; a signalled fence with an
+	// unadvanced timeline would mean the GPU ran it but the semaphore signal was lost.
+	void DumpOutstanding(uint64_t known_gpu_tick) const;
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
 
@@ -127,6 +132,34 @@ private:
 
 	friend class CommandBuffer;
 };
+
+// Per-submission work log.
+//
+// VK_ERROR_DEVICE_LOST is sticky and VK_NV_device_diagnostic_checkpoints only reports on device
+// loss, so neither identifies a submission that simply never completes while the device stays
+// alive. This records what went into each command buffer, keyed by the timeline tick it signals,
+// so the stalled tick can be named from a live process.
+//
+// Diagnostic only: every entry point is a no-op unless SyncStats level 2 is enabled.
+namespace WorkLog {
+
+void NoteDraw() noexcept;
+void NoteDispatch() noexcept;
+void NoteTilerDispatch(uint64_t invocations) noexcept;
+
+// Identity of one draw, tagged with the tick its command buffer will signal.
+void NoteDrawDetail(uint64_t tick, uint64_t pipeline, const uint32_t* vs_spirv, uint32_t vs_words,
+                    const uint32_t* ps_spirv, uint32_t ps_words, uint32_t index_count,
+                    uint32_t instance_count) noexcept;
+
+// Called from SubmitCurrent with the tick this buffer will signal; snapshots the counters above.
+void RecordSubmission(uint64_t tick, uint32_t slot, uint64_t submit_seq) noexcept;
+
+// Prints what the given tick's command buffer contained. Returns false if the ring has already
+// wrapped past it.
+bool DumpStuck(uint64_t tick, uint64_t known_gpu_tick, uint64_t issued_tick) noexcept;
+
+} // namespace WorkLog
 
 } // namespace Libs::Graphics
 

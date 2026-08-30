@@ -30,6 +30,8 @@
 #include "spirv-tools/libspirv.hpp"
 
 #include <algorithm>
+#include <fstream>
+#include <filesystem>
 #include <array>
 #include <bit>
 #include <cstdint>
@@ -4742,20 +4744,34 @@ void TestNewShaderRecompilerPixelImageSampleLodSelection() {
               1,
           "pixel IMAGE_SAMPLE_LZ must use explicit lod");
   }
+  // ImageTestUserData() describes a k8UNorm kColor2D surface, i.e. a colour image. RDNA2 lets
+  // IMAGE_SAMPLE_C compare against any surface, but Vulkan's Dref sampling is legal only on a
+  // format advertising SAMPLED_IMAGE_DEPTH_COMPARISON, and violating that hangs the GPU. So a
+  // compare-sample against a colour descriptor must lower to an ordinary sample plus an in-shader
+  // compare, never to OpImageSampleDref*. The depth-capable descriptor keeps the hardware path;
+  // that direction is covered by the CompareEmulation* cases in ShaderRecompilerComputeTests.
   {
     const auto result = compile(0x28, 0x1); // image_sample_c
     Check(SpirvInstructionOpcodeCount(result.spirv,
-                                      OpImageSampleDrefImplicitLod) == 1,
-          "pixel IMAGE_SAMPLE_C must use OpImageSampleDrefImplicitLod");
-    Check(SpirvInstructionOpcodeCount(result.spirv,
-                                      OpImageSampleDrefExplicitLod) == 0,
-          "pixel IMAGE_SAMPLE_C unexpectedly used explicit dref lod");
+                                      OpImageSampleDrefImplicitLod) == 0 &&
+              SpirvInstructionOpcodeCount(result.spirv,
+                                          OpImageSampleDrefExplicitLod) == 0,
+          "pixel IMAGE_SAMPLE_C on a colour surface must not use hardware Dref");
+    Check(SpirvInstructionOpcodeCount(result.spirv, OpImageSampleImplicitLod) ==
+              1,
+          "pixel IMAGE_SAMPLE_C emulation must sample with implicit lod");
   }
   {
     const auto result = compile(0x2f, 0x1); // image_sample_c_lz
     Check(SpirvInstructionOpcodeCount(result.spirv,
-                                      OpImageSampleDrefExplicitLod) == 1,
-          "pixel IMAGE_SAMPLE_C_LZ must use explicit dref lod");
+                                      OpImageSampleDrefImplicitLod) == 0 &&
+              SpirvInstructionOpcodeCount(result.spirv,
+                                          OpImageSampleDrefExplicitLod) == 0,
+          "pixel IMAGE_SAMPLE_C_LZ on a colour surface must not use hardware "
+          "Dref");
+    Check(SpirvInstructionOpcodeCount(result.spirv, OpImageSampleExplicitLod) ==
+              1,
+          "pixel IMAGE_SAMPLE_C_LZ emulation must sample with explicit lod");
   }
 }
 
@@ -12204,13 +12220,16 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
       EncodeSopp(0x01),
   };
   const auto dispatcher_result = compile("dispatcher", dispatcher,
-                                         {.words = 242,
+                                         {.words = 248,
                                           .instructions = 67,
                                           .variables = 3,
                                           .function_variables = 3,
                                           .loads = 3,
                                           .stores = 6,
-                                          .phis = 2,
+                                          // Three: the state phi, and the bounded-iteration
+                                          // counter phi that keeps a non-terminating dispatcher
+                                          // from hanging the GPU.
+                                          .phis = 3,
                                           .labels = 13,
                                           .loop_merges = 1,
                                           .selection_merges = 1,
@@ -12219,10 +12238,182 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
                                           .switches = 1});
   Check(dispatcher_result.program.dispatcher_fallback &&
             Common::ContainsStr(dispatcher_result.ir_dump, "Phi") &&
-            SpirvInstructionOpcodeCount(dispatcher_result.spirv, 245u) == 2u &&
+            SpirvInstructionOpcodeCount(dispatcher_result.spirv, 245u) == 3u &&
             SpirvInstructionOpcodeCount(dispatcher_result.spirv, 251u) == 1u,
-        "dispatcher size fixture lost its two control Phis or switch");
+        "dispatcher size fixture lost its control Phis or switch");
   CheckSpirvPhiParents(dispatcher_result.spirv);
+}
+
+// The dispatcher loop exits only when a block steers the state to the UINT32_MAX sentinel. A
+// recompiled guest loop whose exit condition is mistranslated therefore spins forever, and a pixel
+// shader that never returns hangs the GPU hard enough to take the desktop with it. A counter folded
+// into the loop's exit test bounds that. Structured shaders must not pay for it.
+// Guest code that jumps straight into one arm of a selection makes that construct multi-entry,
+// which SPIR-V forbids. The structurizer duplicates the affected blocks so the original keeps the
+// header as its only entry.
+void TestNewShaderRecompilerCfgClonesExternallyEnteredSelectionArm() {
+  const uint32_t shader[] = {
+      EncodeSopc(0x06, 0, 0), // 0 E: s_cmp_eq_u32 s0, s0
+      EncodeSopp(0x05, 2),    // 1 E: scc1 -> A, fallthrough -> H
+      EncodeSopc(0x06, 1, 1), // 2 H: s_cmp_eq_u32 s1, s1
+      EncodeSopp(0x05, 2),    // 3 H: scc1 -> B, fallthrough -> A
+      EncodeSMovB32(2, 129),  // 4 A
+      EncodeSopp(0x02, 1),    // 5 A: s_branch -> M
+      EncodeSMovB32(2, 130),  // 6 B: falls through to M
+      EncodeSMovB32(3, 131),  // 7 M
+      0xbf810000u,            // 8 M: s_endpgm
+  };
+
+  ShaderRecompiler::Decoder::Program decoded;
+  std::string error;
+  Check(ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded, &error),
+        error.c_str());
+  ShaderRecompiler::CFG::Graph graph;
+  Check(ShaderRecompiler::CFG::BuildGraph(decoded, graph, &error), error.c_str());
+  const auto original_coverage =
+      CfgInstructionCoverage(graph, decoded.instructions.size());
+  Check(ShaderRecompiler::CFG::Structurize(graph, &error), error.c_str());
+
+  // Cloning duplicates guest instructions on purpose, so the usual "coverage is unchanged"
+  // invariant is relaxed to "the same instructions are still covered".
+  const auto coverage = CfgInstructionCoverage(graph, decoded.instructions.size());
+  for (size_t index = 0; index < coverage.size(); index++) {
+    Check((coverage[index] != 0u) == (original_coverage[index] != 0u),
+          "region cloning changed which semantic instructions are covered");
+  }
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  ShaderRecompiler::CompileResult result;
+  Check(ShaderRecompiler::TryRecompile(shader, options, result, &error), error.c_str());
+  Check(!result.program.dispatcher_fallback &&
+            Common::ContainsStr(result.ir_dump, "mode=structured") &&
+            SpirvInstructionOpcodeCount(result.spirv, 251) == 0u,
+        "externally entered selection arm still forced dispatcher control flow");
+  CheckSpirvBinaryValidates(result.spirv);
+  CheckSpirvPhiParents(result.spirv);
+}
+
+void TestNewShaderRecompilerDispatcherIterationGuard() {
+  constexpr uint32_t OpIAdd              = 128u;
+  constexpr uint32_t OpLogicalOr         = 166u;
+  constexpr uint32_t OpUGreaterThanEqual = 174u;
+  constexpr uint32_t OpPhi               = 245u;
+
+  // Two entries into one cycle: irreducible, so this is forced down the dispatcher path.
+  const uint32_t dispatcher[] = {
+      EncodeSopp(0x05, 2),       // entry -> B, fallthrough A
+      EncodeSopp(0x02, 0),       // A -> C
+      EncodeSopp(0x05, 0xfffeu), // C -> A, fallthrough B
+      EncodeSopp(0x02, 0xfffeu), // B -> C
+      EncodeSopp(0x01),
+  };
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.dump_ir = true;
+
+  ShaderRecompiler::CompileResult result;
+  std::string error;
+  Check(ShaderRecompiler::TryRecompile(dispatcher, options, result, &error), error.c_str());
+  Check(result.program.dispatcher_fallback, "guard fixture no longer takes the dispatcher path");
+  CheckSpirvBinaryValidates(result.spirv);
+
+  // Three control phis: the state, the next state after the switch, and the iteration counter.
+  Check(SpirvInstructionOpcodeCount(result.spirv, OpPhi) == 3u,
+        "dispatcher lost a control phi or the iteration-counter phi");
+  Check(SpirvInstructionOpcodeCount(result.spirv, OpIAdd) >= 1u,
+        "dispatcher iteration counter is never incremented");
+  Check(SpirvInstructionOpcodeCount(result.spirv, OpUGreaterThanEqual) >= 1u,
+        "dispatcher iteration counter is never compared against its limit");
+  Check(SpirvInstructionOpcodeCount(result.spirv, OpLogicalOr) >= 1u,
+        "dispatcher iteration limit is not folded into the loop exit condition");
+
+  // A structured shader must be untouched: no counter, and only whatever phis it needs.
+  const uint32_t structured[] = {
+      EncodeSopp(0x01),
+  };
+  ShaderRecompiler::CompileResult structured_result;
+  auto structured_options = MakeCompileOptions(ShaderType::Pixel);
+  Check(ShaderRecompiler::TryRecompile(structured, structured_options, structured_result, &error),
+        error.c_str());
+  Check(!structured_result.program.dispatcher_fallback,
+        "structured fixture unexpectedly fell back to the dispatcher");
+  Check(SpirvInstructionOpcodeCount(structured_result.spirv, OpUGreaterThanEqual) == 0u,
+        "structured shader paid for the dispatcher iteration guard");
+}
+
+// Offline replay of guest shader bytecode captured with --graphics-debug-dump.
+//
+// Reproducing a structurizer problem by launching a game takes a minute, risks a GPU reset, and
+// gives no detail. Recompiling the captured .bin files instead is headless and instant. Set
+// KYTY_REPLAY_DIR to the dump's "original" directory; the harness is diagnostic and is skipped
+// entirely when the variable is unset.
+void ReplayDumpedShaders(const char *directory) {
+  namespace fs = std::filesystem;
+  std::vector<std::string> files;
+  for (const auto &entry : fs::directory_iterator(directory)) {
+    if (entry.path().extension() == ".bin") {
+      files.push_back(entry.path().string());
+    }
+  }
+  std::sort(files.begin(), files.end());
+
+  uint32_t structured = 0;
+  uint32_t dispatcher = 0;
+  uint32_t invalid = 0;
+  for (const auto &file : files) {
+    std::ifstream stream(file, std::ios::binary);
+    std::vector<uint32_t> code((std::istreambuf_iterator<char>(stream)),
+                               std::istreambuf_iterator<char>());
+    stream.clear();
+    stream.seekg(0);
+    const auto size = fs::file_size(file);
+    code.assign(size / sizeof(uint32_t), 0u);
+    stream.read(reinterpret_cast<char *>(code.data()),
+                static_cast<std::streamsize>(code.size() * sizeof(uint32_t)));
+
+    const auto name = fs::path(file).filename().string();
+    const auto stage = name.find("_ps_") != std::string::npos ? ShaderType::Pixel
+                       : name.find("_vs_") != std::string::npos
+                           ? ShaderType::Vertex
+                           : ShaderType::Compute;
+
+    auto options = MakeCompileOptions(stage);
+    options.dump_ir = true;
+    // The capture does not carry the pipeline's interpolant configuration, and
+    // ShaderInfoCollection rejects an attribute reference at or beyond input_num. The maximum
+    // keeps every reference in range; control-flow reconstruction does not depend on the exact
+    // interpolant setup, which is all this harness measures.
+    ShaderPixelInputInfo pixel_info{};
+    pixel_info.input_num = 32;
+    if (stage == ShaderType::Pixel) {
+      options.input_info.pixel = &pixel_info;
+    }
+    ShaderRecompiler::CompileResult result;
+    std::string error;
+    if (!ShaderRecompiler::TryRecompile(code, options, result, &error)) {
+      std::printf("  %-46s RECOMPILE FAILED: %s\n", name.c_str(), error.c_str());
+      continue;
+    }
+
+    spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+    std::string messages;
+    tools.SetMessageConsumer([&messages](spv_message_level_t, const char *,
+                                         const spv_position_t &,
+                                         const char *message) { messages += message; });
+    const bool valid = tools.Validate(result.spirv);
+
+    result.program.dispatcher_fallback ? dispatcher++ : structured++;
+    if (!valid) {
+      invalid++;
+    }
+    std::printf("  %-46s %-11s %-8s blocks=%-5zu words=%-7zu %s\n", name.c_str(),
+                result.program.dispatcher_fallback ? "dispatcher" : "structured",
+                valid ? "valid" : "INVALID", result.program.blocks.size(), result.spirv.size(),
+                result.program.dispatcher_fallback ? result.program.fallback_reason.c_str()
+                                                   : (valid ? "" : messages.c_str()));
+  }
+  std::printf("\nstructured=%u dispatcher=%u invalid=%u of %zu\n", structured, dispatcher,
+              invalid, files.size());
 }
 
 } // namespace
@@ -12232,11 +12423,17 @@ int main() {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
+  if (const char *replay = std::getenv("KYTY_REPLAY_DIR"); replay != nullptr) {
+    ReplayDumpedShaders(replay);
+    return 0;
+  }
   TestResourceDescriptorClassification();
   TestNativeShaderResourceDependencies();
   TestNormalizedImageContracts();
   TestSpirvRequirementsAnalysis();
   TestNewShaderRecompilerSpirvSizeBaselines();
+  TestNewShaderRecompilerCfgClonesExternallyEnteredSelectionArm();
+  TestNewShaderRecompilerDispatcherIterationGuard();
   TestDemandDrivenSpirvDeclarations();
   TestNewShaderRecompilerSMovB32();
   TestNewShaderRecompilerAuxPositionExports();
